@@ -1261,6 +1261,30 @@ describe('PGLiteEngine: getHealth graph metrics', () => {
     expect(h.timeline_coverage).toBeCloseTo(1 / 3, 2);
   });
 
+  test('entity coverage includes generic entity and organization pages', async () => {
+    await engine.putPage('entities/topics/deadlines', {
+      ...testPage,
+      type: 'entity',
+      title: 'Deadlines',
+    });
+    await engine.putPage('organizations/example-labs', {
+      ...testPage,
+      type: 'organization',
+      title: 'Example Labs',
+    });
+
+    await engine.addLink('people/alice', 'entities/topics/deadlines', '', 'mentions');
+    await engine.addTimelineEntry('organizations/example-labs', {
+      date: '2026-01-15',
+      summary: 'Created',
+    });
+
+    const h = await engine.getHealth();
+    expect(h.link_coverage).toBeCloseTo(1 / 5, 2);
+    expect(h.timeline_coverage).toBeCloseTo(1 / 5, 2);
+    expect(h.most_connected.some((row) => row.slug === 'entities/topics/deadlines')).toBe(true);
+  });
+
   test('most_connected lists top entities by link count', async () => {
     await engine.addLink('people/alice', 'companies/acme', '', 'works_at');
     await engine.addLink('people/bob', 'companies/acme', '', 'invested_in');

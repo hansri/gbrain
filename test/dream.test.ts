@@ -76,6 +76,25 @@ describe('runDream — brainDir resolution', () => {
     if (report) expect(report.brain_dir).toBe(repo);
   });
 
+  test('no --dir + --source: uses the source local_path and records source freshness', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config)
+       VALUES ('alpha', 'alpha', $1, '{}'::jsonb)
+       ON CONFLICT (id) DO UPDATE SET local_path = EXCLUDED.local_path`,
+      [repo],
+    );
+
+    const report = await runDream(engine, ['--source', 'alpha', '--phase', 'lint', '--json']);
+
+    expect(report).toBeTruthy();
+    if (report) expect(report.brain_dir).toBe(repo);
+    const rows = await engine.executeRaw<{ config: Record<string, unknown> | string }>(
+      `SELECT config FROM sources WHERE id = 'alpha'`,
+    );
+    const config = typeof rows[0]?.config === 'string' ? JSON.parse(rows[0].config) : rows[0]?.config;
+    expect(typeof config?.last_full_cycle_at).toBe('string');
+  });
+
   test('no --dir + engine=null exits 1', async () => {
     const spy = spyOn(process, 'exit').mockImplementation(() => { throw new Error('EXIT'); });
     const errSpy = spyOn(console, 'error').mockImplementation(() => {});

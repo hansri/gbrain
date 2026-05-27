@@ -30,6 +30,7 @@ import {
   type CyclePhase,
   type CycleReport,
 } from '../core/cycle.ts';
+import { isValidSourceId } from '../core/source-id.ts';
 import { existsSync } from 'fs';
 import { resolve } from 'node:path';
 
@@ -39,6 +40,7 @@ interface DreamArgs {
   pull: boolean;
   phase: CyclePhase | null;
   dir: string | null;
+  sourceId: string | null;
   help: boolean;
   /** v0.21: ad-hoc transcript file path; implies --phase synthesize. */
   inputFile: string | null;
@@ -71,6 +73,13 @@ function parseArgs(args: string[]): DreamArgs {
 
   const dirIdx = args.indexOf('--dir');
   const dir = dirIdx !== -1 ? args[dirIdx + 1] : null;
+
+  const sourceIdx = args.indexOf('--source');
+  const sourceId = sourceIdx !== -1 ? args[sourceIdx + 1] ?? null : null;
+  if (sourceIdx !== -1 && !isValidSourceId(sourceId)) {
+    console.error(`--source must be a valid source_id; got ${JSON.stringify(sourceId)}`);
+    process.exit(2);
+  }
 
   const inputIdx = args.indexOf('--input');
   const inputFile = inputIdx !== -1 ? args[inputIdx + 1] ?? null : null;
@@ -116,6 +125,7 @@ function parseArgs(args: string[]): DreamArgs {
     pull: args.includes('--pull'),
     phase,
     dir,
+    sourceId,
     help: args.includes('--help') || args.includes('-h'),
     inputFile,
     date,
@@ -139,15 +149,57 @@ function parseArgs(args: string[]): DreamArgs {
 async function resolveBrainDir(
   engine: BrainEngine | null,
   explicit: string | null,
+  sourceId: string | null,
 ): Promise<string> {
   if (explicit) {
     if (!existsSync(explicit)) {
       console.error(`--dir path does not exist: ${explicit}`);
       process.exit(1);
     }
+    if (engine && sourceId) {
+      const { fetchSource } = await import('../core/sources-load.ts');
+      const source = await fetchSource(engine, sourceId);
+      if (!source || source.archived === true) {
+        console.error(`Source "${sourceId}" not found. List with: gbrain sources list`);
+        process.exit(1);
+      }
+      if (!source.local_path) {
+        console.error(`Source "${sourceId}" has no local_path; cannot run a filesystem dream cycle.`);
+        process.exit(1);
+      }
+      if (resolve(source.local_path) !== resolve(explicit)) {
+        console.error(
+          `--dir does not match source "${sourceId}" local_path (${source.local_path}). ` +
+          `Use --dir ${source.local_path} or omit --dir.`,
+        );
+        process.exit(1);
+      }
+    }
     // Resolve to absolute so downstream writeFileSync(join(brainDir, slug))
     // can't silently land at cwd when explicit is `.` / `./brain` / etc.
     return resolve(explicit);
+  }
+
+  if (sourceId) {
+    if (!engine) {
+      console.error('--source requires a configured database so the source local_path can be resolved.');
+      process.exit(1);
+    }
+    const { fetchSource } = await import('../core/sources-load.ts');
+    const source = await fetchSource(engine, sourceId);
+    if (!source || source.archived === true) {
+      console.error(`Source "${sourceId}" not found. List with: gbrain sources list`);
+      process.exit(1);
+    }
+    if (!source.local_path) {
+      console.error(`Source "${sourceId}" has no local_path; cannot run a filesystem dream cycle.`);
+      process.exit(1);
+    }
+    if (!existsSync(source.local_path)) {
+      console.error(`Source "${sourceId}" local_path does not exist: ${source.local_path}`);
+      process.exit(1);
+    }
+    return resolve(source.local_path);
   }
 
   if (engine) {
@@ -181,6 +233,7 @@ Options:
   --json              Emit the CycleReport as JSON (agent-readable)
   --phase <name>      Run a single phase: ${ALL_PHASES.join(' | ')}
   --pull              git pull the brain repo before syncing (default: no pull)
+  --source <id>       Source id whose local_path should be cycled
   --dir <path>        Brain directory (default: configured brain)
 
   --input <file>      Synthesize a specific transcript file (implies
@@ -200,6 +253,7 @@ Options:
 Examples:
   gbrain dream
   gbrain dream --dry-run --json
+  gbrain dream --source default
   gbrain dream --phase lint
   gbrain dream --phase synthesize --input ~/transcripts/2026-04-25.txt
   gbrain dream --phase synthesize --from 2026-04-01 --to 2026-04-25
@@ -275,11 +329,12 @@ export async function runDream(engine: BrainEngine | null, args: string[]): Prom
     return;
   }
 
-  const brainDir = await resolveBrainDir(engine, opts.dir);
+  const brainDir = await resolveBrainDir(engine, opts.dir, opts.sourceId);
   const phases: CyclePhase[] | undefined = opts.phase ? [opts.phase] : undefined;
 
   const report = await runCycle(engine, {
     brainDir,
+    ...(opts.sourceId ? { sourceId: opts.sourceId } : {}),
     dryRun: opts.dryRun,
     pull: opts.pull,
     phases,
