@@ -1595,6 +1595,14 @@ async function extractStaleFromDB(
 ): Promise<{ linksCreated: number; timelineCreated: number; pagesProcessed: number; staleRemaining: number }> {
   const { dryRun, jsonMode, includeFrontmatter, sourceIdFilter, catchUp } = opts;
   const versionTs = LINK_EXTRACTOR_VERSION_TS;
+  const versionMs = Date.parse(versionTs);
+  const freshnessStampFor = (updatedAtIso: string): string => {
+    const updatedMs = Date.parse(updatedAtIso);
+    if (Number.isFinite(updatedMs) && Number.isFinite(versionMs) && updatedMs < versionMs) {
+      return versionTs;
+    }
+    return updatedAtIso;
+  };
 
   // Pre-flight count — cheap indexed COUNT. dry-run reports and returns.
   const totalStale = await engine.countStalePagesForExtraction({ sourceId: sourceIdFilter, versionTs });
@@ -1675,7 +1683,13 @@ async function extractStaleFromDB(
       // `page.updated_at.toISOString()` — the JS Date is ms-truncated, so the
       // µs-precision DB updated_at stayed strictly greater and the page never
       // cleared on Postgres. Stamping the exact value makes them equal.
-      processedRefs.push({ slug: page.slug, source_id: page.source_id, extractedAt: page.updated_at_iso });
+      //
+      // CDX-7: when the extractor version is newer than an old page update,
+      // stamping the old updated_at leaves the version arm permanently stale.
+      // Use max(updated_at, LINK_EXTRACTOR_VERSION_TS). A concurrent edit after
+      // the read is still preserved because its new updated_at will exceed this
+      // stamp and remain stale for the next run.
+      processedRefs.push({ slug: page.slug, source_id: page.source_id, extractedAt: freshnessStampFor(page.updated_at_iso) });
     }
 
     // Flush NON-swallowing (CDX-4): a throw here propagates out of the sweep so

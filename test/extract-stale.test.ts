@@ -119,6 +119,27 @@ describe('gbrain extract --stale', () => {
     expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(0);
   });
 
+  test('CRITICAL (CDX-7): pre-version pages clear after --stale', async () => {
+    await engine.putPage('people/alice', personPage('Alice'));
+    await engine.putPage('companies/acme', companyPage('Acme', '[Alice](people/alice) advises [Acme](companies/acme).'));
+    await engine.executeRaw(
+      `UPDATE pages
+          SET updated_at = '2026-05-01 00:00:00.123456+00',
+              links_extracted_at = '2026-05-01 00:00:00.123456+00'`,
+    );
+
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(2);
+
+    await runExtract(engine, ['--stale']);
+
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(0);
+    const rows = await engine.executeRaw<{ fresh: boolean }>(
+      `SELECT bool_and(links_extracted_at >= $1::timestamptz) AS fresh FROM pages`,
+      [LINK_EXTRACTOR_VERSION_TS],
+    );
+    expect(rows[0]?.fresh).toBe(true);
+  });
+
   test('idempotent: second run finds 0 stale and creates no new links', async () => {
     await engine.putPage('people/alice', personPage('Alice'));
     await engine.putPage('companies/acme', companyPage('Acme', '[Alice](people/alice) advises [Acme](companies/acme).'));
