@@ -60,12 +60,12 @@ beforeEach(async () => {
   brainDir = mkdtempSync(join(tmpdir(), 'gbrain-cycle-pglite-ord-'));
 });
 
-async function seed(id: string): Promise<void> {
+async function seed(id: string, localPath = brainDir): Promise<void> {
   await engine.executeRaw(
     `INSERT INTO sources (id, name, local_path, config, archived, created_at)
      VALUES ($1, $2, $3, '{}'::jsonb, false, NOW())
      ON CONFLICT (id) DO UPDATE SET local_path = EXCLUDED.local_path`,
-    [id, id, brainDir],
+    [id, id, localPath],
   );
 }
 
@@ -93,8 +93,11 @@ describe('PGLite cycle: file lock + per-source DB lock ordering', () => {
   });
 
   test('two PGLite cycles for DIFFERENT sources serialize (P0-D regression)', async () => {
-    await seed('alpha');
-    await seed('beta');
+    // Each source must retain a distinct canonical path identity. The lock
+    // ordering exercised below is database-wide, so the cycles can use the
+    // checkout-less path while still carrying different explicit source ids.
+    await seed('alpha', join(brainDir, 'alpha'));
+    await seed('beta', join(brainDir, 'beta'));
     // Plant a "live" file lock with our own PID — simulates an in-flight
     // cycle on a different source. The second cycle attempt MUST be
     // blocked by the file lock even though it'd have a distinct DB lock ID.
@@ -120,9 +123,9 @@ describe('PGLite cycle: file lock + per-source DB lock ordering', () => {
     // this test as the "lock exists during cycle" companion to test #1.
 
     // Run cycle alpha to clear our planted file (recovers as stale)
-    await runCycle(engine, { brainDir, sourceId: 'alpha', phases: ['lint', 'backlinks'] });
+    await runCycle(engine, { brainDir: null, sourceId: 'alpha', phases: ['lint', 'backlinks'] });
     // Run cycle beta — should succeed too (alpha already released)
-    const r = await runCycle(engine, { brainDir, sourceId: 'beta', phases: ['lint', 'backlinks'] });
+    const r = await runCycle(engine, { brainDir: null, sourceId: 'beta', phases: ['lint', 'backlinks'] });
     // Status: succeeded after the previous cycle released the file lock
     expect(['ok', 'clean']).toContain(r.status);
   });
