@@ -140,6 +140,13 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
     });
   }
 
+  async function mcpJson(token: string, method: string, params?: any): Promise<any> {
+    const response = await mcpCall(token, method, params);
+    const raw = await response.text();
+    const dataLine = raw.split('\n').find(line => line.startsWith('data:'));
+    return JSON.parse(dataLine ? dataLine.slice(5).trim() : raw);
+  }
+
   // =========================================================================
   // Fix 1: client_credentials tokens validate at /mcp
   // =========================================================================
@@ -331,6 +338,45 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
     // Body shape is exactly {status, version, engine}.
     expect(Object.keys(data).sort()).toEqual(['engine', 'status', 'version']);
   });
+
+  test('legacy bearer scopes and exact tools constrain discovery and calls end-to-end', async () => {
+    const { execFileSync } = await import('child_process');
+    const tokenName = `e2e-legacy-capabilities-${Date.now()}`;
+    try {
+      const createOutput = execFileSync('bun', [
+        'run', 'src/cli.ts', 'auth', 'create', tokenName,
+        '--scopes', 'admin',
+        '--tools', 'search,get_stats',
+      ], { cwd: process.cwd(), encoding: 'utf8', env: { ...process.env } });
+      const token = createOutput.match(/^\s+(gbrain_[a-f0-9]{64})\s*$/m)?.[1];
+      if (!token) throw new Error('Legacy token creation did not return a token');
+
+      const listed = await mcpJson(token, 'tools/list');
+      expect(listed.result.tools.map((tool: { name: string }) => tool.name).sort()).toEqual([
+        'get_stats',
+        'search',
+      ]);
+
+      const allowed = await mcpJson(token, 'tools/call', {
+        name: 'get_stats',
+        arguments: {},
+      });
+      expect(allowed.result.isError).not.toBe(true);
+
+      const denied = await mcpJson(token, 'tools/call', {
+        name: 'put_page',
+        arguments: { slug: 'must-not-exist', content: 'blocked' },
+      });
+      expect(denied.result.isError).toBe(true);
+      expect(denied.result.content[0].text).toContain('unknown_operation');
+    } finally {
+      try {
+        execFileSync('bun', ['run', 'src/cli.ts', 'auth', 'revoke', tokenName], {
+          cwd: process.cwd(), encoding: 'utf8', env: { ...process.env }, stdio: 'ignore',
+        });
+      } catch { /* best-effort cleanup if create failed before inserting */ }
+    }
+  }, 15_000);
 
   test('v0.28.10: /admin/api/full-stats without admin cookie returns 401', async () => {
     const res = await fetch(`${BASE}/admin/api/full-stats`);

@@ -338,6 +338,48 @@ describe('verifyAccessToken', () => {
     expect(authInfo.sourceId).toBe('default');
     expect(authInfo.allowedSources).toEqual(['default', 'src-a', 'src-b']);
   });
+
+  test('legacy access_tokens fallback enforces explicit scopes and exact tools', async () => {
+    const legacyToken = generateToken('gbrain_');
+    const hash = hashToken(legacyToken);
+    await sql`
+      INSERT INTO access_tokens (id, name, token_hash, permissions)
+      VALUES (
+        ${crypto.randomUUID()},
+        ${'legacy-least-privilege-agent'},
+        ${hash},
+        ${JSON.stringify({
+          source_id: ['src-a'],
+          scopes: ['read'],
+          allowed_tools: ['search', 'get_page'],
+        })}::jsonb
+      )
+    `;
+
+    const authInfo = await provider.verifyAccessToken(legacyToken) as CoreAuthInfo;
+    expect(authInfo.scopes).toEqual(['read']);
+    expect(authInfo.allowedTools).toEqual(['search', 'get_page']);
+    expect(authInfo.sourceId).toBe('src-a');
+    expect(authInfo.allowedSources).toEqual(['src-a']);
+  });
+
+  test('explicit malformed legacy capability fields fail closed', async () => {
+    const legacyToken = generateToken('gbrain_');
+    const hash = hashToken(legacyToken);
+    await sql`
+      INSERT INTO access_tokens (id, name, token_hash, permissions)
+      VALUES (
+        ${crypto.randomUUID()},
+        ${'legacy-malformed-capabilities'},
+        ${hash},
+        ${JSON.stringify({ scopes: 'read', allowed_tools: 'search' })}::jsonb
+      )
+    `;
+
+    const authInfo = await provider.verifyAccessToken(legacyToken) as CoreAuthInfo;
+    expect(authInfo.scopes).toEqual([]);
+    expect(authInfo.allowedTools).toEqual([]);
+  });
 });
 
 // ---------------------------------------------------------------------------

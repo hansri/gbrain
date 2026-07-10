@@ -34,8 +34,12 @@ import { VERSION } from '../version.ts';
 import { dispatchToolCall } from './dispatch.ts';
 import { buildDefaultLimiters, type RateLimiter } from './rate-limit.ts';
 import { sqlQueryForEngine } from '../core/sql-query.ts';
-import { parseLegacyTokenScope } from '../core/legacy-token-scope.ts';
-export { parseLegacyTokenScope };
+import {
+  parseLegacyTokenCapabilities,
+  parseLegacyTokenScope,
+} from '../core/legacy-token-scope.ts';
+import { hasScope } from '../core/scope.ts';
+export { parseLegacyTokenCapabilities, parseLegacyTokenScope };
 
 const DEFAULT_BODY_CAP = 1024 * 1024; // 1 MiB
 
@@ -84,6 +88,8 @@ interface AuthResult {
    * Bounded to the stored grant — never widened to "all".
    */
   auth?: AuthInfo;
+  scopes?: string[];
+  allowedTools?: string[];
 }
 
 /* Legacy token source-scope parsing lives in core/legacy-token-scope.ts and is
@@ -148,7 +154,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
   const limiters = opts.limiters || buildDefaultLimiters();
   const bodyCap = envInt('GBRAIN_HTTP_MAX_BODY_BYTES', DEFAULT_BODY_CAP);
   const corsAllowlist = parseCorsAllowlist();
-  const tools = buildToolDefs(operations);
+  const remoteOperations = operations.filter(op => !op.localOnly);
 
   /**
    * v0.41.3 (T6): single consolidated CORS header builder. Pre-fix there were
@@ -212,11 +218,15 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         : ['world'];
       // #1336: honor the operator-set source grant stored on the token.
       const { sourceId, allowedSources } = parseLegacyTokenScope(perms?.source_id);
+      const capabilities = parseLegacyTokenCapabilities(perms);
       const auth: AuthInfo = {
         token,
         clientId: rowId,
         clientName: rowName,
-        scopes: [],
+        scopes: capabilities.scopes,
+        ...(capabilities.allowedTools !== undefined
+          ? { allowedTools: capabilities.allowedTools }
+          : {}),
         sourceId,
         ...(allowedSources ? { allowedSources } : {}),
       };
@@ -229,6 +239,10 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
         // source unless the token carries an explicit grant (#1336 above).
         sourceId,
         auth,
+        scopes: capabilities.scopes,
+        ...(capabilities.allowedTools !== undefined
+          ? { allowedTools: capabilities.allowedTools }
+          : {}),
       };
     } catch {
       return { ok: false };
@@ -364,9 +378,15 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
 
       // tools/list
       if (method === 'tools/list') {
+        const allowedTools = auth.allowedTools;
+        const discoverableOperations = remoteOperations.filter(operation => {
+          const toolAllowed = allowedTools === undefined
+            || allowedTools.includes(operation.name);
+          return toolAllowed && hasScope(auth.scopes ?? [], operation.scope || 'read');
+        });
         logRequest(auth.tokenName!, 'tools/list', 'success', Date.now() - startedMs);
         return Response.json(
-          { result: { tools }, jsonrpc: '2.0', id },
+          { result: { tools: buildToolDefs(discoverableOperations) }, jsonrpc: '2.0', id },
           { headers: corsHeaders(origin) },
         );
       }
@@ -375,6 +395,38 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       if (method === 'tools/call') {
         const toolName: string = params?.name ?? 'unknown';
         const args: Record<string, unknown> = params?.arguments ?? {};
+        const operation = remoteOperations.find(op => op.name === toolName);
+        const toolAllowed = auth.allowedTools === undefined
+          || auth.allowedTools.includes(toolName);
+        if (!operation || !toolAllowed) {
+          logRequest(auth.tokenName!, `tools/call:${toolName}`, 'denied', Date.now() - startedMs);
+          return Response.json(
+            {
+              result: {
+                content: [{ type: 'text', text: JSON.stringify({ error: 'unknown_tool', message: `Unknown tool: ${toolName}` }, null, 2) }],
+                isError: true,
+              },
+              jsonrpc: '2.0',
+              id,
+            },
+            { headers: corsHeaders(origin) },
+          );
+        }
+        const requiredScope = operation.scope || 'read';
+        if (!hasScope(auth.scopes ?? [], requiredScope)) {
+          logRequest(auth.tokenName!, `tools/call:${toolName}`, 'denied', Date.now() - startedMs);
+          return Response.json(
+            {
+              result: {
+                content: [{ type: 'text', text: JSON.stringify({ error: 'insufficient_scope', message: `Operation ${toolName} requires '${requiredScope}' scope` }, null, 2) }],
+                isError: true,
+              },
+              jsonrpc: '2.0',
+              id,
+            },
+            { headers: corsHeaders(origin) },
+          );
+        }
         // v0.28: thread per-token takes-holder allow-list so takes_list /
         // takes_search / query (when it returns takes) can server-side filter.
         // v0.34.1 (#861): thread source-isolation scope. Legacy access_tokens

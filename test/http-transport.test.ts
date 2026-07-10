@@ -66,7 +66,16 @@ interface FakeEngineConfig {
    * `permissions` JSONB column. Default permissions = {takes_holders: ['world']}
    * when unset, matching the migration v33 default.
    */
-  validTokens?: Map<string, { id: string; name: string; permissions?: { takes_holders?: string[] } }>;
+  validTokens?: Map<string, {
+    id: string;
+    name: string;
+    permissions?: {
+      takes_holders?: string[];
+      scopes?: unknown;
+      allowed_tools?: unknown;
+      source_id?: unknown;
+    };
+  }>;
   /** Tokens that are present but revoked (revoked_at IS NOT NULL — query returns empty). */
   revokedTokens?: Set<string>;
   /** If true, every SELECT throws (simulating DB outage). */
@@ -270,6 +279,111 @@ describe('http-transport: auth', () => {
       expect(body.status).toBe('unhealthy');
       expect(body.db).toBe('unreachable');
     } finally { dbDownSrv.stop(); }
+  });
+});
+
+describe('http-transport: legacy capability boundary', () => {
+  const TOKEN = 'least-privilege-token';
+
+  test('tools/list exposes only the explicit server-side allow-list', async () => {
+    const srv = await startTest({
+      validTokens: new Map([[hash(TOKEN), {
+        id: 'tok-lp-list',
+        name: 'least-privilege',
+        permissions: {
+          scopes: ['read'],
+          allowed_tools: ['search', 'get_page', 'put_page'],
+        },
+      }]]),
+    });
+    try {
+      const response = await fetch(`${srv.url}/mcp`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+        body: rpc('tools/list'),
+      });
+      const body = await response.json();
+      expect(body.result.tools.map((tool: { name: string }) => tool.name).sort()).toEqual([
+        'get_page',
+        'search',
+      ]);
+    } finally {
+      srv.stop();
+    }
+  });
+
+  test('tools/call rejects a tool outside the exact allow-list before dispatch', async () => {
+    const srv = await startTest({
+      validTokens: new Map([[hash(TOKEN), {
+        id: 'tok-lp-call',
+        name: 'least-privilege',
+        permissions: {
+          // Admin satisfies every operation scope. The exact tool boundary
+          // must therefore remain independently load-bearing.
+          scopes: ['admin'],
+          allowed_tools: ['search'],
+        },
+      }]]),
+    });
+    try {
+      const response = await fetch(`${srv.url}/mcp`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+        body: rpc('tools/call', { name: 'put_page', arguments: {} }),
+      });
+      const body = await response.json();
+      expect(body.result.isError).toBe(true);
+      expect(JSON.parse(body.result.content[0].text).error).toBe('unknown_tool');
+      expect(srv.engine.audit.some(row => row.operation === 'tools/call:put_page' && row.status === 'denied')).toBe(true);
+    } finally {
+      srv.stop();
+    }
+  });
+
+  test('tools/call enforces explicit scopes even when a tool is allow-listed', async () => {
+    const srv = await startTest({
+      validTokens: new Map([[hash(TOKEN), {
+        id: 'tok-lp-scope',
+        name: 'least-privilege',
+        permissions: {
+          scopes: ['read'],
+          allowed_tools: ['put_page'],
+        },
+      }]]),
+    });
+    try {
+      const response = await fetch(`${srv.url}/mcp`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+        body: rpc('tools/call', { name: 'put_page', arguments: {} }),
+      });
+      const body = await response.json();
+      expect(body.result.isError).toBe(true);
+      expect(JSON.parse(body.result.content[0].text).error).toBe('insufficient_scope');
+    } finally {
+      srv.stop();
+    }
+  });
+
+  test('an explicit malformed allow-list fails closed to zero tools', async () => {
+    const srv = await startTest({
+      validTokens: new Map([[hash(TOKEN), {
+        id: 'tok-lp-malformed',
+        name: 'least-privilege',
+        permissions: { scopes: ['read'], allowed_tools: 'search' },
+      }]]),
+    });
+    try {
+      const response = await fetch(`${srv.url}/mcp`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${TOKEN}`, 'Content-Type': 'application/json' },
+        body: rpc('tools/list'),
+      });
+      const body = await response.json();
+      expect(body.result.tools).toEqual([]);
+    } finally {
+      srv.stop();
+    }
   });
 });
 

@@ -24,6 +24,7 @@ import { loadConfig, toEngineConfig } from '../core/config.ts';
 import { createEngine } from '../core/engine-factory.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { sqlQueryForEngine, executeRawJsonb, type SqlQuery } from '../core/sql-query.ts';
+import { assertAllowedScopes } from '../core/scope.ts';
 
 function hashToken(token: string): string {
   return createHash('sha256').update(token).digest('hex');
@@ -66,8 +67,25 @@ async function withConfiguredSql<T>(
   }
 }
 
-async function create(name: string, opts: { takesHolders?: string[] } = {}) {
-  if (!name) { console.error('Usage: auth create <name> [--takes-holders world,garry]'); process.exit(1); }
+interface LegacyTokenCreateOptions {
+  takesHolders?: string[];
+  scopes?: string[];
+  allowedTools?: string[];
+}
+
+type LegacyPermissionAction = 'set-takes-holders' | 'set-scopes' | 'set-tools';
+
+const LEGACY_TOOL_NAME_RE = /^[A-Za-z][A-Za-z0-9_-]*$/;
+
+function assertAllowedLegacyTools(tools: readonly string[]): void {
+  const invalid = tools.find(tool => !LEGACY_TOOL_NAME_RE.test(tool));
+  if (invalid) {
+    throw new Error(`Invalid tool name "${invalid}". Tool names may contain only letters, numbers, underscore, and hyphen.`);
+  }
+}
+
+async function create(name: string, opts: LegacyTokenCreateOptions = {}) {
+  if (!name) { console.error('Usage: auth create <name> [--takes-holders world,garry] [--scopes read] [--tools search,get_page]'); process.exit(1); }
   const token = generateToken();
   const hash = hashToken(token);
 
@@ -78,7 +96,19 @@ async function create(name: string, opts: { takesHolders?: string[] } = {}) {
       const takesHolders = opts.takesHolders && opts.takesHolders.length > 0
         ? opts.takesHolders
         : ['world'];
-      const permissions = { takes_holders: takesHolders };
+      if (opts.scopes !== undefined) {
+        if (opts.scopes.length === 0) throw new Error('scopes list cannot be empty');
+        assertAllowedScopes(opts.scopes);
+      }
+      if (opts.allowedTools !== undefined) {
+        if (opts.allowedTools.length === 0) throw new Error('tools list cannot be empty');
+        assertAllowedLegacyTools(opts.allowedTools);
+      }
+      const permissions = {
+        takes_holders: takesHolders,
+        ...(opts.scopes !== undefined ? { scopes: opts.scopes } : {}),
+        ...(opts.allowedTools !== undefined ? { allowed_tools: opts.allowedTools } : {}),
+      };
       // JSONB write: pass the object via executeRawJsonb with an explicit
       // ::jsonb cast in the SQL string. Both engines round-trip the object
       // through the wire-protocol type oid without the v0.12.0 double-encode
@@ -91,11 +121,13 @@ async function create(name: string, opts: { takesHolders?: string[] } = {}) {
         [name, hash],
         [permissions],
       );
-      console.log(`Token created for "${name}" (takes_holders=${JSON.stringify(takesHolders)}):\n`);
+      const scopeLabel = opts.scopes === undefined ? 'legacy-full' : opts.scopes.join(',');
+      const toolLabel = opts.allowedTools === undefined ? 'all' : String(opts.allowedTools.length);
+      console.log(`Token created for "${name}" (takes_holders=${JSON.stringify(takesHolders)}, scopes=${scopeLabel}, allowed_tools=${toolLabel}):\n`);
       console.log(`  ${token}\n`);
       console.log('Save this token — it will not be shown again.');
       console.log(`Revoke with: gbrain auth revoke "${name}"`);
-      console.log(`Update visibility: gbrain auth permissions "${name}" set-takes-holders world,garry`);
+      console.log(`Update capabilities: gbrain auth permissions "${name}" set-scopes read`);
     });
   } catch (e: any) {
     if (e.code === '23505') {
@@ -107,34 +139,31 @@ async function create(name: string, opts: { takesHolders?: string[] } = {}) {
   }
 }
 
-async function permissions(name: string, action: string, value: string | undefined) {
-  if (!name || action !== 'set-takes-holders' || !value) {
-    console.error('Usage: auth permissions <name> set-takes-holders world,garry,brain');
-    process.exit(1);
-  }
+async function permissions(name: string, action: LegacyPermissionAction, list: string[]) {
   try {
-    await withConfiguredSql(async (sql, engine) => {
-      const list = value.split(',').map(s => s.trim()).filter(Boolean);
-      if (list.length === 0) {
-        console.error('takes-holders list cannot be empty (use "world" for default-deny on private)');
-        process.exit(1);
-      }
-      const perms = { takes_holders: list };
-      // JSONB UPDATE via executeRawJsonb — same pattern as create() above.
+    await withConfiguredSql(async (_sql, engine) => {
+      const field = action === 'set-takes-holders'
+        ? 'takes_holders'
+        : action === 'set-scopes'
+          ? 'scopes'
+          : 'allowed_tools';
+      const patch = { [field]: list };
+      // Merge only the selected capability field. Replacing the whole JSONB
+      // object would silently erase source, holder, scope, or tool boundaries.
       const result = await executeRawJsonb(
         engine,
         `UPDATE access_tokens
-            SET permissions = $2::jsonb
+            SET permissions = COALESCE(permissions, '{}'::jsonb) || $2::jsonb
             WHERE name = $1
             RETURNING id`,
         [name],
-        [perms],
+        [patch],
       );
       if (result.length === 0) {
         console.error(`Token "${name}" not found.`);
         process.exit(1);
       }
-      console.log(`Updated "${name}": takes_holders = ${JSON.stringify(list)}`);
+      console.log(`Updated "${name}": ${field} count = ${list.length}`);
     });
   } catch (e: any) {
     console.error('Error:', e.message);
@@ -469,14 +498,60 @@ async function registerClient(name: string, args: string[]) {
  * resolved to `rest[0]` when `takesIdx === -1`, silently dropping the name on
  * the bare `gbrain auth create <name>` form.
  */
-export function parseAuthCreateArgs(rest: string[]): { name: string; takesHolders?: string[] } {
-  const takesIdx = rest.indexOf('--takes-holders');
-  const takesHolders = takesIdx >= 0 && rest[takesIdx + 1]
-    ? rest[takesIdx + 1].split(',').map(s => s.trim()).filter(Boolean)
-    : undefined;
-  const takesValue = takesIdx >= 0 ? rest[takesIdx + 1] : undefined;
-  const positional = rest.find(a => !a.startsWith('--') && a !== takesValue);
-  return { name: positional || '', takesHolders };
+export function parseAuthCreateArgs(rest: string[]): { name: string; takesHolders?: string[]; scopes?: string[]; allowedTools?: string[] } {
+  let name = '';
+  let takesHolders: string[] | undefined;
+  let scopes: string[] | undefined;
+  let allowedTools: string[] | undefined;
+  for (let i = 0; i < rest.length; i++) {
+    const argument = rest[i];
+    if (argument === '--takes-holders' || argument === '--scopes' || argument === '--tools') {
+      const value = rest[++i];
+      if (value === undefined || value.startsWith('--')) throw new Error(`${argument} requires a value`);
+      const parsed = splitCapabilityList(value);
+      if (argument === '--takes-holders') takesHolders = parsed;
+      else if (argument === '--scopes') scopes = parsed;
+      else allowedTools = parsed;
+      continue;
+    }
+    if (argument.startsWith('--')) throw new Error(`Unknown flag: ${argument}`);
+    if (name) throw new Error(`Unexpected positional argument: ${argument}`);
+    name = argument;
+  }
+  if (scopes !== undefined) {
+    if (scopes.length === 0) throw new Error('--scopes list cannot be empty');
+    assertAllowedScopes(scopes);
+  }
+  if (allowedTools !== undefined) {
+    if (allowedTools.length === 0) throw new Error('--tools list cannot be empty');
+    assertAllowedLegacyTools(allowedTools);
+  }
+  return { name, takesHolders, scopes, allowedTools };
+}
+
+function splitCapabilityList(value: string): string[] {
+  return [...new Set(value.split(/[\s,]+/).map(item => item.trim()).filter(Boolean))];
+}
+
+export function parseAuthPermissionsArgs(rest: string[]): {
+  name: string;
+  action: LegacyPermissionAction;
+  values: string[];
+} {
+  if (rest.length !== 3) {
+    throw new Error('auth permissions requires exactly a name, action, and list');
+  }
+  const [name, rawAction, rawValue] = rest;
+  if (!name) throw new Error('token name is required');
+  if (!['set-takes-holders', 'set-scopes', 'set-tools'].includes(rawAction)) {
+    throw new Error(`Unknown permissions action: ${rawAction}`);
+  }
+  const action = rawAction as LegacyPermissionAction;
+  const values = splitCapabilityList(rawValue);
+  if (values.length === 0) throw new Error(`${action} list cannot be empty`);
+  if (action === 'set-scopes') assertAllowedScopes(values);
+  if (action === 'set-tools') assertAllowedLegacyTools(values);
+  return { name, action, values };
 }
 
 export async function runAuth(args: string[]): Promise<void> {
@@ -484,15 +559,33 @@ export async function runAuth(args: string[]): Promise<void> {
   switch (cmd) {
     case 'create': {
       // v0.28: optional --takes-holders world,garry,brain (default: world only)
-      const parsed = parseAuthCreateArgs(rest);
-      await create(parsed.name, { takesHolders: parsed.takesHolders });
+      let parsed: ReturnType<typeof parseAuthCreateArgs>;
+      try {
+        parsed = parseAuthCreateArgs(rest);
+      } catch (e: any) {
+        console.error(`Error: ${e.message}`);
+        console.error('Usage: auth create <name> [--takes-holders world,garry] [--scopes read] [--tools search,get_page]');
+        process.exit(1);
+      }
+      await create(parsed.name, {
+        takesHolders: parsed.takesHolders,
+        scopes: parsed.scopes,
+        allowedTools: parsed.allowedTools,
+      });
       return;
     }
     case 'list': await list(); return;
     case 'revoke': await revoke(rest[0]); return;
     case 'permissions': {
-      // gbrain auth permissions <name> set-takes-holders world,garry
-      await permissions(rest[0] || '', rest[1] || '', rest[2]);
+      let parsed: ReturnType<typeof parseAuthPermissionsArgs>;
+      try {
+        parsed = parseAuthPermissionsArgs(rest);
+      } catch (e: any) {
+        console.error(`Error: ${e.message}`);
+        console.error('Usage: auth permissions <name> set-takes-holders <h1,h2> | set-scopes <read,write> | set-tools <tool1,tool2>');
+        process.exit(1);
+      }
+      await permissions(parsed.name, parsed.action, parsed.values);
       return;
     }
     case 'register-client': await registerClient(rest[0], rest.slice(1)); return;
@@ -508,15 +601,21 @@ export async function runAuth(args: string[]): Promise<void> {
       console.log(`GBrain Token Management
 
 Usage:
-  gbrain auth create <name> [--takes-holders world,garry,brain]
+  gbrain auth create <name> [--takes-holders world,garry,brain] [--scopes read] [--tools search,get_page]
                                                           Create a legacy bearer token. v0.28: --takes-holders
                                                           sets the per-token allow-list for the takes.holder
                                                           field (default: ["world"]). MCP-bound calls to
                                                           takes_list / takes_search / query filter by this.
+                                                          Optional scopes and tools narrow the static token
+                                                          server-side; omitted fields preserve compatibility.
   gbrain auth list                                         List all tokens
   gbrain auth revoke <name>                                Revoke a legacy token
   gbrain auth permissions <name> set-takes-holders <h1,h2,h3>
                                                           Update visibility for an existing token
+  gbrain auth permissions <name> set-scopes <read,write>
+                                                          Set exact OAuth-style operation scopes
+  gbrain auth permissions <name> set-tools <tool1,tool2>
+                                                          Set exact remote MCP tool discovery/call boundary
   gbrain auth register-client <name> [options]             Register an OAuth 2.1 client (v0.26+)
      --grant-types <client_credentials,authorization_code>  (default: client_credentials;
                                                             auto-set to authorization_code,refresh_token
