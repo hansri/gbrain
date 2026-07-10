@@ -18,12 +18,19 @@ describe('normalizeSearchDateWindow', () => {
 
   test('normalizes explicit offsets and treats zone-less timestamps as UTC', () => {
     expect(normalizeSearchDateWindow({
-      since: '2026-07-09T12:30:00+02:00',
-      until: '2026-07-09T12:30:00',
+      since: '2026-07-09T12:30:00.123456+02:00',
+      until: '2026-07-09T12:30:00.999500',
     })).toEqual({
-      since: '2026-07-09T10:30:00.000Z',
-      until: '2026-07-09T12:30:00.000Z',
+      since: '2026-07-09T10:30:00.123456Z',
+      until: '2026-07-09T12:30:00.999500Z',
     });
+  });
+
+  test('compares boundaries at microsecond precision', () => {
+    expect(() => normalizeSearchDateWindow({
+      since: '2026-07-09T12:30:00.999600Z',
+      until: '2026-07-09T12:30:00.999500Z',
+    })).toThrow(/since .* is after until/);
   });
 
   test('resolves relative durations against the injected clock', () => {

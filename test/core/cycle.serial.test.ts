@@ -10,7 +10,16 @@
  */
 
 import { describe, test, expect, mock, beforeEach, beforeAll, afterAll, afterEach } from 'bun:test';
-import { existsSync, unlinkSync } from 'fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+} from 'fs';
+import { tmpdir } from 'os';
+import { join, relative } from 'path';
 
 // ─── Mocks ──────────────────────────────────────────────────────────
 // Track what each phase was called with so tests can assert.
@@ -540,6 +549,60 @@ describe('runCycle — sourceId resolution (regression #475)', () => {
     await expect(runCycle(sharedEngine, { brainDir: '/tmp/brain-475-e' }))
       .rejects.toThrow(/Ambiguous source mapping/);
     expect(syncCalls.length).toBe(0);
+  });
+
+  test('canonically equivalent local_path rows fail closed', async () => {
+    await (sharedEngine as any).db.query(
+      `INSERT INTO sources (id, name, local_path) VALUES
+        ('first', 'first', '/tmp/brain-475-canonical'),
+        ('second', 'second', '/tmp/brain-475-canonical/.')`,
+    );
+    await expect(runCycle(sharedEngine, { brainDir: '/tmp/brain-475-canonical' }))
+      .rejects.toThrow(/Ambiguous source mapping/);
+  });
+
+  test('trailing path components resolve to the registered source', async () => {
+    await (sharedEngine as any).db.query(
+      `INSERT INTO sources (id, name, local_path) VALUES ($1, $2, $3)`,
+      ['alpha', 'alpha', '/tmp/brain-475-trailing/.'],
+    );
+    await runCycle(sharedEngine, {
+      brainDir: '/tmp/brain-475-trailing',
+      phases: ['sync'],
+    });
+    expect(syncCalls.at(-1)?.sourceId).toBe('alpha');
+  });
+
+  test('legacy relative local_path rows resolve against the working directory', async () => {
+    const checkout = mkdtempSync(join(tmpdir(), 'gbrain-cycle-relative-path-'));
+    try {
+      await (sharedEngine as any).db.query(
+        `INSERT INTO sources (id, name, local_path) VALUES ($1, $2, $3)`,
+        ['alpha', 'alpha', relative(process.cwd(), checkout)],
+      );
+      await runCycle(sharedEngine, { brainDir: checkout, phases: ['sync'] });
+      expect(syncCalls.at(-1)?.sourceId).toBe('alpha');
+    } finally {
+      rmSync(checkout, { recursive: true, force: true });
+    }
+  });
+
+  test('symlink and real checkout paths resolve to one source identity', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'gbrain-cycle-source-path-'));
+    const checkout = join(root, 'checkout');
+    const alias = join(root, 'checkout-link');
+    mkdirSync(checkout);
+    symlinkSync(checkout, alias, 'dir');
+    try {
+      await (sharedEngine as any).db.query(
+        `INSERT INTO sources (id, name, local_path) VALUES ($1, $2, $3)`,
+        ['alpha', 'alpha', alias],
+      );
+      await runCycle(sharedEngine, { brainDir: checkout, phases: ['sync'] });
+      expect(syncCalls.at(-1)?.sourceId).toBe('alpha');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('empty-string source ids fail closed', async () => {

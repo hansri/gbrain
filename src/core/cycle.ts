@@ -52,6 +52,7 @@ import { getCliOptions, cliOptsToProgressOptions } from './cli-options.ts';
 import { tryAcquireDbLock, reapDeadHolderLocks, type DbLockHandle } from './db-lock.ts';
 import { assertValidSourceId } from './source-id.ts';
 import { isUndefinedTableError } from './utils.ts';
+import { canonicalSourcePath } from './source-path.ts';
 
 // ─── Types ─────────────────────────────────────────────────────────
 
@@ -833,11 +834,10 @@ async function resolveSourceForDir(
   // No checkout → no path-derived source. Callers fall back to opts.sourceId
   // (the cycleSourceId precedence) or 'default'.
   if (brainDir === null) return undefined;
-  let rows: Array<{ id: string }>;
+  let rows: Array<{ id: string; local_path: string }>;
   try {
-    rows = await engine.executeRaw<{ id: string }>(
-      `SELECT id FROM sources WHERE local_path = $1 ORDER BY id LIMIT 2`,
-      [brainDir],
+    rows = await engine.executeRaw<{ id: string; local_path: string }>(
+      `SELECT id, local_path FROM sources WHERE local_path IS NOT NULL ORDER BY id`,
     );
   } catch (error) {
     // sources table might not exist on very old brains — fall through. Any
@@ -845,13 +845,15 @@ async function resolveSourceForDir(
     if (isUndefinedTableError(error)) return undefined;
     throw error;
   }
-  if (rows.length > 1) {
+  const requestedPath = canonicalSourcePath(brainDir);
+  const matches = rows.filter((row) => canonicalSourcePath(row.local_path) === requestedPath);
+  if (matches.length > 1) {
     throw new Error(
       `Ambiguous source mapping for brain directory "${brainDir}": multiple sources share local_path. `
       + 'Repair the sources table before running a cycle.',
     );
   }
-  const sourceId = rows[0]?.id;
+  const sourceId = matches[0]?.id;
   if (sourceId !== undefined) assertValidSourceId(sourceId);
   return sourceId;
 }

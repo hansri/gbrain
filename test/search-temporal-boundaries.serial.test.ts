@@ -161,4 +161,18 @@ describe('PGLite temporal search containment', () => {
     const results = await engine.searchKeyword('temporal boundary sentinel', legacy);
     expect(results.map((result) => result.slug)).toEqual([]);
   });
+
+  test('deprecated date-only beforeDate remains exclusive at midnight', async () => {
+    const results = await hybridSearch(engine, 'temporal boundary sentinel', {
+      afterDate: '2026-07-08',
+      beforeDate: '2026-07-09',
+      expansion: false,
+      relationalRetrieval: false,
+      dedupOpts: { cosineThreshold: 1.1, maxTypeRatio: 1, maxPerPage: 3 },
+      limit: 20,
+    });
+    expect(results.map((result) => result.slug)).toEqual([
+      'meetings/temporal-before',
+    ]);
+  });
 });

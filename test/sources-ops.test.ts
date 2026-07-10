@@ -12,8 +12,9 @@ import {
   symlinkSync,
   chmodSync,
   existsSync,
+  realpathSync,
 } from 'fs';
-import { join } from 'path';
+import { join, relative } from 'path';
 import { tmpdir } from 'os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import {
@@ -181,6 +182,16 @@ describe('addSource — happy paths', () => {
       expect(row.id).toBe('wiki');
       expect(row.local_path).toBe('/tmp/wiki-fixture');
       expect(row.config).toEqual({ federated: true });
+    });
+  });
+
+  test('relative localPath is stored as canonical absolute identity', async () => {
+    await withEnv2(async () => {
+      const row = await addSource(engine, {
+        id: 'relative-wiki',
+        localPath: relative(process.cwd(), FAKE_GIT_DIR),
+      });
+      expect(row.local_path).toBe(realpathSync.native(FAKE_GIT_DIR));
     });
   });
 

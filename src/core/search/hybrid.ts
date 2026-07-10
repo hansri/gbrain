@@ -752,7 +752,13 @@ function normalizeHybridSearchDateOpts(opts?: HybridSearchOpts): HybridSearchOpt
   const rawUntil = opts?.until ?? opts?.beforeDate;
   if (rawSince === undefined && rawUntil === undefined) return opts;
 
-  const window = normalizeSearchDateWindow({ since: rawSince, until: rawUntil });
+  const window = normalizeSearchDateWindow({
+    since: rawSince,
+    until: rawUntil,
+    // Deprecated beforeDate treated a date-only value as midnight and used
+    // a strict `<` comparison. Only public until expands through end-of-day.
+    untilDateOnlyEndOfDay: opts?.until !== undefined,
+  });
   return {
     ...opts,
     // Keep the public and deprecated fields distinct. Public since/until are

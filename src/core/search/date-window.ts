@@ -18,6 +18,8 @@ export class SearchDateWindowError extends Error {
 export interface SearchDateWindowInput {
   since?: string;
   until?: string;
+  /** Default true. Set false for deprecated beforeDate midnight semantics. */
+  untilDateOnlyEndOfDay?: boolean;
 }
 
 export interface NormalizedSearchDateWindow {
@@ -28,6 +30,7 @@ export interface NormalizedSearchDateWindow {
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const RELATIVE_RE = /^(\d+)(d|w|y)$/i;
 const EXPLICIT_ZONE_RE = /(Z|[+-]\d{2}:?\d{2})$/i;
+const ISO_TIMESTAMP_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?)(?:\.(\d{1,9}))?(Z|[+-]\d{2}:?\d{2})$/i;
 
 export function isRelativeSearchDateBoundary(value: string | undefined): boolean {
   return value !== undefined && RELATIVE_RE.test(value.trim());
@@ -43,6 +46,7 @@ function normalizeBoundary(
   rawValue: string | undefined,
   label: 'since' | 'until',
   now: Date,
+  untilDateOnlyEndOfDay: boolean,
 ): string | undefined {
   if (rawValue === undefined) return undefined;
   const raw = rawValue.trim();
@@ -66,14 +70,15 @@ function normalizeBoundary(
   if (DATE_ONLY_RE.test(raw)) {
     // Date-only `until` is inclusive of the whole UTC day, matching the
     // public operation contract. `since` begins at the first millisecond.
-    const suffix = label === 'until' ? 'T23:59:59.999Z' : 'T00:00:00.000Z';
+    const endOfDay = label === 'until' && untilDateOnlyEndOfDay;
+    const suffix = endOfDay ? 'T23:59:59.999Z' : 'T00:00:00.000Z';
     const parsed = new Date(`${raw}${suffix}`);
     if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== raw) {
       throw invalid(label, rawValue);
     }
     // PostgreSQL stores microseconds. Returning JS's millisecond-resolution
     // `.999Z` would exclude rows in the final 999 microseconds of the day.
-    return label === 'until' ? `${raw}T23:59:59.999999Z` : parsed.toISOString();
+    return endOfDay ? `${raw}T23:59:59.999999Z` : parsed.toISOString();
   }
 
   // Zone-less ISO timestamps are interpreted as UTC, not the host timezone,
@@ -81,7 +86,23 @@ function normalizeBoundary(
   const candidate = EXPLICIT_ZONE_RE.test(raw) ? raw : `${raw}Z`;
   const parsed = new Date(candidate);
   if (!Number.isFinite(parsed.getTime())) throw invalid(label, rawValue);
-  return parsed.toISOString();
+  const iso = parsed.toISOString();
+  const timestamp = ISO_TIMESTAMP_RE.exec(candidate);
+  const fraction = timestamp?.[2];
+  if (!fraction || fraction.length <= 3) return iso;
+
+  // Date preserves milliseconds only. Append the remaining fractional
+  // digits after timezone normalization so PostgreSQL receives its full
+  // six-digit precision without changing the represented instant.
+  const micros = fraction.padEnd(6, '0').slice(0, 6);
+  return `${iso.slice(0, -1)}${micros.slice(3)}Z`;
+}
+
+function boundaryMicros(value: string): bigint {
+  const millis = Date.parse(value);
+  const fraction = /\.(\d{1,6})Z$/.exec(value)?.[1] ?? '';
+  const microsWithinMillisecond = Number(fraction.padEnd(6, '0').slice(3, 6) || '0');
+  return BigInt(millis) * 1000n + BigInt(microsWithinMillisecond);
 }
 
 export function normalizeSearchDateWindow(
@@ -92,9 +113,10 @@ export function normalizeSearchDateWindow(
     throw new SearchDateWindowError('Search date-window clock is invalid.');
   }
 
-  const since = normalizeBoundary(input.since, 'since', now);
-  const until = normalizeBoundary(input.until, 'until', now);
-  if (since && until && Date.parse(since) > Date.parse(until)) {
+  const untilDateOnlyEndOfDay = input.untilDateOnlyEndOfDay !== false;
+  const since = normalizeBoundary(input.since, 'since', now, untilDateOnlyEndOfDay);
+  const until = normalizeBoundary(input.until, 'until', now, untilDateOnlyEndOfDay);
+  if (since && until && boundaryMicros(since) > boundaryMicros(until)) {
     throw new SearchDateWindowError(
       `Invalid search date window: since (${since}) is after until (${until}).`,
     );
