@@ -1,10 +1,14 @@
 import { existsSync, readFileSync, writeFileSync, statSync } from 'fs';
 import { execFileSync } from 'child_process';
-import { join, relative } from 'path';
+import { join } from 'path';
 import type { BrainEngine } from '../core/engine.ts';
 import { DELETE_BATCH_SIZE } from '../core/engine-constants.ts';
-import { importFile } from '../core/import-file.ts';
-import { collectSyncableFiles } from './import.ts';
+import { importGitBlob } from '../core/import-file.ts';
+import {
+  collectSyncableFiles,
+  collectSyncableGitBlobs,
+  filterSyncableGitBlobs,
+} from './import.ts';
 import { createInterface } from 'readline';
 import {
   isSyncable,
@@ -22,6 +26,10 @@ import {
 import {
   computeSyncDelta,
   buildDetachedWorkingTreeManifest,
+  GIT_SNAPSHOT_SENTINEL,
+  GitSnapshotError,
+  openGitCommitSnapshot,
+  readGitCommitBlobsBatch,
 } from '../core/sync-delta.ts';
 import { fetchRemote } from '../core/git-remote.ts';
 import {
@@ -70,7 +78,7 @@ import { getDefaultSourcePath } from '../core/source-resolver.ts';
 // remote staleness path reads a column instead of shelling out to git.
 // lagFromContentMs is the remote/column comparator (buildSyncStatusReport
 // backs the get_status_snapshot MCP op — must NOT shell out to git).
-import { newestCommitMs, commitTimeMs, lagFromContentMs } from '../core/source-health.ts';
+import { commitTimeMs, lagFromContentMs } from '../core/source-health.ts';
 import { sortNewestFirst } from '../core/sort-newest-first.ts';
 import {
   loadOpCheckpoint,
@@ -86,6 +94,7 @@ import { registerCleanup } from '../core/process-cleanup.ts';
 import { type DbPacer, createDbPacer, createNoopPacer, observed } from '../core/db-pacer.ts';
 import { resolvePaceMode, loadPaceModeConfig, readPaceEnv } from '../core/pace-mode.ts';
 import { AbortError } from '../core/abort-check.ts';
+import { gitAuthorityEnvironment } from '../core/git-environment.ts';
 
 /**
  * v0.42.x (#1794) -- resumable incremental sync checkpoint.
@@ -260,9 +269,44 @@ export function estimateSourceTreeTokens(
   return { tokens, files };
 }
 
-/** Sum tokens for an explicit set of repo-relative paths read at live working-tree content. */
-function estimateDeltaTokens(localPath: string, relPaths: string[]): number {
+/** Sum tokens for an explicit path set from a commit snapshot or detached working tree. */
+export function estimateDeltaTokens(localPath: string, relPaths: string[], commit?: string): number | null {
   let tokens = 0;
+  if (commit) {
+    try {
+      const snapshot = openGitCommitSnapshot(localPath, commit);
+      const selected = relPaths
+        .map(path => snapshot.getBlob(path))
+        .filter((blob): blob is NonNullable<typeof blob> => blob !== null && blob.size <= 5_000_000);
+      // Keep synchronous cost previews memory-bounded while amortizing Git
+      // startup over many files. The execution path uses one persistent reader.
+      const MAX_BATCH_BYTES = 64 * 1024 * 1024;
+      let batch: typeof selected = [];
+      let batchBytes = 0;
+      const flush = () => {
+        if (batch.length === 0) return;
+        const contents = readGitCommitBlobsBatch(localPath, batch, 5_000_000);
+        for (const blob of batch) {
+          const content = contents.get(blob.path);
+          if (content) tokens += estimateTokens(content.toString('utf8'));
+        }
+        batch = [];
+        batchBytes = 0;
+      };
+      for (const blob of selected) {
+        if (batch.length > 0 && batchBytes + blob.size > MAX_BATCH_BYTES) flush();
+        batch.push(blob);
+        batchBytes += blob.size;
+      }
+      flush();
+      return tokens;
+    } catch {
+      // A zero estimate is unsafe: the caller would treat unreadable committed
+      // content as free. Signal authority failure so the cost gate escalates to
+      // the conservative full-tree ceiling instead.
+      return null;
+    }
+  }
   for (const rel of relPaths) {
     try {
       const full = join(localPath, rel);
@@ -270,7 +314,7 @@ function estimateDeltaTokens(localPath: string, relPaths: string[]): number {
       if (stat.size > 5_000_000) continue; // skip large binaries (matches tree walk)
       tokens += estimateTokens(readFileSync(full, 'utf-8'));
     } catch {
-      // Listed in the diff but unreadable (e.g. since deleted) → 0, like the tree walk.
+      // Listed in the diff but unreadable/oversized → 0, like the tree walk.
     }
   }
   return tokens;
@@ -285,8 +329,8 @@ function estimateDeltaTokens(localPath: string, relPaths: string[]): number {
  * prices exactly what this run will sync. The subsequent pull fast-forwards
  * the already-fetched objects, so net new network cost ≈ 0.
  *
- *   - detached HEAD → no upstream; target = local HEAD (+ caller merges the
- *     detached working-tree manifest, which sync imports on a detached repo).
+ *   - detached HEAD → no upstream; target = immutable local HEAD. Sync refuses
+ *     a dirty detached checkout rather than importing bytes with no commit.
  *   - attached + origin remote → fetch origin/<branch> (best-effort), target =
  *     origin/<branch> if resolvable, else local HEAD (offline / no upstream).
  *   - HEAD unresolvable (not a git repo) → null (caller treats as unavailable).
@@ -297,7 +341,7 @@ function estimateDeltaTokens(localPath: string, relPaths: string[]): number {
  * cost paid a few seconds early — a tighter cap would frequently fall back to
  * local HEAD and underestimate the remote delta).
  */
-function resolveEstimateTarget(localPath: string): { target: string; detached: boolean } | null {
+function resolveEstimateTarget(localPath: string): { target: string } | null {
   let head: string;
   try {
     head = git(localPath, ['rev-parse', 'HEAD']);
@@ -305,7 +349,7 @@ function resolveEstimateTarget(localPath: string): { target: string; detached: b
     return null;
   }
   const detached = isDetachedHead(localPath);
-  if (detached) return { target: head, detached: true };
+  if (detached) return { target: head };
 
   let branch: string | null = null;
   try {
@@ -324,12 +368,12 @@ function resolveEstimateTarget(localPath: string): { target: string; detached: b
     }
     try {
       const remoteSha = git(localPath, ['rev-parse', `origin/${branch}`]);
-      if (remoteSha) return { target: remoteSha, detached: false };
+      if (remoteSha) return { target: remoteSha };
     } catch {
       // no remote-tracking ref for this branch — use local HEAD.
     }
   }
-  return { target: head, detached: false };
+  return { target: head };
 }
 
 export type EstimateKind = 'delta' | 'ceiling' | 'mixed' | 'unchanged';
@@ -357,7 +401,7 @@ export interface InlineEstimate {
  *        commits are caught up imports nothing). kind: unchanged
  *   4. last_commit === null (first sync)      → full-tree CEILING. kind: ceiling_first_sync
  *   5. computeSyncDelta ok                    → price added∪modified∪renamed.to
- *        (syncable, live working-tree content); deletes cost 0. kind: delta
+ *        from the immutable target commit; deletes cost 0. kind: delta
  *   6. computeSyncDelta unavailable           → full-tree CEILING. kind: ceiling_git_unavailable
  *
  * The delta rung routes through the SAME `computeSyncDelta` the executor uses
@@ -416,26 +460,15 @@ export function estimateInlineNewTokens(
       continue;
     }
 
-    // Rung 3: caught up to the fetch target AND no detached working-tree changes.
-    // Mirrors the executor's `up_to_date` predicate — a dirty-but-committed-current
-    // tree imports nothing, so it must price $0 (the heart of the false-fire fix).
-    const detachedManifest = resolved.detached
-      ? buildDetachedWorkingTreeManifest(localPath)
-      : null;
-    const detachedHasChanges = detachedManifest !== null &&
-      (detachedManifest.added.length > 0 ||
-        detachedManifest.modified.length > 0 ||
-        detachedManifest.deleted.length > 0 ||
-        detachedManifest.renamed.length > 0);
-    if (src.last_commit === resolved.target && !detachedHasChanges) {
+    // Rung 3: caught up to the immutable fetch target. Dirty attached bytes are
+    // ignored; dirty detached syncs are refused by the executor before import.
+    if (src.last_commit === resolved.target) {
       unchangedSources++;
       continue;
     }
 
     // Rung 5/6: the delta itself — SAME helper the executor diffs with.
-    const delta = computeSyncDelta(localPath, src.last_commit, resolved.target, {
-      detachedManifest,
-    });
+    const delta = computeSyncDelta(localPath, src.last_commit, resolved.target);
     if (delta.status === 'unavailable') {
       ceiling(localPath, strategy, 'git_unavailable');
       continue;
@@ -446,7 +479,16 @@ export function estimateInlineNewTokens(
       ...delta.manifest.modified.filter(p => isSyncable(p, syncOpts)),
       ...delta.manifest.renamed.filter(r => isSyncable(r.to, syncOpts)).map(r => r.to),
     ]);
-    tokens += estimateDeltaTokens(localPath, changedPaths);
+    const deltaTokens = estimateDeltaTokens(
+      localPath,
+      changedPaths,
+      resolved.target,
+    );
+    if (deltaTokens === null) {
+      ceiling(localPath, strategy, 'git_snapshot_unavailable');
+      continue;
+    }
+    tokens += deltaTokens;
     changedSources++;
     hadDelta = true;
   }
@@ -626,6 +668,7 @@ async function runInlineCostGate(
 
   // ── Inline path ───────────────────────────────────────────────
   const inline = estimateInlineNewTokens(sources, String(CHUNKER_VERSION));
+  const authorityUncertain = inline.ceilingReasons.includes('git_snapshot_unavailable');
   // D7A: `--full` runs `performFullSync` → `runEmbedCore({stale:true})`, which
   // sweeps the pre-existing stale backlog INLINE on top of the delta. Price it.
   const costUsd = estimateEmbeddingCostUsd(inline.tokens) + (full ? staleCostUsd : 0);
@@ -635,10 +678,13 @@ async function runInlineCostGate(
   const staleNote = !full && staleChars > 0
     ? ` (plus ~${staleChars.toLocaleString()} stale-backlog chars pending \`gbrain embed --stale\`)`
     : '';
+  const costLabel = authorityUncertain
+    ? 'unavailable (committed snapshot read failed; conservative gate)'
+    : `$${costUsd.toFixed(2)}`;
   const previewMsg =
     `${label} preview (inline embed): ${inline.changedSources} changed source(s), ` +
     `${inline.unchangedSources} unchanged; ${labelEstimate(inline)}, ` +
-    `est. $${costUsd.toFixed(2)} on ${embeddingModelName}${fullNote}${staleNote}.`;
+    `est. ${costLabel} on ${embeddingModelName}${fullNote}${staleNote}.`;
 
   if (dryRun) {
     if (jsonOut) {
@@ -677,7 +723,7 @@ async function runInlineCostGate(
     /* best-effort */
   }
 
-  if (shouldBlockSync(costUsd, floorUsd, mode, posture)) {
+  if (authorityUncertain || shouldBlockSync(costUsd, floorUsd, mode, posture)) {
     const isTTY = Boolean(process.stdout.isTTY) && Boolean(process.stdin.isTTY);
     if (isTTY && !jsonOut) {
       // Interactive TTY: prompt [y/N].
@@ -879,12 +925,33 @@ export async function resolveSlugByPathOrSourcePath(
  * Exported for `test/sync.test.ts` invariant assertion only.
  */
 export function buildGitInvocation(repoPath: string, args: string[], configs: string[] = []): string[] {
-  const cfg = ['core.quotepath=false', ...configs].flatMap(c => ['-c', c]);
-  return [...cfg, '-C', repoPath, ...args];
+  const cfg = ['core.quotepath=false', 'core.fsmonitor=false', ...configs].flatMap(c => ['-c', c]);
+  return ['--no-replace-objects', ...cfg, '-C', repoPath, ...args];
 }
 
 export function buildAutoEmbedArgs(slugs: string[], sourceId?: string): string[] {
   return sourceId ? ['--source', sourceId, '--slugs', ...slugs] : ['--slugs', ...slugs];
+}
+
+/** Operator-facing remediation for non-skippable sync integrity sentinels. */
+export function formatSyncSentinelRemediation(paths: readonly string[]): string {
+  const uniquePaths = new Set(paths);
+  const actions: string[] = [];
+  if (uniquePaths.has('<head>')) {
+    actions.push('Git history changed during the run. Re-run sync to pin current HEAD.');
+  }
+  if (uniquePaths.has(GIT_SNAPSHOT_SENTINEL)) {
+    actions.push('Committed Git objects could not be read. Verify repository/object-store integrity, then re-run sync.');
+  }
+  if (uniquePaths.has('<delete-reconcile>')) {
+    actions.push('A file-backed row could not be safely resolved or deleted. Restore database connectivity and re-run; do not skip this failure.');
+  }
+  if (uniquePaths.has('<rename>')) {
+    actions.push('Rename reconciliation failed. Resolve the slug/path collision or database error, then re-run sync.');
+  }
+  return actions.length > 0
+    ? actions.join(' ')
+    : 'Resolve the integrity failure shown above, then re-run sync.';
 }
 
 /**
@@ -902,6 +969,7 @@ function git(repoPath: string, args: string[], configs: string[] = []): string {
     encoding: 'utf-8',
     timeout: 30000,
     maxBuffer: 100 * 1024 * 1024,
+    env: gitAuthorityEnvironment(),
   }).trim();
 }
 
@@ -911,6 +979,7 @@ function hasOriginRemote(repoPath: string): boolean {
       encoding: 'utf-8',
       timeout: 30000,
       stdio: ['ignore', 'ignore', 'ignore'],
+      env: gitAuthorityEnvironment(),
     });
     return true;
   } catch {
@@ -1578,7 +1647,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // gated on opts.noPull.
   const detachedHead = isDetachedHead(repoPath);
   if (detachedHead && !opts.noPull) {
-    serr(`Detached HEAD on ${repoPath}; skipping git pull. Syncing from local working tree.`);
+    serr(`Detached HEAD on ${repoPath}; skipping git pull. Syncing immutable HEAD only.`);
   }
 
   // Git pull (unless --no-pull). v0.28.1 codex finding (HIGH): the legacy
@@ -1671,6 +1740,24 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     headCommit = git(repoPath, ['rev-parse', 'HEAD']);
   } catch {
     throw new Error(`No commits in repo ${repoPath}. Make at least one commit before syncing.`);
+  }
+
+  // A detached checkout has no branch/upstream, but HEAD is still a valid
+  // immutable authority. Refuse dirty or untracked bytes instead of silently
+  // mixing them into the committed snapshot (there is no durable object to
+  // cite or resume). A clean detached checkout syncs its exact HEAD commit.
+  if (detachedHead) {
+    const detachedChanges = buildDetachedWorkingTreeManifest(repoPath);
+    const dirty = detachedChanges.added.length > 0
+      || detachedChanges.modified.length > 0
+      || detachedChanges.deleted.length > 0
+      || detachedChanges.renamed.length > 0;
+    if (dirty) {
+      throw new Error(
+        `Detached HEAD has uncommitted changes. Commit them or checkout a branch; ` +
+        `GBrain only syncs immutable Git objects.`,
+      );
+    }
   }
 
   // #1970: bookmark reachability. The ONLY thing that should force a full
@@ -1778,14 +1865,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   const currentVersion = String(CHUNKER_VERSION);
   const versionMismatch = storedVersion !== null && storedVersion !== currentVersion;
   const versionNeverSet = storedVersion === null && opts.sourceId !== undefined;
-  const detachedWorkingTreeManifest = detachedHead ? buildDetachedWorkingTreeManifest(repoPath) : null;
-  const hasDetachedWorkingTreeChanges = detachedWorkingTreeManifest !== null &&
-    (detachedWorkingTreeManifest.added.length > 0 ||
-      detachedWorkingTreeManifest.modified.length > 0 ||
-      detachedWorkingTreeManifest.deleted.length > 0 ||
-      detachedWorkingTreeManifest.renamed.length > 0);
-
-  if (lastCommit === headCommit && !versionMismatch && !versionNeverSet && !hasDetachedWorkingTreeChanges) {
+  if (lastCommit === headCommit && !versionMismatch && !versionNeverSet) {
     if (opts.sourceId && !opts.dryRun) {
       // A successful source check is fresh even when git HEAD did not advance.
       await writeSyncAnchor(engine, opts.sourceId, 'last_commit', headCommit);
@@ -1828,7 +1908,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // `unavailable`, fall back to the authoritative full reconcile instead of
   // throwing — a slow correct reconcile beats a hard error or a silent walk.
   const delta = computeSyncDelta(repoPath, lastCommit, pin, {
-    detachedManifest: detachedWorkingTreeManifest,
+    detachedManifest: null,
   });
   if (delta.status === 'unavailable') {
     serr(
@@ -1838,25 +1918,35 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     return performFullSync(engine, repoPath, headCommit, opts);
   }
   const manifest = delta.manifest;
+  const pinSnapshot = openGitCommitSnapshot(repoPath, pin);
+  try {
 
   // Filter to syncable files (strategy-aware)
   const syncOpts = opts.strategy ? { strategy: opts.strategy } : undefined;
+  const regularAtPin = new Set(pinSnapshot.blobs.map(blob => blob.path));
   // #1970 (F-C): a rename whose DESTINATION is unsyncable drops out of BOTH
   // `renamed` (only `r.to` is kept below) AND `deleted` (git emits it as `R`,
   // not `D`), leaving the OLD page stale. Fold the source side into the delete
   // set. isSyncable(r.from) excludes metafiles automatically, so a rename of a
   // metafile is left untouched (matching the #1433 metafile-skip invariant).
   const renamedToUnsyncable = manifest.renamed
-    .filter(r => isSyncable(r.from, syncOpts) && !isSyncable(r.to, syncOpts))
+    .filter(r => isSyncable(r.from, syncOpts)
+      && (!isSyncable(r.to, syncOpts) || !regularAtPin.has(r.to)))
     .map(r => r.from);
+  // Git reports regular-file -> symlink/gitlink as a type change (`T`). The
+  // manifest classifies it as modified, but a non-regular target must delete
+  // the previously indexed page rather than fail-importing forever.
+  const changedToNonRegular = manifest.modified
+    .filter(path => isSyncable(path, syncOpts) && !regularAtPin.has(path));
   const filtered: SyncManifest = {
-    added: manifest.added.filter(p => isSyncable(p, syncOpts)),
-    modified: manifest.modified.filter(p => isSyncable(p, syncOpts)),
+    added: manifest.added.filter(p => isSyncable(p, syncOpts) && regularAtPin.has(p)),
+    modified: manifest.modified.filter(p => isSyncable(p, syncOpts) && regularAtPin.has(p)),
     deleted: unique([
       ...manifest.deleted.filter(p => isSyncable(p, syncOpts)),
       ...renamedToUnsyncable,
+      ...changedToNonRegular,
     ]),
-    renamed: manifest.renamed.filter(r => isSyncable(r.to, syncOpts)),
+    renamed: manifest.renamed.filter(r => isSyncable(r.to, syncOpts) && regularAtPin.has(r.to)),
   };
 
   // Delete pages that became un-syncable (modified but filtered out).
@@ -1905,7 +1995,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
 
   // Dry run
   if (opts.dryRun) {
-    slog(`Sync dry run: ${lastCommit.slice(0, 8)}..${headCommit.slice(0, 8)}`);
+    slog(`Sync dry run: ${lastCommit.slice(0, 8)}..${pin.slice(0, 8)}`);
     if (filtered.added.length) slog(`  Added: ${filtered.added.join(', ')}`);
     if (filtered.modified.length) slog(`  Modified: ${filtered.modified.join(', ')}`);
     if (filtered.deleted.length) slog(`  Deleted: ${filtered.deleted.join(', ')}`);
@@ -1914,7 +2004,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     return {
       status: 'dry_run',
       fromCommit: lastCommit,
-      toCommit: headCommit,
+      toCommit: pin,
       added: filtered.added.length,
       modified: filtered.modified.length,
       deleted: filtered.deleted.length,
@@ -2108,10 +2198,35 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // failures here too. Same canonical surface that gates `sync.last_commit`
   // advancement at the bottom of this function.
   const failedFiles: Array<{ path: string; error: string; line?: number }> = [];
+  const RENAME_SENTINEL = '<rename>';
+  const DELETE_SENTINEL = '<delete-reconcile>';
+  let renameFailed = false;
+  let deleteFailed = false;
+  let snapshotAuthorityFailed = false;
+  const deletedPathsSucceeded: string[] = [];
+  const recordRenameFailure = (path: string, error: unknown): void => {
+    renameFailed = true;
+    if (!failedFiles.some(f => f.path === RENAME_SENTINEL)) {
+      failedFiles.push({
+        path: RENAME_SENTINEL,
+        error: `rename failed for ${path}: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  };
+  const recordDeleteFailure = (error: unknown): void => {
+    deleteFailed = true;
+    if (!failedFiles.some(f => f.path === DELETE_SENTINEL)) {
+      failedFiles.push({
+        path: DELETE_SENTINEL,
+        error: `delete reconciliation failed: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  };
 
   // v0.18.0+ multi-source: scope deletePage so we only delete the source-A
   // row, not every same-slug row across all sources.
-  const deleteOpts = opts.sourceId ? { sourceId: opts.sourceId } : undefined;
+  const deleteSourceId = opts.sourceId ?? DEFAULT_SOURCE_ID;
+  const deleteOpts = { sourceId: deleteSourceId };
 
   // v0.41.19.0 (T2/D6/D7/D16/D18 via /plan-eng-review + codex outside-voice):
   // batched delete loop. Replaces the per-file N+1 that PR #1538 originally
@@ -2132,14 +2247,13 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   //   engine.resolveSlugsByPaths(batch, {sourceId})  ◀── 1 SQL round-trip
   //       │
   //       ▼
-  //   slugs = batch.map(path => map.get(path)
-  //                  ?? resolveSlugForPath(path))    ◀── pure-JS fallback for
-  //       │                                              frontmatter-fallback
-  //       ▼                                              + missing-source-path
+  //   slugs = mapped custom slug or path-derived slug when no row exists
+  //       │
+  //       ▼
   //   try {
   //     deleted = engine.deletePages(slugs, opts)    ◀── 1 SQL round-trip
-  //     pagesAffected.push(...deleted)               ◀── D6: only confirmed
-  //   } catch {                                          deletes, not phantoms
+  //     verify no source_path row remains            ◀── fail-closed custom-slug guard
+  //   } catch {
   //     // D7 decompose: per-slug deletePage,
   //     // unrecoverable failures → failedFiles
   //   }
@@ -2148,100 +2262,77 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   //   pre-fix:   73,000 SELECTs + 73,000 DELETEs = 146,000 (~5 hours)
   //   post-fix:     146 SELECTs +     146 DELETEs =     292 (~2 minutes)
   //
-  // ATOMICITY (D3): each batch is one transaction. A mid-batch abort or
-  // transient connection failure rolls back up to DELETE_BATCH_SIZE - 1
-  // successful deletes. Sync is idempotent — the next run picks them up
-  // via git diff regenerating the deletion list.
-  //
-  // NO-SOURCEID FALLBACK: when opts.sourceId is undefined (legacy unscoped
-  // callers, rare post-v0.34.1 source-resolution wiring), fall back to the
-  // OLD per-path loop. The batch engine surface requires sourceId per D5
-  // (multi-source-bug-class defense at the type level). Production callers
-  // that thread sourceId via resolveSourceWithTier get the new fast path.
+  // The batch delete itself is atomic; its per-slug outage fallback is
+  // idempotent. Paths enter the checkpoint only after the source_path query
+  // proves every file-backed row is gone. Any resolver/delete/verification
+  // error creates a non-skippable sentinel and preserves last_commit.
   // v0.42.x (#1794): resume-filter the delete set so a resumed run skips paths
   // already drained in a prior run (deletes are idempotent, but skipping avoids
   // re-resolving + re-deleting tens of thousands of already-gone pages).
   const deletesToDo = resumeFilter(filtered.deleted, [...completed]);
   if (deletesToDo.length > 0) {
     progress.start('sync.deletes', deletesToDo.length);
-    if (opts.sourceId) {
-      const sid = opts.sourceId;
-      const deleteScopedOpts = { sourceId: sid };
-      for (let i = 0; i < deletesToDo.length; i += DELETE_BATCH_SIZE) {
-        if (opts.signal?.aborted) {
-          progress.finish();
-          return await partial('timeout');
-        }
-        const batch = deletesToDo.slice(i, i + DELETE_BATCH_SIZE);
+    for (let i = 0; i < deletesToDo.length; i += DELETE_BATCH_SIZE) {
+      if (opts.signal?.aborted) {
+        progress.finish();
+        return await partial('timeout');
+      }
+      const batch = deletesToDo.slice(i, i + DELETE_BATCH_SIZE);
 
-        // Phase A: batch slug resolution (1 round-trip per batch).
-        let pathSlugMap: Map<string, string>;
-        try {
-          pathSlugMap = await engine.resolveSlugsByPaths(batch, deleteScopedOpts);
-        } catch {
-          // Resolve failure: fall back to empty map; per-path fallback
-          // below will use resolveSlugForPath. Best-effort, matches the
-          // existing resolveSlugByPathOrSourcePath swallow-and-fallback
-          // semantics.
-          pathSlugMap = new Map();
-        }
-        const slugs = batch.map(p => pathSlugMap.get(p) ?? resolveSlugForPath(p));
+      // Slug resolution is authoritative for custom/frontmatter-owned slugs.
+      // If it fails, deleting the path-derived fallback can leave the real row
+      // live while advancing last_commit, so this batch hard-blocks untouched.
+      let pathSlugMap: Map<string, string>;
+      try {
+        pathSlugMap = await engine.resolveSlugsByPaths(batch, deleteOpts);
+      } catch (error) {
+        recordDeleteFailure(error);
+        progress.tick(batch.length, `delete-resolve-failed ${Math.min(i + DELETE_BATCH_SIZE, deletesToDo.length)}/${deletesToDo.length}`);
+        continue;
+      }
+      const slugs = [...new Set(batch.map(p => pathSlugMap.get(p) ?? resolveSlugForPath(p)))];
 
-        // Phase B: batch delete (1 round-trip per batch).
+      try {
         try {
-          const deleted = await engine.deletePages(slugs, deleteScopedOpts);
-          // D6: only push slugs that were actually deleted. Filters phantom
-          // slugs (paths in filtered.deleted but with no DB row) so
-          // downstream extract/embed don't waste lookups.
+          const deleted = await engine.deletePages(slugs, deleteOpts);
           pagesAffected.push(...deleted);
-          // v0.42.x (#1794): the whole batch is handled (deleted or already
-          // gone); checkpoint every path so a resume skips it.
-          for (const p of batch) await markCompleted(p);
-        } catch (err) {
-          // D7 decompose: a transient blip on this batch shouldn't lose all
-          // 500 deletes. Fall back to per-slug deletePage for THIS batch
-          // only; unrecoverable per-slug failures land in failedFiles
-          // (matching the existing import-loop pattern at sync.ts:~1350).
-          for (let j = 0; j < slugs.length; j++) {
+        } catch (batchError) {
+          for (const slug of slugs) {
             try {
-              await engine.deletePage(slugs[j], deleteScopedOpts);
-              pagesAffected.push(slugs[j]);
-              await markCompleted(batch[j]);
-            } catch (perSlugErr) {
-              failedFiles.push({
-                path: batch[j],
-                error: `delete failed: ${perSlugErr instanceof Error ? perSlugErr.message : String(perSlugErr)} (batch error: ${err instanceof Error ? err.message : String(err)})`,
-              });
+              await engine.deletePage(slug, deleteOpts);
+              pagesAffected.push(slug);
+            } catch (perSlugError) {
+              throw new Error(
+                `delete failed for ${slug}: ${perSlugError instanceof Error ? perSlugError.message : String(perSlugError)} ` +
+                `(batch error: ${batchError instanceof Error ? batchError.message : String(batchError)})`,
+              );
             }
           }
         }
-        progress.tick(batch.length, `deletes ${Math.min(i + DELETE_BATCH_SIZE, deletesToDo.length)}/${deletesToDo.length}`);
-        await maybeYield();
-      }
-    } else {
-      // Legacy no-sourceId path. The engine batch methods require sourceId
-      // per D5 (kills the multi-source-bug-class on the new surface); when
-      // sourceId is unset, fall back to the original per-path loop. Slow
-      // but correct; production callers all thread sourceId so this branch
-      // is functionally dead post-v0.34.1.
-      for (const path of deletesToDo) {
-        if (opts.signal?.aborted) {
-          progress.finish();
-          return await partial('timeout');
+
+        // Verify by source_path, not guessed slug. This catches a missing map
+        // entry, custom slug, duplicate row, or a delete primitive that returned
+        // success without removing the authoritative file-backed row.
+        const remaining = await engine.executeRaw<{ source_path: string }>(
+          `SELECT source_path FROM pages
+            WHERE source_id = $1 AND source_path = ANY($2::text[])`,
+          [deleteSourceId, batch],
+        );
+        if (remaining.length > 0) {
+          throw new Error(
+            `${remaining.length} file-backed page(s) remained after delete ` +
+            `(first source_path: ${remaining[0]!.source_path})`,
+          );
         }
-        const slug = await resolveSlugByPathOrSourcePath(engine, path, undefined);
-        try {
-          await engine.deletePage(slug, deleteOpts);
-          pagesAffected.push(slug);
+        for (const path of batch) {
+          deletedPathsSucceeded.push(path);
           await markCompleted(path);
-        } catch (err) {
-          failedFiles.push({
-            path,
-            error: `delete failed: ${err instanceof Error ? err.message : String(err)}`,
-          });
         }
-        progress.tick(1, slug);
+      } catch (error) {
+        recordDeleteFailure(error);
       }
+      progress.tick(batch.length, `deletes ${Math.min(i + DELETE_BATCH_SIZE, deletesToDo.length)}/${deletesToDo.length}`);
+      await maybeYield();
     }
     progress.finish();
   }
@@ -2252,10 +2343,10 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // all resolve to the right slug shape for each side.
   //
   // v0.41.19.0 (T4): pre-batched slug resolution per Phase 3 of the plan.
-  // Renames' per-file cost is dominated by importFile() (file IO + chunking
-  // + embedding), so the per-iteration updateSlug + importFile loop stays;
-  // only the upfront slug-resolve N+1 gets batched. The try/catch around
-  // updateSlug for slug-doesn't-exist preserves verbatim.
+  // Renames' per-file cost is dominated by committed-blob import (chunking +
+  // embedding), so the per-iteration updateSlug + importGitBlob loop stays;
+  // only the upfront slug-resolve N+1 gets batched. Missing old rows are
+  // explicitly probed; real update/import failures hard-block the bookmark.
   // v0.42.x (#1794): resume-filter renames on the destination path.
   const renamesToDo = filtered.renamed.filter(r => !completed.has(r.to));
   if (renamesToDo.length > 0) {
@@ -2283,8 +2374,9 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         let m: Map<string, string>;
         try {
           m = await engine.resolveSlugsByPaths(batch, { sourceId: sid });
-        } catch {
-          m = new Map();
+        } catch (error) {
+          recordRenameFailure(batch[0] ?? '<empty-batch>', error);
+          continue;
         }
         for (const p of batch) {
           fromSlugByPath.set(p, m.get(p) ?? resolveSlugForPath(p));
@@ -2294,11 +2386,17 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
 
     for (const { from, to } of renamesToDo) {
       // v0.41.13.0 (T2 / D-V4-2): per-iteration abort check. Renames call
-      // importFile() at line 1173-style sites which can be slow on big files;
+      // committed-blob import can be slow on big files;
       // refactor commits with 200+ renames must respect --timeout.
       if (opts.signal?.aborted) {
         progress.finish();
         return await partial('timeout');
+      }
+      if (renameFailed && opts.sourceId && !fromSlugByPath.has(from)) {
+        // The batch resolver failed. Never guess a path-derived slug for a
+        // frontmatter-owned page; the hard-block sentinel preserves the pin.
+        progress.tick(1, `failed:${to}`);
+        continue;
       }
       const oldSlug = opts.sourceId
         ? (fromSlugByPath.get(from) ?? resolveSlugForPath(from))
@@ -2306,18 +2404,28 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       // The new path doesn't yet have a row, so resolve from path only.
       const newSlug = resolveSlugForPath(to);
       try {
-        await engine.updateSlug(oldSlug, newSlug, renameOpts);
-      } catch {
-        // Slug doesn't exist or collision, treat as add
-      }
-      // Reimport at new path (picks up content changes)
-      const filePath = join(repoPath, to);
-      if (existsSync(filePath)) {
-        const result = await importFile(engine, filePath, to, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack });
+        // Missing old rows are legitimate (the rename is effectively an add),
+        // but a real update error/collision is not. Probe first so only the
+        // missing-row case takes the add path.
+        const existingOld = await engine.getPage(oldSlug, pageOpts);
+        if (existingOld) await engine.updateSlug(oldSlug, newSlug, renameOpts);
+
+        const blob = pinSnapshot.getBlob(to);
+        if (!blob) throw new GitSnapshotError(`Rename target is not a regular file at ${pin.slice(0, 12)}: ${to}`);
+        const result = await importGitBlob(engine, pinSnapshot, blob, {
+          noEmbed, sourceId: opts.sourceId, activePack: syncActivePack,
+        });
+        if (result.status === 'skipped' && result.error && result.error !== 'unchanged') {
+          throw new Error(result.error);
+        }
         if (result.status === 'imported') chunksCreated += result.chunks;
+        pagesAffected.push(result.slug);
+        succeededPaths.push(to);
+        await markCompleted(to);
+      } catch (error) {
+        if (error instanceof GitSnapshotError) snapshotAuthorityFailed = true;
+        recordRenameFailure(to, error);
       }
-      pagesAffected.push(newSlug);
-      await markCompleted(to);
       progress.tick(1, newSlug);
     }
     progress.finish();
@@ -2391,7 +2499,6 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
 
     // Core import logic shared by serial and parallel paths.
     // repoPath is validated non-null at the top of performSyncInner; narrow for TS.
-    const syncRepoPath = repoPath!;
     // paced-backfill (T3 / C9 / CX4): ONE shared pacer across all worker
     // engines. This is the multi-pool permit case — each parallel worker owns a
     // separate PostgresEngine, so a single worker count can't bound TOTAL
@@ -2456,29 +2563,6 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     }
 
     async function importOnePath(eng: BrainEngine, path: string): Promise<void> {
-      const filePath = join(syncRepoPath, path);
-      if (!existsSync(filePath)) {
-        // v0.42.x (#1794, Codex #3): the diff is against the PINNED target, but
-        // importFile reads the live working tree. A file added in lastCommit..pin
-        // that's gone from disk was deleted by a commit AFTER the pin (normal
-        // forward progress from the enrich process). It genuinely doesn't exist
-        // at live HEAD, so there's nothing to import — SKIP and mark it
-        // completed rather than failing the run. The post-loop pin-reachability
-        // gate catches a real history REWRITE (the dangerous drift); a benign
-        // forward delete is handled by the next sync's pin..HEAD diff (which
-        // will show this path deleted). The pre-v0.42 "record as failure" was
-        // correct only when the gate compared HEAD == captured; under pinning a
-        // forward delete must not block.
-        await markCompleted(path);
-        // issue #1939 adversarial finding #1: a file that previously failed to
-        // parse (open ledger row) and is now gone from disk is resolved — clear
-        // its row so it can't age doctor to a permanent FAIL. (This covers the
-        // net-zero add-then-delete range where the path isn't in filtered.deleted.)
-        succeededPaths.push(path);
-        progressAt.last = Date.now(); // #1950: forward progress → reset stall watchdog
-        progress.tick(1, `skip:${path}`);
-        return;
-      }
       // v0.41.37.0 #1569: per-file BEGIN heartbeat, emitted BEFORE importFile so a
       // hang names the stalling file (the progress.tick below only fires AFTER
       // importFile returns — useless when one file wedges). Off by default
@@ -2502,8 +2586,11 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
         // / addLink) target (sourceId, slug). Pre-fix the schema DEFAULT
         // 'default' was applied even for non-default sources, fabricating
         // duplicate rows that crashed bare-slug subqueries with Postgres 21000.
-        const result = await observed(pacer, () =>
-          importFile(eng, filePath, path, { noEmbed, sourceId: opts.sourceId, activePack: syncActivePack }));
+        const blob = pinSnapshot.getBlob(path);
+        if (!blob) throw new GitSnapshotError(`Import target is not a regular file at ${pin.slice(0, 12)}: ${path}`);
+        const result = await observed(pacer, () => importGitBlob(eng, pinSnapshot, blob, {
+          noEmbed, sourceId: opts.sourceId, activePack: syncActivePack,
+        }));
         if (result.status === 'imported') {
           chunksCreated += result.chunks;
           pagesAffected.push(result.slug);
@@ -2527,7 +2614,14 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         serr(`  Warning: skipped ${path}: ${msg}`);
-        failedFiles.push({ path, error: msg });
+        if (e instanceof GitSnapshotError) {
+          snapshotAuthorityFailed = true;
+          if (!failedFiles.some(f => f.path === GIT_SNAPSHOT_SENTINEL)) {
+            failedFiles.push({ path: GIT_SNAPSHOT_SENTINEL, error: msg });
+          }
+        } else {
+          failedFiles.push({ path, error: msg });
+        }
       } finally {
         permit.release();
       }
@@ -2561,6 +2655,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
             return await partial(stallAborted ? 'stall_timeout' : 'timeout');
           }
           await importOnePath(engine, path);
+          if (snapshotAuthorityFailed) break;
         }
       } else {
         const { PostgresEngine } = await import('../core/postgres-engine.ts');
@@ -2594,7 +2689,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
                 // Each worker exits its while loop cleanly when --timeout
                 // fires. In-flight importOnePath() calls complete
                 // naturally (no mid-transaction kill).
-                if (opts.signal?.aborted || checkpointDead) break;
+                if (opts.signal?.aborted || checkpointDead || snapshotAuthorityFailed) break;
                 const idx = queueIndex++;
                 if (idx >= importsToDo.length) break;
                 await importOnePath(eng, importsToDo[idx]);
@@ -2625,6 +2720,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
           return await partial(stallAborted ? 'stall_timeout' : 'timeout');
         }
         await importOnePath(engine, path);
+        if (snapshotAuthorityFailed) break;
       }
     }
     } finally {
@@ -2741,8 +2837,11 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // FAIL. Treat removed paths as resolved so the ledger self-heals.
   const resolvedPaths = [
     ...succeededPaths,
-    ...filtered.deleted,
+    ...deletedPathsSucceeded,
     ...filtered.renamed.map(r => r.from),
+    ...(!renameFailed ? [RENAME_SENTINEL] : []),
+    ...(!deleteFailed ? [DELETE_SENTINEL] : []),
+    ...(!snapshotAuthorityFailed ? [GIT_SNAPSHOT_SENTINEL] : []),
   ];
 
   const gate = await applySyncFailureGate({
@@ -2757,12 +2856,12 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   if (!gate.advanced) {
     const codeBreakdown = formatCodeBreakdown(failedFiles);
     if (gate.sentinelBlocked) {
+      const sentinelPaths = failedFiles.filter(f => !isSkippablePath(f.path)).map(f => f.path);
+      const remediation = formatSyncSentinelRemediation(sentinelPaths);
       serr(
-        `\nSync blocked: repository history changed during sync (force-push / reset).\n` +
+        `\nSync blocked by non-skippable integrity failure (${sentinelPaths.join(', ')}).\n` +
         `${codeBreakdown}\n\n` +
-        `The pinned target is no longer an ancestor of HEAD; advancing would record ` +
-        `a commit that doesn't match the indexed tree. Re-run sync to re-pin against ` +
-        `current HEAD.`,
+        `${remediation}`,
       );
     } else {
       const fileFailCount = failedFiles.filter(f => isSkippablePath(f.path)).length;
@@ -2818,7 +2917,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   // Log ingest
   await engine.logIngest({
     source_type: 'git_sync',
-    source_ref: `${repoPath} @ ${headCommit.slice(0, 8)}`,
+    source_ref: `${repoPath} @ ${pin}`,
     pages_updated: pagesAffected,
     summary: `Sync: +${filtered.added.length} ~${filtered.modified.length} -${filtered.deleted.length} R${filtered.renamed.length}, ${chunksCreated} chunks, ${elapsed}ms`,
   });
@@ -2848,23 +2947,18 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   }
   if (!opts.noExtract && totalChanges <= 100 && pagesAffected.length > 0) {
     try {
-      const { extractLinksForSlugs, extractTimelineForSlugs, stampExtracted } = await import('./extract.ts');
-      const linksCreated = await extractLinksForSlugs(engine, repoPath, pagesAffected, extractOpts);
-      const timelineCreated = await extractTimelineForSlugs(engine, repoPath, pagesAffected, extractOpts);
+      const { extractImportedPagesFromDB } = await import('./extract.ts');
+      const extracted = await extractImportedPagesFromDB(engine, pagesAffected, extractOpts);
+      const linksCreated = extracted.linksCreated;
+      const timelineCreated = extracted.timelineCreated;
       if (linksCreated > 0 || timelineCreated > 0) {
         slog(`  Extracted: ${linksCreated} links, ${timelineCreated} timeline entries`);
       }
-      // v0.42.7 (#1696, CDX-6): stamp the links_extracted_at watermark for the
-      // pages we just extracted, AFTER the import set their updated_at, so
-      // links_extracted_at >= updated_at (page is now fresh, not flagged stale).
-      // Source-correct via opts.sourceId. Stamp at the CALL SITE (not inside
-      // extractLinksForSlugs) so we use the per-source sourceId the sync owns.
-      // Best-effort: a stamp miss just means extract --stale re-sweeps later.
-      await stampExtracted(
-        engine,
-        pagesAffected.map((slug) => ({ slug, source_id: opts.sourceId ?? 'default' })),
-      );
-    } catch { /* extraction is best-effort */ }
+    } catch (error) {
+      // Extraction remains decoupled from sync convergence, but failures are
+      // visible and the DB helper stamps nothing until both batches succeed.
+      serr(`[sync] inline DB extraction deferred after error: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   // v0.31.2: facts extraction now routes through the shared
@@ -2942,7 +3036,7 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
   return {
     status: 'synced',
     fromCommit: lastCommit,
-    toCommit: headCommit,
+    toCommit: pin,
     added: filtered.added.length,
     modified: filtered.modified.length,
     deleted: filtered.deleted.length,
@@ -2951,6 +3045,9 @@ async function performSyncInner(engine: BrainEngine, opts: SyncOpts): Promise<Sy
     embedded,
     pagesAffected,
   };
+  } finally {
+    await pinSnapshot.close();
+  }
 }
 
 async function performFullSync(
@@ -2959,6 +3056,9 @@ async function performFullSync(
   headCommit: string,
   opts: SyncOpts,
 ): Promise<SyncResult> {
+  // Every Git source, including a clean detached checkout, is commit-authoritative.
+  const snapshotCommit = headCommit;
+
   // Dry-run: walk the repo, count syncable files, return without writing.
   // Fixes the silent-write-on-dry-run bug where performFullSync called
   // runImport unconditionally regardless of opts.dryRun.
@@ -2969,7 +3069,9 @@ async function performFullSync(
   // code --dry-run` always reported zero files even when ~1500 code
   // files were waiting.
   if (opts.dryRun) {
-    const allFiles = collectSyncableFiles(repoPath, { strategy: opts.strategy ?? 'markdown' });
+    const allFiles = collectSyncableGitBlobs(
+      repoPath, snapshotCommit, { strategy: opts.strategy ?? 'markdown' },
+    );
     slog(
       `Full-sync dry run (strategy=${opts.strategy ?? 'markdown'}): ` +
       `${allFiles.length} file(s) would be imported ` +
@@ -3008,7 +3110,7 @@ async function performFullSync(
   const _fullImportT0 = Date.now();
   serr(`[gbrain phase] sync.fullsync.import start strategy=${opts.strategy ?? 'markdown'}`);
   const result = await runImport(engine, importArgs, {
-    commit: headCommit,
+    commit: snapshotCommit,
     strategy: opts.strategy,
     sourceId: opts.sourceId,
     // issue #1939: performFullSync owns the failure ledger + bookmark via the
@@ -3020,6 +3122,76 @@ async function performFullSync(
     `imported=${result.imported} skipped=${result.skipped} errors=${result.errors}`,
   );
 
+  // A full import is authoritative for both additions AND removals. Reconcile
+  // stale file-backed pages before the bookmark gate and verify deletion from
+  // the database. Any delete/query failure becomes an unskippable sentinel;
+  // `last_commit` therefore cannot claim a tree whose stale rows remain live.
+  const FULL_DELETE_SENTINEL = '<full-delete-reconcile>';
+  const fullFailures = [...result.failures];
+  let fullDeleteFailed = false;
+  let reconciledDeletes = 0;
+  try {
+      const sid = opts.sourceId ?? DEFAULT_SOURCE_ID;
+      const reconcileSyncOpts = opts.strategy ? { strategy: opts.strategy } : undefined;
+      const current = new Set(
+        collectSyncableGitBlobs(
+          repoPath, snapshotCommit, { strategy: opts.strategy ?? 'markdown' },
+        ).map(blob => blob.path),
+      );
+      const rows = await engine.executeRaw<{ slug: string; source_path: string | null }>(
+        `SELECT slug, source_path FROM pages WHERE source_id = $1 AND source_path IS NOT NULL AND deleted_at IS NULL`,
+        [sid],
+      );
+      const staleSlugs = rows
+        .filter(row => row.source_path != null
+          && isSyncable(row.source_path, reconcileSyncOpts)
+          && !current.has(row.source_path))
+        .map(row => row.slug);
+      const deleteScopedOpts = { sourceId: sid };
+      for (let i = 0; i < staleSlugs.length; i += DELETE_BATCH_SIZE) {
+        const batch = staleSlugs.slice(i, i + DELETE_BATCH_SIZE);
+        try {
+          await engine.deletePages(batch, deleteScopedOpts);
+        } catch (batchError) {
+          for (const slug of batch) {
+            try {
+              await engine.deletePage(slug, deleteScopedOpts);
+            } catch (error) {
+              throw new Error(
+                `stale page delete failed for ${slug}: ${error instanceof Error ? error.message : String(error)} ` +
+                `(batch error: ${batchError instanceof Error ? batchError.message : String(batchError)})`,
+              );
+            }
+          }
+        }
+      }
+      const remaining: string[] = [];
+      for (let i = 0; i < staleSlugs.length; i += DELETE_BATCH_SIZE) {
+        const batch = staleSlugs.slice(i, i + DELETE_BATCH_SIZE);
+        const stillLive = await engine.executeRaw<{ slug: string }>(
+          `SELECT slug FROM pages
+            WHERE source_id = $1 AND slug = ANY($2::text[]) AND deleted_at IS NULL`,
+          [sid, batch],
+        );
+        remaining.push(...stillLive.map(row => row.slug));
+      }
+      if (remaining.length > 0) {
+        throw new Error(
+          `${remaining.length} stale page(s) remained after delete (first: ${remaining[0]})`,
+        );
+      }
+      reconciledDeletes = staleSlugs.length;
+      if (reconciledDeletes > 0) {
+        slog(`  Reconciled ${reconciledDeletes} stale page(s) whose committed source file was removed.`);
+      }
+  } catch (error) {
+    fullDeleteFailed = true;
+    fullFailures.push({
+      path: FULL_DELETE_SENTINEL,
+      error: `full-sync stale delete reconciliation failed: ${error instanceof Error ? error.message : String(error)}`,
+    });
+  }
+
   // issue #1939 — gate the full-sync bookmark through the SAME shared ledger as
   // the incremental path (Codex #6: a wedge here on first/forced sync was
   // previously unreachable by the valve). A full re-import is authoritative for
@@ -3027,14 +3199,16 @@ async function performFullSync(
   // now has been resolved → clear it (resets its auto-skip streak); current
   // failures still climb their attempts.
   const fullSourceId = opts.sourceId ?? DEFAULT_SOURCE_ID;
-  const fullFailureSet = new Set(result.failures.map(f => f.path));
+  const fullFailureSet = new Set(fullFailures.map(f => f.path));
   const fullSucceeded = loadSyncFailures()
     .filter(e => e.source_id === fullSourceId && isSkippablePath(e.path) && !fullFailureSet.has(e.path))
     .map(e => e.path);
+  if (!fullDeleteFailed) fullSucceeded.push(FULL_DELETE_SENTINEL);
+  if (!fullFailureSet.has(GIT_SNAPSHOT_SENTINEL)) fullSucceeded.push(GIT_SNAPSHOT_SENTINEL);
   const advanceFull = async (): Promise<void> => {
     // Persist sync state so the next sync is incremental. Routed through
     // writeSyncAnchor so --source pins the right sources row.
-    await writeSyncAnchor(engine, opts.sourceId, 'last_commit', headCommit, newestCommitMs(repoPath));
+    await writeSyncAnchor(engine, opts.sourceId, 'last_commit', headCommit, commitTimeMs(repoPath, headCommit));
     await engine.setConfig('sync.last_run', new Date().toISOString());
     await writeSyncAnchor(engine, opts.sourceId, 'repo_path', repoPath);
     await writeChunkerVersion(engine, opts.sourceId, String(CHUNKER_VERSION));
@@ -3042,7 +3216,7 @@ async function performFullSync(
 
   const fullGate = await applySyncFailureGate({
     sourceId: fullSourceId,
-    failedFiles: result.failures,
+    failedFiles: fullFailures,
     succeededPaths: fullSucceeded,
     commit: headCommit,
     skipFailed: opts.skipFailed === true,
@@ -3050,11 +3224,11 @@ async function performFullSync(
   });
 
   if (!fullGate.advanced) {
-    const codeBreakdown = formatCodeBreakdown(result.failures);
+    const codeBreakdown = formatCodeBreakdown(fullFailures);
     if (fullGate.sentinelBlocked) {
-      serr(`\nFull sync blocked: repository history changed during sync.\n${codeBreakdown}`);
+      serr(`\nFull sync blocked: immutable-source reconciliation failed.\n${codeBreakdown}`);
     } else {
-      const fileFailCount = result.failures.filter(f => isSkippablePath(f.path)).length;
+      const fileFailCount = fullFailures.filter(f => isSkippablePath(f.path)).length;
       serr(
         `\nFull sync blocked: ${fileFailCount} file(s) failed:\n` +
         `${codeBreakdown}\n\n` +
@@ -3072,7 +3246,7 @@ async function performFullSync(
       chunksCreated: result.chunksCreated,
       embedded: 0,
       pagesAffected: [],
-      failedFiles: result.failures.length,
+      failedFiles: fullFailures.length,
     };
   }
   if (fullGate.acknowledged > 0) {
@@ -3084,68 +3258,6 @@ async function performFullSync(
       `${resolveAutoSkipThreshold()} consecutive syncs. These pages are NOT indexed; ` +
       `'gbrain doctor' will warn until they're fixed.`,
     );
-  }
-
-  // #1970 (F-A): runImport is import-only — it never purges pages whose backing
-  // file was deleted since the last sync. A full re-import is authoritative for
-  // the whole tree, so reconcile deletes here too (this is what makes the
-  // object-absent fallback at performSyncInner correct for deletes, not just
-  // imports). Runs only on an advancing full sync (we're past the
-  // !fullGate.advanced early-return).
-  //
-  // SAFETY — must NOT re-introduce the #1433 stale-page data loss. A page is
-  // deleted ONLY when ALL three hold:
-  //   1. source_path != null      → file-backed pages only; put_page/manual
-  //      pages (null source_path) are never swept.
-  //   2. isSyncable(source_path)  → excludes metafiles (README/log.md, the
-  //      #1433 class) AND the wrong strategy (a markdown sync can't delete a
-  //      code page, and vice versa).
-  //   3. source_path ∉ current    → the backing file is genuinely gone from the
-  //      working tree (collectSyncableFiles == the same enumeration runImport
-  //      used, so paths are in the identical relative form as source_path).
-  // Skipped on the legacy no-sourceId path (the batch delete primitives require
-  // a sourceId; matches every other source-scoped feature).
-  let reconciledDeletes = 0;
-  if (opts.sourceId) {
-    const sid = opts.sourceId;
-    const reconcileSyncOpts = opts.strategy ? { strategy: opts.strategy } : undefined;
-    // collectSyncableFiles returns ABSOLUTE paths; source_path is stored
-    // repo-relative (importFile uses `relative(dir, filePath)`), so relativize
-    // to the same form before membership-testing — otherwise every page looks
-    // stale and the reconcile would wrongly delete live pages.
-    const current = new Set(
-      collectSyncableFiles(repoPath, { strategy: opts.strategy ?? 'markdown' })
-        .map(abs => relative(repoPath, abs)),
-    );
-    const rows = await engine.executeRaw<{ slug: string; source_path: string | null }>(
-      `SELECT slug, source_path FROM pages WHERE source_id = $1 AND source_path IS NOT NULL AND deleted_at IS NULL`,
-      [sid],
-    );
-    const staleSlugs = rows
-      .filter(r => r.source_path != null
-        && isSyncable(r.source_path, reconcileSyncOpts)
-        && !current.has(r.source_path))
-      .map(r => r.slug);
-    if (staleSlugs.length > 0) {
-      const deleteScopedOpts = { sourceId: sid };
-      for (let i = 0; i < staleSlugs.length; i += DELETE_BATCH_SIZE) {
-        const batch = staleSlugs.slice(i, i + DELETE_BATCH_SIZE);
-        try {
-          const deleted = await engine.deletePages(batch, deleteScopedOpts);
-          reconciledDeletes += deleted.length;
-        } catch {
-          // Per-slug fallback on a batch blip (mirrors the incremental delete
-          // loop). A stale page that won't delete is best-effort, not fatal.
-          for (const slug of batch) {
-            try { await engine.deletePage(slug, deleteScopedOpts); reconciledDeletes++; }
-            catch { /* best-effort */ }
-          }
-        }
-      }
-      if (reconciledDeletes > 0) {
-        slog(`  Reconciled ${reconciledDeletes} stale page(s) whose source file was removed.`);
-      }
-    }
   }
 
   // Full sync doesn't track pagesAffected, so fall back to embed --stale.

@@ -185,7 +185,7 @@ describe('sync-parallel: head-drift gate (CODEX-3)', () => {
     expect(await engine.getConfig('sync.last_commit')).toBe(head);
   });
 
-  test('vanished-mid-sync added file is skipped, not a failure (v0.42.x #1794)', async () => {
+  test('[CRITICAL] vanished worktree file still imports from the pinned commit', async () => {
     // First sync: clean state for incremental.
     seedRepoWithMarkdown(repoPath, 3);
     const { performSync } = await import('../src/commands/sync.ts');
@@ -202,17 +202,11 @@ describe('sync-parallel: head-drift gate (CODEX-3)', () => {
     const result = await performSync(engine, {
       repoPath, noPull: true, noEmbed: true,
     });
-    // v0.42.x (#1794, Codex #3) SUPERSEDES the v0.22.13 CODEX-3 behavior: under
-    // the pinned-target resumable sync, importFile reads the live working tree,
-    // so a file added in lastCommit..pin but deleted from disk by a commit AFTER
-    // the pin is normal forward progress from a concurrent committer — it
-    // genuinely doesn't exist at HEAD, so SKIP it (don't block the run). A real
-    // history REWRITE is caught by the separate pin-reachability gate. The
-    // vanished file is never created; the next sync's pin..HEAD diff shows it
-    // deleted.
+    // The manifest and bytes share one authority: the pinned commit. A mutable
+    // checkout deletion cannot make the committed page silently disappear.
     expect(result.status).toBe('synced');
     expect(result.failedFiles ?? 0).toBe(0);
-    expect(await engine.getPage('people/will-vanish')).toBeNull();
+    expect((await engine.getPage('people/will-vanish'))?.compiled_truth).toContain('body');
   });
 });
 

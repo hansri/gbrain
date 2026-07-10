@@ -1,5 +1,6 @@
 import { test, expect, describe, beforeAll, afterAll, beforeEach } from 'bun:test';
-import { mkdirSync, writeFileSync, rmSync, readFileSync, existsSync, chmodSync } from 'fs';
+import { mkdirSync, writeFileSync, rmSync, readFileSync, existsSync, chmodSync, mkdtempSync } from 'fs';
+import { execFileSync } from 'child_process';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
@@ -10,6 +11,7 @@ import {
   cloneRepo,
   pullRepo,
   GitOperationError,
+  isWorkingTreeDirty,
   validateRepoState,
 } from '../src/core/git-remote.ts';
 import { withEnv } from './helpers/with-env.ts';
@@ -414,5 +416,25 @@ describe('validateRepoState', () => {
     await withEnv({ PATH: fakePath() }, async () => {
       expect(validateRepoState(p)).toBe('healthy');
     });
+  });
+});
+
+describe('local Git environment boundary', () => {
+  test('working-tree probe ignores inherited repository/config poisoning', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'gbrain-git-env-'));
+    try {
+      execFileSync('git', ['init', '-q', repo]);
+      await withEnv({
+        GIT_DIR: '/dev/null',
+        GIT_WORK_TREE: '/dev/null',
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'core.repositoryformatversion',
+        GIT_CONFIG_VALUE_0: '999',
+      }, async () => {
+        expect(isWorkingTreeDirty(repo)).toBe(false);
+      });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 });

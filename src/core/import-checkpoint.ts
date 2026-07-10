@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, writeFileSync, renameSync, unlinkSync } from 'fs';
+import { randomUUID } from 'crypto';
 import { relative, isAbsolute } from 'path';
 
 /**
@@ -25,7 +26,7 @@ import { relative, isAbsolute } from 'path';
  * enter the set.
  */
 export interface ImportCheckpoint {
-  /** Absolute brain directory the checkpoint was created against. Mismatch on resume → discard. */
+  /** Opaque brain/source/authority identity. Mismatch on resume → discard. */
   dir: string;
   /**
    * Paths (relative to `dir`) that completed successfully or were unchanged.
@@ -93,8 +94,8 @@ export function loadCheckpoint(path: string, currentDir: string): ImportCheckpoi
  * `content_hash`.
  */
 export function saveCheckpoint(path: string, cp: ImportCheckpoint): void {
+  const tmp = `${path}.tmp-${process.pid}-${randomUUID()}`;
   try {
-    const tmp = `${path}.tmp`;
     // Sort for stable serialization — keeps diffs across snapshots minimal
     // and tests deterministic.
     const payload: ImportCheckpoint = {
@@ -105,6 +106,7 @@ export function saveCheckpoint(path: string, cp: ImportCheckpoint): void {
     writeFileSync(tmp, JSON.stringify(payload));
     renameSync(tmp, path);
   } catch {
+    try { if (existsSync(tmp)) unlinkSync(tmp); } catch { /* best-effort */ }
     /* non-fatal: lost checkpoint just means re-walk on next run */
   }
 }

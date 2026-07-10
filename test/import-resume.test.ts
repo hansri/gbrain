@@ -22,16 +22,17 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync, mkdirSync } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
-import { runImport } from '../src/commands/import.ts';
+import { resolveImportCheckpointScope, runImport } from '../src/commands/import.ts';
 
 let engine: PGLiteEngine;
 let workspace: string;        // GBRAIN_HOME target — `${workspace}/.gbrain/` holds the checkpoint file
 let gbrainHomeDir: string;    // Resolves to `${workspace}/.gbrain` — the actual checkpoint dir
 let cpPath: string;           // The checkpoint file path inside gbrainHomeDir
+let cpIdentity: string;
 let brainDir: string;         // The brain content dir — fixture markdown lives here
 
 beforeAll(async () => {
@@ -51,7 +52,6 @@ beforeEach(async () => {
   // The checkpoint lives at `${workspace}/.gbrain/import-checkpoint.json`.
   gbrainHomeDir = join(workspace, '.gbrain');
   mkdirSync(gbrainHomeDir, { recursive: true });
-  cpPath = join(gbrainHomeDir, 'import-checkpoint.json');
   brainDir = mkdtempSync(join(tmpdir(), 'gbrain-import-resume-brain-'));
 });
 
@@ -77,12 +77,22 @@ function validMarkdown(slug: string, title = slug) {
   ].join('\n');
 }
 
+async function withCheckpointEnv<T>(fn: () => Promise<T>): Promise<T> {
+  return withEnv({ GBRAIN_HOME: workspace }, async () => {
+    const scope = resolveImportCheckpointScope(brainDir);
+    cpPath = scope.path;
+    cpIdentity = scope.identity;
+    mkdirSync(dirname(cpPath), { recursive: true });
+    return fn();
+  });
+}
+
 describe('runImport checkpoint resume — v0.33.2 path-based', () => {
   test('old positional checkpoint gets discarded with stderr log', async () => {
-    await withEnv({ GBRAIN_HOME: workspace }, async () => {
+    await withCheckpointEnv(async () => {
       // Plant a pre-v0.33.2 positional checkpoint.
       writeFileSync(cpPath, JSON.stringify({
-        dir: brainDir,
+        dir: cpIdentity,
         totalFiles: 10,
         processedIndex: 5,
         completedFiles: 5,
@@ -111,14 +121,14 @@ describe('runImport checkpoint resume — v0.33.2 path-based', () => {
   }, 30_000);
 
   test('v0.33.2 checkpoint with completedPaths skips already-done files', async () => {
-    await withEnv({ GBRAIN_HOME: workspace }, async () => {
+    await withCheckpointEnv(async () => {
       writeBrainFile('a.md', validMarkdown('a'));
       writeBrainFile('b.md', validMarkdown('b'));
       writeBrainFile('c.md', validMarkdown('c'));
 
       // Plant a v0.33.2 checkpoint that says a.md and b.md are done.
       writeFileSync(cpPath, JSON.stringify({
-        dir: brainDir,
+        dir: cpIdentity,
         completedPaths: ['a.md', 'b.md'],
         timestamp: '2026-05-14T00:00:00Z',
       }));
@@ -131,7 +141,7 @@ describe('runImport checkpoint resume — v0.33.2 path-based', () => {
   }, 30_000);
 
   test('clean completion clears the checkpoint file', async () => {
-    await withEnv({ GBRAIN_HOME: workspace }, async () => {
+    await withCheckpointEnv(async () => {
       writeBrainFile('only.md', validMarkdown('only'));
 
       // No prior checkpoint.
@@ -148,7 +158,7 @@ describe('runImport checkpoint resume — v0.33.2 path-based', () => {
   }, 30_000);
 
   test('failed file does NOT enter completedPaths — next run retries it', async () => {
-    await withEnv({ GBRAIN_HOME: workspace }, async () => {
+    await withCheckpointEnv(async () => {
       // Two healthy files plus one with a path-vs-frontmatter slug mismatch.
       // import-file.ts rejects path-derived 'people/bob' vs declared slug
       // 'wrong-slug' with a SLUG_MISMATCH failure (test/e2e/sync.test.ts uses
@@ -165,6 +175,13 @@ describe('runImport checkpoint resume — v0.33.2 path-based', () => {
       // returned-skipped-with-error paths. SLUG_MISMATCH hits the latter.
       expect(result1.failures.length).toBeGreaterThan(0);
       expect(result1.failures.some(f => f.path.includes('bob'))).toBe(true);
+      expect(existsSync(cpPath)).toBe(true);
+      const checkpoint = JSON.parse(readFileSync(cpPath, 'utf8')) as {
+        completedPaths: string[];
+      };
+      expect(checkpoint.completedPaths).toContain('people/alice.md');
+      expect(checkpoint.completedPaths).toContain('people/carol.md');
+      expect(checkpoint.completedPaths).not.toContain('people/bob.md');
 
       // Fix the broken file.
       writeBrainFile('people/bob.md', validMarkdown('people/bob'));
@@ -174,6 +191,7 @@ describe('runImport checkpoint resume — v0.33.2 path-based', () => {
       // pointer (the pre-v0.33.2 bug class).
       const result2 = await runImport(engine, [brainDir, '--no-embed']);
       expect(result2.failures.length).toBe(0);
+      expect(result2.imported).toBe(1);
 
       // bob now exists in the DB.
       const pages = await engine.executeRaw<{ slug: string }>(
@@ -187,7 +205,7 @@ describe('runImport checkpoint resume — v0.33.2 path-based', () => {
   }, 60_000);
 
   test('checkpoint with mismatched dir is discarded silently (no migration log)', async () => {
-    await withEnv({ GBRAIN_HOME: workspace }, async () => {
+    await withCheckpointEnv(async () => {
       writeBrainFile('one.md', validMarkdown('one'));
 
       // v0.33.2-shaped checkpoint pointing at a different brain dir.
@@ -216,4 +234,17 @@ describe('runImport checkpoint resume — v0.33.2 path-based', () => {
       expect(captured).not.toContain('Older checkpoint format');
     });
   }, 30_000);
+
+  test('checkpoint files are isolated by source, brain, and pinned commit', () => {
+    const commitA = 'a'.repeat(40);
+    const sourceA = resolveImportCheckpointScope(brainDir, { sourceId: 'source-a', commit: commitA });
+    const sourceB = resolveImportCheckpointScope(brainDir, { sourceId: 'source-b', commit: commitA });
+    const otherBrain = resolveImportCheckpointScope(`${brainDir}-other`, { sourceId: 'source-a', commit: commitA });
+    const otherCommit = resolveImportCheckpointScope(brainDir, { sourceId: 'source-a', commit: 'b'.repeat(40) });
+
+    expect(sourceA.path).not.toBe(sourceB.path);
+    expect(sourceA.path).not.toBe(otherBrain.path);
+    expect(sourceA.path).not.toBe(otherCommit.path);
+    expect(sourceA.identity).not.toBe(sourceB.identity);
+  });
 });

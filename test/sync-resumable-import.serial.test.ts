@@ -197,19 +197,24 @@ describe('#1794 — resumable incremental sync (pinned target)', () => {
     // Simulate a started-but-unfinished run pinned at C1 (nothing drained yet).
     await seedCheckpoint(c0, c1, []);
     // The enrich process commits FORWARD past the pin while we were "down".
-    const c2 = commitPages(repoPath, { 'y.md': pageMd('Y') }, 'add y (forward drift)');
+    const c2 = commitPages(repoPath, {
+      'x.md': pageMd('X at C2'),
+      'y.md': pageMd('Y'),
+    }, 'modify x and add y (forward drift)');
     expect(c2).not.toBe(c1);
 
     // Run 1: drains C0..C1 only, advances to the PIN (C1), not live HEAD (C2).
     const r1 = await performSync(engine, { repoPath, noPull: true, noEmbed: true });
     expect(r1.status).toBe('synced');
-    expect(await engine.getPage('notes/x')).not.toBeNull();
+    expect((await engine.getPage('notes/x'))?.compiled_truth).toContain('Body for X.');
+    expect((await engine.getPage('notes/x'))?.compiled_truth).not.toContain('X at C2');
     expect(await engine.getPage('notes/y')).toBeNull(); // past the pin, not yet
     expect(await lastCommitConfig()).toBe(c1);
 
     // Run 2: now anchored at C1, diff C1..C2 picks up y.
     const r2 = await performSync(engine, { repoPath, noPull: true, noEmbed: true });
     expect(r2.status).toBe('synced');
+    expect((await engine.getPage('notes/x'))?.compiled_truth).toContain('Body for X at C2.');
     expect(await engine.getPage('notes/y')).not.toBeNull();
     expect(await lastCommitConfig()).toBe(c2);
   }, 60_000);
@@ -292,21 +297,21 @@ describe('#1794 — resumable incremental sync (pinned target)', () => {
     expect(banked).not.toContain('notes/bad.md');
   }, 60_000);
 
-  // ── F. Codex #3: file added in range but deleted from disk → skip, not block
-  test('[Codex #3] vanished-on-disk added file is skipped, not a failure', async () => {
+  // ── F. Commit authority: a live checkout delete cannot erase pinned bytes
+  test('[CRITICAL] vanished-on-disk added file imports from the pinned commit', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
 
     await performSync(engine, { repoPath, full: true, noPull: true, noEmbed: true });
     const c1 = commitPages(repoPath, { 'keep.md': pageMd('Keep'), 'gone.md': pageMd('Gone') }, 'two pages');
 
-    // Delete gone.md from disk WITHOUT committing — it's still 'added' in the
-    // C0..C1 diff, but importFile won't find it (forward-delete simulation).
+    // Delete gone.md from disk WITHOUT committing. The pinned C1 object remains
+    // authoritative and must still be imported.
     unlinkSync(join(repoPath, 'notes/gone.md'));
 
     const res = await performSync(engine, { repoPath, noPull: true, noEmbed: true });
     expect(res.status).toBe('synced'); // NOT blocked_by_failures
     expect(await engine.getPage('notes/keep')).not.toBeNull();
-    expect(await engine.getPage('notes/gone')).toBeNull();
+    expect(await engine.getPage('notes/gone')).not.toBeNull();
     expect(await lastCommitConfig()).toBe(c1);
   }, 60_000);
 

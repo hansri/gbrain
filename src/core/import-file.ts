@@ -39,6 +39,11 @@ import { normalizeAliasList } from './search/alias-normalize.ts';
 import { isUndefinedTableError, warnOncePerProcess } from './utils.ts';
 import { computeCorpusGeneration } from './contextual-retrieval-service.ts';
 import { runGuardrails } from './guardrails.ts';
+import {
+  openGitCommitSnapshot,
+  type GitCommitSnapshot,
+  type GitCommitBlob,
+} from './sync-delta.ts';
 
 /**
  * v0.20.0 Cathedral II Layer 8 D2 — markdown fence extraction helper.
@@ -903,36 +908,33 @@ export async function importFromContent(
  * `people/elon` page on the next `gbrain sync` or `gbrain import`. In shared
  * brains where PRs are mergeable, this is a silent page-hijack primitive.
  */
-export async function importFromFile(
+export interface ImportFileOptions {
+  noEmbed?: boolean;
+  inferFrontmatter?: boolean;
+  sourceId?: string;
+  forceRechunk?: boolean;
+  /**
+   * v0.39 T1.5: active schema pack threaded through to importFromContent so
+   * `parseMarkdown` uses pack-driven type inference. Load ONCE per command;
+   * never per file (codex perf finding #7).
+   */
+  activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }> };
+}
+
+/**
+ * Import already-captured text bytes under a repo-relative path.
+ *
+ * The content is an explicit argument so Git-backed sync can pass an immutable
+ * commit blob without round-tripping through a mutable checkout. Filesystem
+ * callers retain their lstat/stat checks in `importFromFile` before entering
+ * this shared parser.
+ */
+export async function importFileContent(
   engine: BrainEngine,
-  filePath: string,
+  content: string,
   relativePath: string,
-  opts: {
-    noEmbed?: boolean;
-    inferFrontmatter?: boolean;
-    sourceId?: string;
-    forceRechunk?: boolean;
-    /**
-     * v0.39 T1.5: active schema pack threaded through to importFromContent so
-     * `parseMarkdown` uses pack-driven type inference. Load ONCE per command;
-     * never per file (codex perf finding #7).
-     */
-    activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }> };
-  } = {},
+  opts: ImportFileOptions = {},
 ): Promise<ImportResult> {
-  // Defense-in-depth: reject symlinks before reading content.
-  const lstat = lstatSync(filePath);
-  if (lstat.isSymbolicLink()) {
-    return { slug: relativePath, status: 'skipped', chunks: 0, error: `Skipping symlink: ${filePath}` };
-  }
-
-  const stat = statSync(filePath);
-  if (stat.size > MAX_FILE_SIZE) {
-    return { slug: relativePath, status: 'skipped', chunks: 0, error: `File too large (${stat.size} bytes)` };
-  }
-
-  let content = readFileSync(filePath, 'utf-8');
-
   // Route code files through the code import path
   if (isCodeFilePath(relativePath)) {
     return importCodeFile(engine, relativePath, content, {
@@ -1018,6 +1020,81 @@ export async function importFromFile(
     filename: fileBasename,
     sourcePath: relativePath,
   });
+}
+
+export async function importFromFile(
+  engine: BrainEngine,
+  filePath: string,
+  relativePath: string,
+  opts: ImportFileOptions = {},
+): Promise<ImportResult> {
+  // Defense-in-depth: reject symlinks before reading content.
+  const lstat = lstatSync(filePath);
+  if (lstat.isSymbolicLink()) {
+    return { slug: relativePath, status: 'skipped', chunks: 0, error: `Skipping symlink: ${filePath}` };
+  }
+
+  const stat = statSync(filePath);
+  if (stat.size > MAX_FILE_SIZE) {
+    return { slug: relativePath, status: 'skipped', chunks: 0, error: `File too large (${stat.size} bytes)` };
+  }
+
+  return importFileContent(engine, readFileSync(filePath, 'utf-8'), relativePath, opts);
+}
+
+export type ImportGitBlobOptions = ImportFileOptions & ImportImageOptions;
+
+/** Import a blob reference that was already resolved from one commit tree. */
+export async function importGitBlob(
+  engine: BrainEngine,
+  snapshot: GitCommitSnapshot,
+  blob: GitCommitBlob,
+  opts: ImportGitBlobOptions = {},
+): Promise<ImportResult> {
+  if (isImageFilePath(blob.path)) {
+    if (blob.size > MAX_IMAGE_BYTES) {
+      return {
+        slug: slugifyPath(blob.path),
+        status: 'skipped',
+        chunks: 0,
+        error: `Image too large (${blob.size} bytes, max ${MAX_IMAGE_BYTES}). Voyage multimodal caps at 20MB per input.`,
+      };
+    }
+    const bytes = await snapshot.read(blob.path, MAX_IMAGE_BYTES);
+    return importImageBuffer(engine, bytes, blob.path, opts);
+  }
+  if (blob.size > MAX_FILE_SIZE) {
+    return {
+      slug: blob.path,
+      status: 'skipped',
+      chunks: 0,
+      error: `File too large (${blob.size} bytes)`,
+    };
+  }
+  const bytes = await snapshot.read(blob.path, MAX_FILE_SIZE);
+  return importFileContent(engine, bytes.toString('utf8'), blob.path, opts);
+}
+
+/** Resolve and import one path from the exact bytes at `commit`. */
+export async function importGitCommitFile(
+  engine: BrainEngine,
+  repoPath: string,
+  commit: string,
+  relativePath: string,
+  opts: ImportGitBlobOptions = {},
+): Promise<ImportResult> {
+  const snapshot = openGitCommitSnapshot(repoPath, commit);
+  try {
+    const blob = snapshot.getBlob(relativePath);
+    if (!blob) {
+      throw new Error(
+        `Path is not a regular file in Git snapshot ${commit.slice(0, 12)}: ${relativePath}`,
+      );
+    }
+    return await importGitBlob(engine, snapshot, blob, opts);
+  } finally {
+    await snapshot.close();
+  }
 }
 
 /**
@@ -1536,24 +1613,18 @@ const _ocrLimiter = pLimit(8);
  * (extended in import.ts to recognize image extensions when
  * embedding_multimodal is on).
  */
-export async function importImageFile(
+export async function importImageBuffer(
   engine: BrainEngine,
-  filePath: string,
+  buf: Buffer,
   relativePath: string,
   opts: ImportImageOptions = {},
 ): Promise<ImportResult> {
-  // Defense-in-depth: reject symlinks before reading bytes.
-  const lstat = lstatSync(filePath);
-  if (lstat.isSymbolicLink()) {
-    return { slug: slugifyPath(relativePath), status: 'skipped', chunks: 0, error: `Skipping symlink: ${filePath}` };
-  }
-  const stat = statSync(filePath);
-  if (stat.size > MAX_IMAGE_BYTES) {
+  if (buf.byteLength > MAX_IMAGE_BYTES) {
     return {
       slug: slugifyPath(relativePath),
       status: 'skipped',
       chunks: 0,
-      error: `Image too large (${stat.size} bytes, max ${MAX_IMAGE_BYTES}). Voyage multimodal caps at 20MB per input.`,
+      error: `Image too large (${buf.byteLength} bytes, max ${MAX_IMAGE_BYTES}). Voyage multimodal caps at 20MB per input.`,
     };
   }
 
@@ -1563,7 +1634,6 @@ export async function importImageFile(
   // and slugifyPath would already preserve it). Recompute with the file
   // extension preserved so the page slug is stable + collision-free.
   const imageSlug = relativePath.replace(/[\\\/]/g, '/').toLowerCase();
-  const buf = readFileSync(filePath);
   const hash = createHash('sha256').update(buf).digest('hex');
 
   const existing = await engine.getPage(imageSlug);
@@ -1616,7 +1686,7 @@ export async function importImageFile(
     type: 'image',
     title: filename,
     mime_type: decoded.mime,
-    bytes: stat.size,
+    bytes: buf.byteLength,
     ...exif,
   };
 
@@ -1635,7 +1705,7 @@ export async function importImageFile(
     filename,
     storage_path: relativePath.replace(/[\\\/]/g, '/'),
     mime_type: decoded.mime,
-    size_bytes: stat.size,
+    size_bytes: buf.byteLength,
     content_hash: hash,
   };
 
@@ -1675,6 +1745,29 @@ export async function importImageFile(
   });
 
   return { slug: imageSlug, status: 'imported', chunks: 1 };
+}
+
+export async function importImageFile(
+  engine: BrainEngine,
+  filePath: string,
+  relativePath: string,
+  opts: ImportImageOptions = {},
+): Promise<ImportResult> {
+  // Defense-in-depth: reject symlinks before reading bytes.
+  const lstat = lstatSync(filePath);
+  if (lstat.isSymbolicLink()) {
+    return { slug: slugifyPath(relativePath), status: 'skipped', chunks: 0, error: `Skipping symlink: ${filePath}` };
+  }
+  const stat = statSync(filePath);
+  if (stat.size > MAX_IMAGE_BYTES) {
+    return {
+      slug: slugifyPath(relativePath),
+      status: 'skipped',
+      chunks: 0,
+      error: `Image too large (${stat.size} bytes, max ${MAX_IMAGE_BYTES}). Voyage multimodal caps at 20MB per input.`,
+    };
+  }
+  return importImageBuffer(engine, readFileSync(filePath), relativePath, opts);
 }
 
 /** Used by sync.isSyncable + import.ts walker. */

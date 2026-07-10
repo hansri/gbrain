@@ -71,6 +71,10 @@ import { canonicalSourcePath } from '../core/source-path.ts';
 // count but safe at any future schema width and keeps per-batch error blast radius
 // small (a malformed row aborts at most 100, not thousands).
 const BATCH_SIZE = 100;
+// Dedicated provenance for timeline rows maintained from imported Markdown.
+// Manual timeline entries use their caller-provided source (often '' or
+// 'manual') and are never touched by this reconciler.
+const IMPORTED_MARKDOWN_TIMELINE_SOURCE = 'gbrain-markdown';
 
 // v0.42.7 (#1696): keyset batch size for `extract --stale`. SMALL by design —
 // listStalePagesForExtraction returns page CONTENT (compiled_truth + timeline),
@@ -1293,6 +1297,165 @@ async function extractTimelineFromDir(
 
 // --- Sync integration hooks ---
 
+/**
+ * Extract links + timeline for freshly imported pages from the DB bytes that
+ * were just persisted. This is the commit-safe sync hook: it never reopens the
+ * mutable checkout after import, and it stamps each page with the exact
+ * `updated_at` value read alongside those bytes so a concurrent edit remains
+ * stale. Batch failures propagate; no page is stamped over a lost write.
+ */
+export async function extractImportedPagesFromDB(
+  engine: BrainEngine,
+  slugs: string[],
+  opts?: { sourceId?: string },
+): Promise<{ linksCreated: number; timelineCreated: number; pagesProcessed: number }> {
+  const sourceId = opts?.sourceId ?? 'default';
+  const uniqueSlugs = [...new Set(slugs)];
+  if (uniqueSlugs.length === 0) {
+    return { linksCreated: 0, timelineCreated: 0, pagesProcessed: 0 };
+  }
+
+  const allRefs = await engine.listAllPageRefs();
+  const allSlugs = new Set<string>();
+  const slugToSources = new Map<string, string[]>();
+  for (const ref of allRefs) {
+    allSlugs.add(ref.slug);
+    const sources = slugToSources.get(ref.slug) ?? [];
+    sources.push(ref.source_id);
+    slugToSources.set(ref.slug, sources);
+  }
+  const resolver = makeResolver(engine, { mode: 'batch', sourceId });
+  const globalBasename = await isGlobalBasenameEnabled(engine);
+  let linksCreated = 0;
+  let timelineCreated = 0;
+  let pagesProcessed = 0;
+
+  for (let start = 0; start < uniqueSlugs.length; start += BATCH_SIZE) {
+    const slugBatch = uniqueSlugs.slice(start, start + BATCH_SIZE);
+    const pages = await engine.executeRaw<{
+      slug: string;
+      source_id: string;
+      type: PageType;
+      compiled_truth: string;
+      timeline: string | null;
+      frontmatter: Record<string, unknown> | string | null;
+      updated_at_iso: string;
+    }>(
+      `SELECT slug, source_id, type, compiled_truth, timeline, frontmatter,
+              to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at_iso
+         FROM pages
+        WHERE source_id = $1
+          AND slug = ANY($2::text[])
+          AND deleted_at IS NULL`,
+      [sourceId, slugBatch],
+    );
+
+    const linkRows: LinkBatchInput[] = [];
+    const timelineRows: TimelineBatchInput[] = [];
+    const processedRefs: Array<{ slug: string; source_id: string; extractedAt: string }> = [];
+    for (const page of pages) {
+      let frontmatter: Record<string, unknown> = {};
+      if (page.frontmatter && typeof page.frontmatter === 'object') {
+        frontmatter = page.frontmatter;
+      } else if (typeof page.frontmatter === 'string') {
+        try { frontmatter = JSON.parse(page.frontmatter) as Record<string, unknown>; }
+        catch { frontmatter = {}; }
+      }
+      const fullContent = `${page.compiled_truth ?? ''}\n${page.timeline ?? ''}`;
+      const extracted = await extractPageLinks(
+        page.slug,
+        fullContent,
+        frontmatter,
+        page.type,
+        resolver,
+        { skipFrontmatter: true, globalBasename },
+      );
+      for (const candidate of extracted.candidates) {
+        const resolved = resolveCandidateSources(
+          candidate, page.slug, page.source_id, allSlugs, slugToSources,
+        );
+        if (!resolved) continue;
+        linkRows.push({
+          from_slug: resolved.fromSlug,
+          to_slug: candidate.targetSlug,
+          link_type: candidate.linkType,
+          context: candidate.context,
+          link_source: candidate.linkSource,
+          origin_slug: candidate.originSlug,
+          origin_field: candidate.originField,
+          from_source_id: resolved.fromSourceId,
+          to_source_id: resolved.toSourceId,
+          origin_source_id: page.source_id,
+        });
+      }
+      for (const entry of parseTimelineEntries(fullContent)) {
+        timelineRows.push({
+          slug: page.slug,
+          date: entry.date,
+          source: IMPORTED_MARKDOWN_TIMELINE_SOURCE,
+          summary: entry.summary,
+          detail: entry.detail || '',
+          source_id: page.source_id,
+        });
+      }
+      processedRefs.push({
+        slug: page.slug,
+        source_id: page.source_id,
+        extractedAt: page.updated_at_iso,
+      });
+    }
+
+    const reconciled = await engine.transaction(async tx => {
+      // Replace only rows owned by this extractor. Explicit/manual links and
+      // timeline entries are separate authorities and survive untouched.
+      await tx.executeRaw(
+        `DELETE FROM links l
+          USING pages p
+          WHERE l.from_page_id = p.id
+            AND p.source_id = $1
+            AND p.slug = ANY($2::text[])
+            AND l.origin_page_id IS NULL
+            AND (l.link_source IS NULL OR l.link_source IN ('markdown', 'wikilink-resolved'))`,
+        [sourceId, slugBatch],
+      );
+      await tx.executeRaw(
+        `DELETE FROM timeline_entries te
+          USING pages p
+          WHERE te.page_id = p.id
+            AND p.source_id = $1
+            AND p.slug = ANY($2::text[])
+            AND te.source = $3`,
+        [sourceId, slugBatch, IMPORTED_MARKDOWN_TIMELINE_SOURCE],
+      );
+
+      let createdLinks = 0;
+      let createdTimeline = 0;
+      for (let i = 0; i < linkRows.length; i += BATCH_SIZE) {
+        createdLinks += await tx.addLinksBatch( // gbrain-allow-direct-insert: authoritative post-sync reconciliation from freshly imported DB bytes
+          linkRows.slice(i, i + BATCH_SIZE),
+          { auditSite: 'extract.stale' },
+        );
+      }
+      for (let i = 0; i < timelineRows.length; i += BATCH_SIZE) {
+        createdTimeline += await tx.addTimelineEntriesBatch(
+          timelineRows.slice(i, i + BATCH_SIZE),
+          { auditSite: 'extract.stale' },
+        );
+      }
+      if (processedRefs.length > 0) {
+        // Stamp last in the SAME transaction. A delete/add failure rolls the
+        // managed graph back and leaves every page stale for a safe retry.
+        await tx.markPagesExtractedBatch(processedRefs, new Date().toISOString());
+      }
+      return { createdLinks, createdTimeline };
+    });
+    linksCreated += reconciled.createdLinks;
+    timelineCreated += reconciled.createdTimeline;
+    pagesProcessed += pages.length;
+  }
+  return { linksCreated, timelineCreated, pagesProcessed };
+}
+
 export async function extractLinksForSlugs(
   engine: BrainEngine,
   repoPath: string,
@@ -1744,7 +1907,14 @@ async function extractStaleFromDB(
         });
       }
       for (const entry of parseTimelineEntries(fullContent)) {
-        timelineRows.push({ slug: page.slug, date: entry.date, summary: entry.summary, detail: entry.detail || '', source_id: page.source_id });
+        timelineRows.push({
+          slug: page.slug,
+          date: entry.date,
+          source: IMPORTED_MARKDOWN_TIMELINE_SOURCE,
+          summary: entry.summary,
+          detail: entry.detail || '',
+          source_id: page.source_id,
+        });
       }
       // EVERY processed page is stamped (incl. zero-link pages). D4 race fix:
       // stamp with the row's READ updated_at, NOT now() — a concurrent edit
@@ -1765,19 +1935,50 @@ async function extractStaleFromDB(
       processedRefs.push({ slug: page.slug, source_id: page.source_id, extractedAt: freshnessStampFor(page.updated_at_iso) });
     }
 
-    // Flush NON-swallowing (CDX-4): a throw here propagates out of the sweep so
-    // the batch's pages stay unstamped and re-extract next run. addLinksBatch is
-    // ON CONFLICT DO NOTHING + timeline dedups, so partial-chunk writes are
-    // idempotent on re-extraction.
-    for (let i = 0; i < linkRows.length; i += BATCH_SIZE) {
-      linksCreated += await engine.addLinksBatch(linkRows.slice(i, i + BATCH_SIZE), { auditSite: 'extract.stale' }); // gbrain-allow-direct-insert: gbrain extract --stale — canonical link reconciliation from markdown body
-    }
-    for (let i = 0; i < timelineRows.length; i += BATCH_SIZE) {
-      timelineCreated += await engine.addTimelineEntriesBatch(timelineRows.slice(i, i + BATCH_SIZE), { auditSite: 'extract.stale' });
-    }
-    // Stamp LAST, directly (not the swallowing stampExtracted) so a stamp
-    // failure surfaces instead of looping forever.
-    await engine.markPagesExtractedBatch(processedRefs, new Date().toISOString());
+    const reconciled = await engine.transaction(async tx => {
+      const slugsBySource = new Map<string, string[]>();
+      for (const ref of processedRefs) {
+        const slugs = slugsBySource.get(ref.source_id) ?? [];
+        slugs.push(ref.slug);
+        slugsBySource.set(ref.source_id, slugs);
+      }
+      for (const [sourceId, slugs] of slugsBySource) {
+        await tx.executeRaw(
+          `DELETE FROM links l
+            USING pages p
+            WHERE l.from_page_id = p.id
+              AND p.source_id = $1
+              AND p.slug = ANY($2::text[])
+              AND l.origin_page_id IS NULL
+              AND (l.link_source IS NULL OR l.link_source IN ('markdown', 'wikilink-resolved'))`,
+          [sourceId, slugs],
+        );
+        await tx.executeRaw(
+          `DELETE FROM timeline_entries te
+            USING pages p
+            WHERE te.page_id = p.id
+              AND p.source_id = $1
+              AND p.slug = ANY($2::text[])
+              AND te.source = $3`,
+          [sourceId, slugs, IMPORTED_MARKDOWN_TIMELINE_SOURCE],
+        );
+      }
+
+      let createdLinks = 0;
+      let createdTimeline = 0;
+      for (let i = 0; i < linkRows.length; i += BATCH_SIZE) {
+        createdLinks += await tx.addLinksBatch(linkRows.slice(i, i + BATCH_SIZE), { auditSite: 'extract.stale' }); // gbrain-allow-direct-insert: authoritative stale-page reconciliation from DB bytes
+      }
+      for (let i = 0; i < timelineRows.length; i += BATCH_SIZE) {
+        createdTimeline += await tx.addTimelineEntriesBatch(timelineRows.slice(i, i + BATCH_SIZE), { auditSite: 'extract.stale' });
+      }
+      // Stamp LAST in the same transaction. Any managed-row replacement error
+      // rolls back and leaves the page stale for an idempotent retry.
+      await tx.markPagesExtractedBatch(processedRefs, new Date().toISOString());
+      return { createdLinks, createdTimeline };
+    });
+    linksCreated += reconciled.createdLinks;
+    timelineCreated += reconciled.createdTimeline;
 
     pagesProcessed += rows.length;
     progress.tick(rows.length);

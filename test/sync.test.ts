@@ -1,7 +1,11 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
 import { buildSyncManifest, isSyncable, pathToSlug, pruneDir, isCodeFilePath } from '../src/core/sync.ts';
-import { buildAutoEmbedArgs, buildGitInvocation } from '../src/commands/sync.ts';
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'fs';
+import {
+  buildAutoEmbedArgs,
+  buildGitInvocation,
+  formatSyncSentinelRemediation,
+} from '../src/commands/sync.ts';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, symlinkSync } from 'fs';
 import { join } from 'path';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
@@ -497,7 +501,7 @@ describe('performSync dry-run never writes', () => {
     expect(typeof result.embedded).toBe('number');
   });
 
-  test('detached HEAD skips git pull and ingests local working-tree files', async () => {
+  test('detached HEAD refuses uncommitted working-tree files', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
     const seeded = await performSync(engine, {
       repoPath,
@@ -524,28 +528,23 @@ describe('performSync dry-run never writes', () => {
     };
 
     try {
-      const result = await performSync(engine, {
+      await expect(performSync(engine, {
         repoPath,
         noEmbed: true,
         noExtract: true,
-      });
-
-      expect(result.status).toBe('synced');
-      expect(result.added).toBe(1);
-      expect(result.pagesAffected).toContain('people/detached-local');
+      })).rejects.toThrow('Detached HEAD has uncommitted changes');
     } finally {
       console.error = originalError;
     }
 
-    expect(errors.join('\n')).toContain(`Detached HEAD on ${repoPath}; skipping git pull. Syncing from local working tree.`);
+    expect(errors.join('\n')).toContain(`Detached HEAD on ${repoPath}; skipping git pull. Syncing immutable HEAD only.`);
     expect(errors.join('\n')).not.toContain('git pull failed');
 
     const page = await engine.getPage('people/detached-local');
-    expect(page).not.toBeNull();
-    expect(page!.title).toBe('Detached Local');
+    expect(page).toBeNull();
   });
 
-  test('detached HEAD with --no-pull also ingests local working-tree files', async () => {
+  test('detached HEAD with --no-pull ingests an exact committed detached tip', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
     const seeded = await performSync(engine, {
       repoPath,
@@ -562,8 +561,9 @@ describe('performSync dry-run never writes', () => {
       'title: Detached NoPull',
       '---',
       '',
-      'Only in detached working tree, --no-pull caller.',
+      'Committed on a detached tip, --no-pull caller.',
     ].join('\n'));
+    execSync('git add -A && git commit -m "detached committed tip"', { cwd: repoPath, stdio: 'pipe' });
 
     const result = await performSync(engine, {
       repoPath,
@@ -671,7 +671,9 @@ describe('git() helper invocation order (CJK wave v0.32.7)', () => {
   test('core.quotepath=false is always emitted first', () => {
     const argv = buildGitInvocation('/repo', ['diff', '--name-status']);
     expect(argv).toEqual([
+      '--no-replace-objects',
       '-c', 'core.quotepath=false',
+      '-c', 'core.fsmonitor=false',
       '-C', '/repo',
       'diff', '--name-status',
     ]);
@@ -680,7 +682,9 @@ describe('git() helper invocation order (CJK wave v0.32.7)', () => {
   test('extra configs append AFTER quotepath, BEFORE -C and subcommand', () => {
     const argv = buildGitInvocation('/repo', ['diff'], ['foo=bar', 'baz=qux']);
     expect(argv).toEqual([
+      '--no-replace-objects',
       '-c', 'core.quotepath=false',
+      '-c', 'core.fsmonitor=false',
       '-c', 'foo=bar',
       '-c', 'baz=qux',
       '-C', '/repo',
@@ -691,9 +695,23 @@ describe('git() helper invocation order (CJK wave v0.32.7)', () => {
   test('empty args produces a valid invocation', () => {
     const argv = buildGitInvocation('/repo', []);
     expect(argv).toEqual([
+      '--no-replace-objects',
       '-c', 'core.quotepath=false',
+      '-c', 'core.fsmonitor=false',
       '-C', '/repo',
     ]);
+  });
+});
+
+describe('sync sentinel remediation', () => {
+  test('reports every applicable integrity recovery action', () => {
+    const message = formatSyncSentinelRemediation([
+      '<git-snapshot>', '<delete-reconcile>', '<rename>', '<head>',
+    ]);
+    expect(message).toContain('object-store integrity');
+    expect(message).toContain('file-backed row');
+    expect(message).toContain('slug/path collision');
+    expect(message).toContain('pin current HEAD');
   });
 });
 
@@ -784,6 +802,26 @@ describe('#1970: unreachable last_commit bookmark recovery', () => {
       console.log = origLog;
     }
   }
+
+  test('[CRITICAL] attached full sync imports committed bytes, not dirty same-path edits', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({
+      'people/alice-example.md': personMd('Alice Example', 'Committed authority.'),
+    });
+
+    // Dirty the attached checkout after HEAD is fixed. Full sync must enumerate
+    // and read HEAD's tree, not the mutable file that happens to be on disk.
+    writeFileSync(
+      join(repo, 'people/alice-example.md'),
+      personMd('Alice Example', 'Mutable worktree poison.'),
+    );
+
+    const result = await performSync(engine, { repoPath: repo, full: true, ...SYNC_OPTS });
+    expect(result.status).toBe('first_sync');
+    const page = await engine.getPage('people/alice-example', { sourceId: 'default' });
+    expect(page?.compiled_truth).toContain('Committed authority.');
+    expect(page?.compiled_truth).not.toContain('Mutable worktree poison.');
+  });
 
   test('orphan-present (not an ancestor): diffs tree-to-tree, imports only the delta, advances bookmark', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
@@ -880,6 +918,80 @@ describe('#1970: unreachable last_commit bookmark recovery', () => {
     expect(await engine.getPage('people/carol')).toBeNull();
   });
 
+  test('[CRITICAL] regular file to symlink deletes the stale indexed page', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({ 'people/alice.md': personMd('Alice', 'Regular committed page.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(await engine.getPage('people/alice')).not.toBeNull();
+
+    rmSync(join(repo, 'people/alice.md'));
+    symlinkSync('../outside.md', join(repo, 'people/alice.md'));
+    execSync('git add -A && git commit -m "regular to symlink"', { cwd: repo, stdio: 'pipe' });
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+    expect(await engine.getPage('people/alice')).toBeNull();
+  });
+
+  test('[CRITICAL] custom-slug delete blocks on resolver failure or unverified fallback', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({ 'people/alice.md': personMd('Alice', 'Custom slug target.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    await engine.updateSlug('people/alice', 'custom/alice', { sourceId: 'default' });
+    const before = await bookmark();
+    execSync('git rm people/alice.md && git commit -m "remove custom slug page"', {
+      cwd: repo,
+      stdio: 'pipe',
+    });
+
+    const originalResolve = engine.resolveSlugsByPaths.bind(engine);
+    (engine as any).resolveSlugsByPaths = async () => { throw new Error('resolver unavailable'); };
+    const resolverBlocked = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(resolverBlocked.status).toBe('blocked_by_failures');
+    expect(await bookmark()).toBe(before);
+    expect(await engine.getPage('custom/alice')).not.toBeNull();
+
+    // An empty/incorrect map must also fail verification instead of deleting a
+    // guessed path slug and advancing past the still-live custom row.
+    (engine as any).resolveSlugsByPaths = async () => new Map();
+    const verifyBlocked = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(verifyBlocked.status).toBe('blocked_by_failures');
+    expect(await bookmark()).toBe(before);
+    expect(await engine.getPage('custom/alice')).not.toBeNull();
+
+    (engine as any).resolveSlugsByPaths = originalResolve;
+    const resumed = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(resumed.status).toBe('synced');
+    expect(await engine.getPage('custom/alice')).toBeNull();
+    expect(await bookmark()).toBe(execSync('git rev-parse HEAD', { cwd: repo }).toString().trim());
+  });
+
+  test('[CRITICAL] rename errors hard-block and preserve the bookmark for retry', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({ 'people/old.md': personMd('Old', 'Original page.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    const before = await bookmark();
+
+    execSync('git mv people/old.md people/new.md', { cwd: repo, stdio: 'pipe' });
+    execSync('git commit -m "rename page"', { cwd: repo, stdio: 'pipe' });
+    const originalUpdateSlug = engine.updateSlug.bind(engine);
+    (engine as any).updateSlug = async () => { throw new Error('simulated rename collision'); };
+    let blocked: Awaited<ReturnType<typeof performSync>> | undefined;
+    try {
+      blocked = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    } finally {
+      (engine as any).updateSlug = originalUpdateSlug;
+    }
+    expect(blocked!.status).toBe('blocked_by_failures');
+    expect(await bookmark()).toBe(before);
+    expect(await engine.getPage('people/new')).toBeNull();
+
+    const resumed = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(resumed.status).toBe('synced');
+    expect(await engine.getPage('people/new')).not.toBeNull();
+    expect(await bookmark()).toBe(execSync('git rev-parse HEAD', { cwd: repo }).toString().trim());
+  });
+
   test('F-A: full reconcile purges stale file-backed pages but spares manual + metafile pages', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
     const repo = mkRepo({
@@ -910,6 +1022,38 @@ describe('#1970: unreachable last_commit bookmark recovery', () => {
     expect(await engine.getPage('people/alice')).not.toBeNull();    // still present → kept
     expect(await engine.getPage('manual/note')).not.toBeNull();     // null source_path → spared
     expect(await engine.getPage('people/log')).not.toBeNull();      // metafile source_path → spared
+  });
+
+  test('[CRITICAL] full delete failure blocks bookmark; retry reconciles then advances', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({
+      'people/alice.md': personMd('Alice', 'Alice is a person.'),
+      'people/bob.md': personMd('Bob', 'Bob is a person.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    const before = await bookmark();
+    execSync('git rm people/bob.md && git commit -m "remove bob"', { cwd: repo, stdio: 'pipe' });
+    const head = execSync('git rev-parse HEAD', { cwd: repo }).toString().trim();
+
+    const originalDeletePages = engine.deletePages.bind(engine);
+    const originalDeletePage = engine.deletePage.bind(engine);
+    (engine as any).deletePages = async () => { throw new Error('simulated batch delete outage'); };
+    (engine as any).deletePage = async () => { throw new Error('simulated single delete outage'); };
+    let blocked: Awaited<ReturnType<typeof performSync>> | undefined;
+    try {
+      blocked = await performSync(engine, { repoPath: repo, full: true, ...SYNC_OPTS });
+    } finally {
+      (engine as any).deletePages = originalDeletePages;
+      (engine as any).deletePage = originalDeletePage;
+    }
+    expect(blocked!.status).toBe('blocked_by_failures');
+    expect(await bookmark()).toBe(before);
+    expect(await engine.getPage('people/bob')).not.toBeNull();
+
+    const resumed = await performSync(engine, { repoPath: repo, full: true, ...SYNC_OPTS });
+    expect(resumed.status).toBe('first_sync');
+    expect(await engine.getPage('people/bob')).toBeNull();
+    expect(await bookmark()).toBe(head);
   });
 
   test('F-B: an undiffable-but-present bookmark falls back to a full reconcile instead of throwing', async () => {

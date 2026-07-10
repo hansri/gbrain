@@ -18,6 +18,7 @@ import { execFileSync } from 'child_process';
 import { lstatSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { isInternalUrl } from './url-safety.ts';
+import { cleanInheritedGitEnvironment } from './git-environment.ts';
 
 /**
  * Git CLI accepts two flag positions:
@@ -141,6 +142,7 @@ export class GitOperationError extends Error {
 }
 
 export const GIT_ENV = {
+  GIT_NO_REPLACE_OBJECTS: '1',
   // Confine to the gbrain SSRF model — no credential helpers, no SSH askpass,
   // no GUI prompts. Inherit PATH so git itself is findable.
   GIT_TERMINAL_PROMPT: '0',
@@ -160,6 +162,7 @@ export const GIT_ENV = {
  * fails fast instead of hanging a non-interactive cron forever.
  */
 export const GIT_ENV_AUTH = {
+  GIT_NO_REPLACE_OBJECTS: '1',
   GIT_TERMINAL_PROMPT: '0',
   GCM_INTERACTIVE: 'never',
 } as const;
@@ -203,7 +206,7 @@ export function cloneRepo(url: string, destDir: string, opts: CloneOpts = {}): v
     execFileSync('git', args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: opts.timeoutMs ?? 600_000,
-      env: { ...process.env, ...GIT_ENV },
+      env: cleanInheritedGitEnvironment(process.env, GIT_ENV),
     });
   } catch (e) {
     throw new GitOperationError(
@@ -221,7 +224,7 @@ export function pullRepo(repoPath: string, opts: { timeoutMs?: number } = {}): v
     execFileSync('git', args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: opts.timeoutMs ?? 300_000,
-      env: { ...process.env, ...GIT_ENV },
+      env: cleanInheritedGitEnvironment(process.env, GIT_ENV),
     });
   } catch (e) {
     throw new GitOperationError(
@@ -246,7 +249,7 @@ export function fetchRemote(repoPath: string, branch: string, opts: { timeoutMs?
     execFileSync('git', args, {
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: opts.timeoutMs ?? 30_000,
-      env: { ...process.env, ...GIT_ENV },
+      env: cleanInheritedGitEnvironment(process.env, GIT_ENV),
     });
   } catch (e) {
     throw new GitOperationError(
@@ -290,7 +293,7 @@ export function validateRepoState(
     const out = execFileSync('git', ['-C', repoPath, 'remote', 'get-url', 'origin'], {
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 10_000,
-      env: { ...process.env, ...GIT_ENV },
+      env: cleanInheritedGitEnvironment(process.env, GIT_ENV),
     });
     remoteUrl = out.toString().trim();
   } catch {
@@ -337,11 +340,11 @@ function runGit(
   try {
     const out = execFileSync(
       'git',
-      ['-C', repoPath, ...globalFlags, subcommand, ...subArgs],
+      ['-C', repoPath, '-c', 'core.fsmonitor=false', ...globalFlags, subcommand, ...subArgs],
       {
         stdio: ['ignore', 'pipe', 'pipe'],
         timeout: opts.timeoutMs ?? 120_000,
-        env: { ...process.env, ...(opts.env ?? GIT_ENV) },
+        env: cleanInheritedGitEnvironment(process.env, opts.env ?? GIT_ENV),
       },
     );
     return out.toString().trim();
@@ -363,14 +366,14 @@ export function isWorkingTreeDirty(repoPath: string): boolean {
 export function detectDefaultBranch(repoPath: string): string {
   try {
     const sym = execFileSync('git', ['-C', repoPath, 'symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: cleanInheritedGitEnvironment(process.env, GIT_ENV),
     }).toString().trim();
     if (sym.startsWith('origin/')) return sym.slice('origin/'.length);
     if (sym) return sym;
   } catch { /* origin/HEAD not set — fall through */ }
   try {
     const cur = execFileSync('git', ['-C', repoPath, 'rev-parse', '--abbrev-ref', 'HEAD'], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: cleanInheritedGitEnvironment(process.env, GIT_ENV),
     }).toString().trim();
     if (cur && cur !== 'HEAD') return cur;
   } catch { /* detached or no commits */ }
@@ -382,7 +385,7 @@ function rebaseInProgress(repoPath: string): boolean {
   for (const name of ['rebase-merge', 'rebase-apply']) {
     try {
       const p = execFileSync('git', ['-C', repoPath, 'rev-parse', '--git-path', name], {
-        stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+        stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: cleanInheritedGitEnvironment(process.env, GIT_ENV),
       }).toString().trim();
       const abs = p.startsWith('/') ? p : join(repoPath, p);
       if (existsSync(abs)) return true;
@@ -433,14 +436,14 @@ export function divergenceSafePull(
     // Abort any half-applied rebase so the tree is never left mid-rebase.
     try {
       execFileSync('git', ['-C', repoPath, 'rebase', '--abort'], {
-        stdio: 'ignore', timeout: 30_000, env: { ...process.env, ...GIT_ENV },
+        stdio: 'ignore', timeout: 30_000, env: cleanInheritedGitEnvironment(process.env, GIT_ENV),
       });
     } catch { /* best-effort */ }
     // If state STILL remains, try once more, then report regardless.
     if (rebaseInProgress(repoPath)) {
       try {
         execFileSync('git', ['-C', repoPath, 'rebase', '--abort'], {
-          stdio: 'ignore', timeout: 30_000, env: { ...process.env, ...GIT_ENV },
+          stdio: 'ignore', timeout: 30_000, env: cleanInheritedGitEnvironment(process.env, GIT_ENV),
         });
       } catch { /* best-effort */ }
     }
@@ -476,7 +479,7 @@ export function pushProbe(
     execFileSync(
       'git',
       ['-C', repoPath, ...durableSsrfFlags(), 'push', ...GIT_SSRF_SUBCOMMAND_FLAGS, '--dry-run', 'origin', `HEAD:${branch}`],
-      { stdio: ['ignore', 'pipe', 'pipe'], timeout: opts.timeoutMs ?? 60_000, env: { ...process.env, ...GIT_ENV_AUTH } },
+      { stdio: ['ignore', 'pipe', 'pipe'], timeout: opts.timeoutMs ?? 60_000, env: cleanInheritedGitEnvironment(process.env, GIT_ENV_AUTH) },
     );
     return { ok: true };
   } catch (e) {

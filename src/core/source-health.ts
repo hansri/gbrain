@@ -25,6 +25,7 @@ import { execFileSync } from 'child_process';
 import type { BrainEngine } from './engine.ts';
 import { parseSourceConfig, type SourceRow } from './sources-load.ts';
 import { isSourceUnchangedSinceSync } from './git-head.ts';
+import { gitAuthorityEnvironment } from './git-environment.ts';
 
 export interface SourceMetrics {
   source_id: string;
@@ -120,10 +121,11 @@ export function resolvePriority(sourceId: string, config: unknown): number {
 export function newestCommitMs(localPath: string | null): number | null {
   if (!localPath) return null;
   try {
-    const out = execFileSync('git', ['-C', localPath, 'log', '-1', '--format=%ct'], {
+    const out = execFileSync('git', ['--no-replace-objects', '-C', localPath, 'log', '-1', '--format=%ct'], {
       encoding: 'utf8',
       timeout: 10_000,
       stdio: ['ignore', 'pipe', 'ignore'],
+      env: gitAuthorityEnvironment(),
     }).trim();
     if (!out) return null;
     const ms = Number(out) * 1000;
@@ -148,10 +150,11 @@ export function newestCommitMs(localPath: string | null): number | null {
 export function commitTimeMs(localPath: string | null, sha: string | null): number | null {
   if (!localPath || !sha) return null;
   try {
-    const out = execFileSync('git', ['-C', localPath, 'show', '-s', '--format=%ct', sha], {
+    const out = execFileSync('git', ['--no-replace-objects', '-C', localPath, 'show', '-s', '--format=%ct', sha], {
       encoding: 'utf8',
       timeout: 10_000,
       stdio: ['ignore', 'pipe', 'ignore'],
+      env: gitAuthorityEnvironment(),
     }).trim();
     if (!out) return null;
     // `git show -s --format=%ct <sha>` prints only the committer epoch for the

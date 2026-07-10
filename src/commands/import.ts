@@ -1,16 +1,29 @@
 import { readdirSync, lstatSync, existsSync } from 'fs';
 import { execFileSync } from 'child_process';
-import { join, relative } from 'path';
+import { createHash } from 'crypto';
+import { dirname, join, relative, resolve } from 'path';
 import { cpus, totalmem } from 'os';
 import type { BrainEngine } from '../core/engine.ts';
-import { importFile, importImageFile, isImageFilePath } from '../core/import-file.ts';
+import {
+  importFile,
+  importImageFile,
+  importGitBlob,
+  isImageFilePath,
+  type ImportResult,
+} from '../core/import-file.ts';
+import {
+  GIT_SNAPSHOT_SENTINEL,
+  GitSnapshotError,
+  openGitCommitSnapshot,
+  type GitCommitBlob,
+  type GitCommitSnapshot,
+} from '../core/sync-delta.ts';
 import { loadConfig, gbrainPath } from '../core/config.ts';
 import { createProgress } from '../core/progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import {
-  isCodeFilePath,
-  isMarkdownFilePath,
   isImageFilePath as isImageFilePathFromSync,
+  isSyncable,
   pruneDir,
   type SyncStrategy,
 } from '../core/sync.ts';
@@ -21,6 +34,7 @@ import {
   clearCheckpoint,
   resumeFilter,
 } from '../core/import-checkpoint.ts';
+import { cleanInheritedGitEnvironment, gitAuthorityEnvironment } from '../core/git-environment.ts';
 
 function defaultWorkers(): number {
   const cpuCount = cpus().length;
@@ -42,10 +56,41 @@ export interface RunImportResult {
   failures: Array<{ path: string; error: string }>;
 }
 
+/**
+ * Source- and brain-scoped checkpoint identity/path.
+ *
+ * A single global `import-checkpoint.json` let concurrent source A/B imports
+ * overwrite or consume each other's completed paths whenever they shared a
+ * checkout and commit. The opaque identity is stored in the checkpoint; its
+ * hash gives each (brain, source, authority commit) an independent file.
+ */
+export function resolveImportCheckpointScope(
+  dir: string,
+  opts: { sourceId?: string; commit?: string } = {},
+): { identity: string; path: string } {
+  const identity = JSON.stringify({
+    version: 2,
+    brain: resolve(dir),
+    source: opts.sourceId ?? 'default',
+    authority: opts.commit ? `git:${opts.commit}` : 'filesystem',
+  });
+  const digest = createHash('sha256').update(identity).digest('hex').slice(0, 32);
+  return {
+    identity,
+    path: gbrainPath('import-checkpoints', `${digest}.json`),
+  };
+}
+
 export async function runImport(
   engine: BrainEngine,
   args: string[],
-  opts: { commit?: string; strategy?: SyncStrategy; sourceId?: string; managedBookmark?: boolean } = {},
+  opts: {
+    /** Resolved Git commit whose tree is the immutable import authority. */
+    commit?: string;
+    strategy?: SyncStrategy;
+    sourceId?: string;
+    managedBookmark?: boolean;
+  } = {},
 ): Promise<RunImportResult> {
   const noEmbed = args.includes('--no-embed');
   const fresh = args.includes('--fresh');
@@ -176,7 +221,18 @@ export async function runImport(
   const strategy: SyncStrategy = opts.strategy ?? 'markdown';
   const _walkT0 = Date.now();
   console.error(`[gbrain phase] import.collect_files start dir=${dir} strategy=${strategy}`);
-  const allFiles = collectSyncableFiles(dir, { strategy });
+  const commitSnapshot: GitCommitSnapshot | null = opts.commit
+    ? openGitCommitSnapshot(dir, opts.commit)
+    : null;
+  const snapshotBlobs = commitSnapshot
+    ? filterSyncableGitBlobs(commitSnapshot.blobs, { strategy })
+    : null;
+  const snapshotBlobByPath = new Map<string, GitCommitBlob>(
+    (snapshotBlobs ?? []).map(blob => [blob.path, blob]),
+  );
+  const allFiles = snapshotBlobs
+    ? snapshotBlobs.map(blob => blob.path)
+    : collectSyncableFiles(dir, { strategy });
   console.error(
     `[gbrain phase] import.collect_files done ${Date.now() - _walkT0}ms files=${allFiles.length}`,
   );
@@ -191,10 +247,12 @@ export async function runImport(
   // Resume from checkpoint if available. v0.33.2: path-based resume —
   // see src/core/import-checkpoint.ts for the bug-class this fixes
   // (parallel-import silent-skip and failed-file no-retry).
-  const checkpointPath = gbrainPath('import-checkpoint.json');
+  const checkpointScope = resolveImportCheckpointScope(dir, opts);
+  const checkpointPath = checkpointScope.path;
+  const checkpointIdentity = checkpointScope.identity;
   const completed = new Set<string>();
   if (!fresh) {
-    const cp = loadCheckpoint(checkpointPath, dir);
+    const cp = loadCheckpoint(checkpointPath, checkpointIdentity);
     if (cp) {
       for (const p of cp.completedPaths) completed.add(p);
       console.log(`Resuming from checkpoint: skipping ${completed.size} already-processed files`);
@@ -216,6 +274,7 @@ export async function runImport(
   const importedSlugs: string[] = [];
   const errorCounts: Record<string, number> = {};
   const failures: Array<{ path: string; error: string }> = []; // Bug 9
+  let snapshotAuthorityFailed = false;
   const startTime = Date.now();
 
   // Progress on stderr so stdout stays clean for the final summary / --json payload.
@@ -227,7 +286,7 @@ export async function runImport(
   }
 
   async function processFile(eng: BrainEngine, filePath: string) {
-    const relativePath = relative(dir, filePath);
+    const relativePath = snapshotBlobs ? filePath : relative(dir, filePath);
     // v0.31.2 (D5): per-file slow-path log. Fires only when a single
     // file takes >5s. The user's hang surfaces as one file taking
     // forever — without this, the agent can't see which file.
@@ -237,9 +296,21 @@ export async function runImport(
       // multimodal is enabled. The walker (collectMarkdownFiles) only picks
       // up images when GBRAIN_EMBEDDING_MULTIMODAL=true so this branch is
       // unreachable when the gate is off; defense-in-depth check anyway.
-      const result = isImageFilePath(relativePath) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true'
-        ? await importImageFile(eng, filePath, relativePath, { noEmbed, sourceId })
-        : await importFile(eng, filePath, relativePath, { noEmbed, sourceId, activePack: importActivePack });
+      let result: ImportResult;
+      if (snapshotBlobs) {
+        const snapshotBlob = snapshotBlobByPath.get(relativePath);
+        if (!snapshotBlob) throw new Error(`Git snapshot entry disappeared from manifest: ${relativePath}`);
+        if (!commitSnapshot) throw new GitSnapshotError('Git commit snapshot was not initialized');
+        result = await importGitBlob(eng, commitSnapshot, snapshotBlob, {
+          noEmbed, sourceId, activePack: importActivePack,
+        });
+      } else if (isImageFilePath(relativePath) && process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true') {
+        result = await importImageFile(eng, filePath, relativePath, { noEmbed, sourceId });
+      } else {
+        result = await importFile(eng, filePath, relativePath, {
+          noEmbed, sourceId, activePack: importActivePack,
+        });
+      }
       const _fileMs = Date.now() - _fileT0;
       if (_fileMs > 5000) {
         console.error(`[gbrain phase] import.process_file slow ${_fileMs}ms ${relativePath}`);
@@ -273,7 +344,14 @@ export async function runImport(
       }
       errors++;
       skipped++;
-      failures.push({ path: relativePath, error: msg });
+      if (e instanceof GitSnapshotError) {
+        snapshotAuthorityFailed = true;
+        if (!failures.some(f => f.path === GIT_SNAPSHOT_SENTINEL)) {
+          failures.push({ path: GIT_SNAPSHOT_SENTINEL, error: msg });
+        }
+      } else {
+        failures.push({ path: relativePath, error: msg });
+      }
     }
     processed++;
     tickProgress();
@@ -281,26 +359,28 @@ export async function runImport(
     // Failed files never enter `completed`, so a flaky file can't push the
     // checkpoint past it — the next run will retry it.
     if (completed.size > 0 && completed.size % 100 === 0) {
-      const cpDir = gbrainPath();
+      const cpDir = dirname(checkpointPath);
       if (!existsSync(cpDir)) {
         try { const { mkdirSync } = await import('fs'); mkdirSync(cpDir, { recursive: true }); }
         catch { /* non-fatal */ }
       }
       saveCheckpoint(checkpointPath, {
-        dir,
+        dir: checkpointIdentity,
         completedPaths: Array.from(completed),
         timestamp: new Date().toISOString(),
       });
     }
   }
 
-  if (actualWorkers > 1) {
+  try {
+    if (actualWorkers > 1) {
     // v0.22.13 (PR #490 A1 + Q3): use engine.kind discriminator (not config.engine
     // string sniff) and fall back to serial when database_url is unset. Both
     // checks belt-and-suspenders so we never crash on a null assertion.
     const config = loadConfig();
     if (engine.kind === 'pglite' || !config?.database_url) {
       for (const file of files) {
+        if (snapshotAuthorityFailed) break;
         await processFile(engine, file);
       }
     } else {
@@ -329,6 +409,7 @@ export async function runImport(
         let queueIndex = 0;
         await Promise.all(workerEngines.map(async (eng) => {
           while (true) {
+            if (snapshotAuthorityFailed) break;
             const idx = queueIndex++;
             if (idx >= files.length) break;
             await processFile(eng, files[idx]);
@@ -346,12 +427,16 @@ export async function runImport(
           ),
         );
       }
-    } // end else (postgres parallel)
-  } else {
-    // Sequential: use the provided engine
-    for (const filePath of files) {
-      await processFile(engine, filePath);
+      } // end else (postgres parallel)
+    } else {
+      // Sequential: use the provided engine
+      for (const filePath of files) {
+        if (snapshotAuthorityFailed) break;
+        await processFile(engine, filePath);
+      }
     }
+  } finally {
+    await commitSnapshot?.close();
   }
 
   progress.finish();
@@ -366,10 +451,22 @@ export async function runImport(
   // Clear checkpoint on clean completion. On error, the path-based checkpoint
   // preserves only the successfully-completed paths, so the next run retries
   // failed files automatically (they never entered `completed`).
-  if (errors === 0) {
+  if (failures.length === 0) {
     clearCheckpoint(checkpointPath);
-  } else if (existsSync(checkpointPath)) {
-    console.log(`  Checkpoint preserved (${errors} errors). Run again to retry failed files.`);
+  } else {
+    const cpDir = dirname(checkpointPath);
+    if (!existsSync(cpDir)) {
+      try { const { mkdirSync } = await import('fs'); mkdirSync(cpDir, { recursive: true }); }
+      catch { /* non-fatal */ }
+    }
+    // Always bank the final successful set, including when the only failure
+    // was a returned parse/validation skip (which does not increment `errors`).
+    saveCheckpoint(checkpointPath, {
+      dir: checkpointIdentity,
+      completedPaths: Array.from(completed),
+      timestamp: new Date().toISOString(),
+    });
+    console.log(`  Checkpoint preserved (${failures.length} failure(s)). Run again to retry failed files.`);
   }
 
   const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -421,7 +518,7 @@ export async function runImport(
   // Log the ingest
   await engine.logIngest({
     source_type: 'directory',
-    source_ref: dir,
+    source_ref: opts.commit ? `${dir} @ ${opts.commit}` : dir,
     pages_updated: importedSlugs,
     summary: `Imported ${imported} pages, ${skipped} skipped, ${chunksCreated} chunks`,
   });
@@ -432,8 +529,14 @@ export async function runImport(
   // last_run + repo_path either way (those are progress indicators).
   let gitHead: string | null = null;
   try {
-    if (existsSync(join(dir, '.git'))) {
-      gitHead = execFileSync('git', ['-C', dir, 'rev-parse', 'HEAD'], { encoding: 'utf-8' }).trim();
+    if (opts.commit) {
+      gitHead = opts.commit;
+    } else if (existsSync(join(dir, '.git'))) {
+      gitHead = execFileSync(
+        'git',
+        ['--no-replace-objects', '-C', dir, 'rev-parse', 'HEAD'],
+        { encoding: 'utf-8', env: gitAuthorityEnvironment() },
+      ).trim();
     }
   } catch {
     // Not a git repo or git not available
@@ -451,7 +554,7 @@ export async function runImport(
       const { recordFailures } = await import('../core/sync.ts');
       recordFailures(opts.sourceId ?? 'default', failures, gitHead);
     }
-    if (failures.length === 0) {
+    if (failures.length === 0 && !snapshotAuthorityFailed) {
       await engine.setConfig('sync.last_commit', gitHead);
     } else {
       console.error(
@@ -499,18 +602,38 @@ function isCollectibleForWalker(
   strategy: SyncStrategy,
   multimodalOn: boolean,
 ): boolean {
-  switch (strategy) {
-    case 'code':
-      return isCodeFilePath(path);
-    case 'markdown':
-      return isMarkdownFilePath(path) || (multimodalOn && isImageFilePathFromSync(path));
-    case 'auto':
-      return (
-        isMarkdownFilePath(path) ||
-        isCodeFilePath(path) ||
-        (multimodalOn && isImageFilePathFromSync(path))
-      );
-  }
+  // Canonical policy first: strategy, pruned directories, and metafiles all
+  // come from one classifier. Preserve the historical markdown+multimodal
+  // image carve-out by evaluating images through the canonical auto policy.
+  if (isSyncable(path, { strategy })) return true;
+  return strategy === 'markdown'
+    && multimodalOn
+    && isImageFilePathFromSync(path)
+    && isSyncable(path, { strategy: 'auto' });
+}
+
+/**
+ * Enumerate syncable regular files from one immutable commit tree.
+ * Unlike `collectSyncableFiles`, this never consults the index, worktree,
+ * untracked files, attributes, or smudge filters.
+ */
+export function collectSyncableGitBlobs(
+  repoPath: string,
+  commit: string,
+  opts: CollectOpts = {},
+): GitCommitBlob[] {
+  const snapshot = openGitCommitSnapshot(repoPath, commit);
+  return filterSyncableGitBlobs(snapshot.blobs, opts);
+}
+
+/** Apply the normal import strategy to an already-enumerated commit tree. */
+export function filterSyncableGitBlobs(
+  blobs: readonly GitCommitBlob[],
+  opts: CollectOpts = {},
+): GitCommitBlob[] {
+  const strategy = opts.strategy ?? 'markdown';
+  const multimodalOn = process.env.GBRAIN_EMBEDDING_MULTIMODAL === 'true';
+  return blobs.filter(blob => isCollectibleForWalker(blob.path, strategy, multimodalOn));
 }
 
 /**
@@ -535,8 +658,22 @@ function gitListSyncableFiles(
   try {
     stdout = execFileSync(
       'git',
-      ['-C', dir, 'ls-files', '--cached', '--others', '--exclude-standard', '-z'],
-      { encoding: 'utf8', maxBuffer: 512 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] },
+      [
+        '--no-replace-objects',
+        '-c', 'core.fsmonitor=false',
+        '-C', dir,
+        'ls-files', '--cached', '--others', '--exclude-standard', '-z',
+      ],
+      {
+        encoding: 'utf8',
+        maxBuffer: 512 * 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'ignore'],
+        env: cleanInheritedGitEnvironment(process.env, {
+          GIT_NO_REPLACE_OBJECTS: '1',
+          GIT_OPTIONAL_LOCKS: '0',
+          GIT_TERMINAL_PROMPT: '0',
+        }),
+      },
     );
   } catch {
     return null; // not a git work tree, or git not on PATH → FS-walk fallback
