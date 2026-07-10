@@ -143,7 +143,12 @@ brain_push() {
   return 1
 }`;
 
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
 function renderPostCommitHook(): string {
+  const installedGbrainHome = shellSingleQuote(gbrainHome());
   return `#!/usr/bin/env bash
 ${HOOK_BANNER}
 # LOCAL + untracked — NEVER commit this file. Best-effort background auto-push so
@@ -151,6 +156,13 @@ ${HOOK_BANNER}
 # Internal scaffolding commits set GBRAIN_DURABILITY_SKIP_HOOK=1 because they
 # push synchronously before hardenBrainRepo returns.
 set -euo pipefail
+
+# Some Git launchers sanitize variables mutated by their parent process. Keep
+# an install-time, shell-escaped fallback so receipts still land in the same
+# GBrain home; an explicitly supplied runtime GBRAIN_HOME continues to win.
+if [ -z "\${GBRAIN_HOME:-}" ]; then
+  export GBRAIN_HOME=${installedGbrainHome}
+fi
 
 if [ "\${GBRAIN_DURABILITY_SKIP_HOOK:-0}" = "1" ]; then
   exit 0
