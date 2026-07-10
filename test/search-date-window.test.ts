@@ -44,6 +44,8 @@ describe('normalizeSearchDateWindow', () => {
   test('rejects malformed dates and inverted windows before SQL', () => {
     expect(() => normalizeSearchDateWindow({ since: '2026-02-30' }))
       .toThrow(SearchDateWindowError);
+    expect(() => normalizeSearchDateWindow({ since: '2026-02-30T12:00:00Z' }))
+      .toThrow(SearchDateWindowError);
     expect(() => normalizeSearchDateWindow({ since: '2026-07-10', until: '2026-07-09' }))
       .toThrow(/since .* is after until/);
   });

@@ -30,7 +30,7 @@ export interface NormalizedSearchDateWindow {
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const RELATIVE_RE = /^(\d+)(d|w|y)$/i;
 const EXPLICIT_ZONE_RE = /(Z|[+-]\d{2}:?\d{2})$/i;
-const ISO_TIMESTAMP_RE = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?)(?:\.(\d{1,9}))?(Z|[+-]\d{2}:?\d{2})$/i;
+const ISO_TIMESTAMP_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?(?:\.(\d{1,9}))?(Z|[+-]\d{2}:?\d{2})$/i;
 
 export function isRelativeSearchDateBoundary(value: string | undefined): boolean {
   return value !== undefined && RELATIVE_RE.test(value.trim());
@@ -84,11 +84,32 @@ function normalizeBoundary(
   // Zone-less ISO timestamps are interpreted as UTC, not the host timezone,
   // so a laptop and a server produce identical cache keys and containment.
   const candidate = EXPLICIT_ZONE_RE.test(raw) ? raw : `${raw}Z`;
+  const timestamp = ISO_TIMESTAMP_RE.exec(candidate);
+  if (!timestamp) throw invalid(label, rawValue);
+
+  // Date accepts impossible calendar dates by rolling them into the next
+  // month (for example 2026-02-30 becomes 2026-03-02). Reject those before
+  // normalization so a malformed strict window cannot silently move days.
+  const year = Number(timestamp[1]);
+  const month = Number(timestamp[2]);
+  const day = Number(timestamp[3]);
+  const hour = Number(timestamp[4]);
+  const minute = Number(timestamp[5]);
+  const second = Number(timestamp[6] ?? '0');
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (
+    month < 1 || month > 12
+    || day < 1 || day > daysInMonth[month - 1]
+    || hour > 23 || minute > 59 || second > 59
+  ) {
+    throw invalid(label, rawValue);
+  }
+
   const parsed = new Date(candidate);
   if (!Number.isFinite(parsed.getTime())) throw invalid(label, rawValue);
   const iso = parsed.toISOString();
-  const timestamp = ISO_TIMESTAMP_RE.exec(candidate);
-  const fraction = timestamp?.[2];
+  const fraction = timestamp[7];
   if (!fraction || fraction.length <= 3) return iso;
 
   // Date preserves milliseconds only. Append the remaining fractional
