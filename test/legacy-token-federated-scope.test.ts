@@ -10,7 +10,10 @@
  * 'default' floor and no federated grant.
  */
 import { describe, test, expect } from 'bun:test';
-import { parseLegacyTokenScope } from '../src/mcp/http-transport.ts';
+import {
+  parseLegacyTokenCapabilities,
+  parseLegacyTokenScope,
+} from '../src/mcp/http-transport.ts';
 
 describe('parseLegacyTokenScope', () => {
   test('array grant → allowedSources (federated read) with first as scalar floor', () => {
@@ -41,5 +44,57 @@ describe('parseLegacyTokenScope', () => {
 
   test('array with non-string junk is filtered to valid sources', () => {
     expect(parseLegacyTokenScope(['a', 5, '', 'b'])).toEqual({ sourceId: 'a', allowedSources: ['a', 'b'] });
+  });
+});
+
+describe('parseLegacyTokenCapabilities', () => {
+  test('missing capability keys preserve the historical legacy contract', () => {
+    expect(parseLegacyTokenCapabilities(undefined)).toEqual({
+      scopes: ['read', 'write', 'admin'],
+    });
+    expect(parseLegacyTokenCapabilities({ takes_holders: ['world'] })).toEqual({
+      scopes: ['read', 'write', 'admin'],
+    });
+  });
+
+  test('explicit scopes and tools are trimmed and deduplicated', () => {
+    expect(parseLegacyTokenCapabilities({
+      scopes: ['read', 'read', ' write '],
+      allowed_tools: ['search', 'get_page', 'search'],
+    })).toEqual({
+      scopes: ['read', 'write'],
+      allowedTools: ['search', 'get_page'],
+    });
+  });
+
+  test('explicit malformed or empty fields deny that capability axis', () => {
+    expect(parseLegacyTokenCapabilities({ scopes: 'read' })).toEqual({ scopes: [] });
+    expect(parseLegacyTokenCapabilities({ scopes: [], allowed_tools: 'search' })).toEqual({
+      scopes: [],
+      allowedTools: [],
+    });
+    expect(parseLegacyTokenCapabilities({
+      scopes: ['read', 'not-a-scope'],
+      allowed_tools: ['search', ''],
+    })).toEqual({ scopes: [], allowedTools: [] });
+  });
+
+  test('JSON-string rows remain compatible while invalid JSON does not gain tools', () => {
+    expect(parseLegacyTokenCapabilities('{"scopes":["read"],"allowed_tools":["query"]}')).toEqual({
+      scopes: ['read'],
+      allowedTools: ['query'],
+    });
+    expect(parseLegacyTokenCapabilities('{not-json')).toEqual({
+      scopes: [],
+      allowedTools: [],
+    });
+    expect(parseLegacyTokenCapabilities([])).toEqual({
+      scopes: [],
+      allowedTools: [],
+    });
+    expect(parseLegacyTokenCapabilities(42)).toEqual({
+      scopes: [],
+      allowedTools: [],
+    });
   });
 });

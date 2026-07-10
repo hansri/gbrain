@@ -380,6 +380,35 @@ export async function queryAgentClientSpend(engine: BrainEngine): Promise<AgentC
 }
 
 /**
+ * Apply an authenticated principal's exact MCP tool boundary.
+ *
+ * Undefined is the backwards-compatible legacy state (all otherwise-remote
+ * operations). An explicit empty array is a deliberate deny-all policy.
+ * Keeping this pure makes both tools/list and tools/call consume one gate.
+ */
+export function filterMcpOperationsForAuth<T extends { name: string }>(
+  available: readonly T[],
+  auth: Pick<AuthInfo, 'allowedTools'>,
+): T[] {
+  if (auth.allowedTools === undefined) return [...available];
+  const allowed = new Set(auth.allowedTools);
+  return available.filter(op => allowed.has(op.name));
+}
+
+/**
+ * Discovery is the intersection of exact tools and callable scopes. Keeping
+ * scope-inadequate tools out of tools/list avoids wasting client context on a
+ * capability that the same principal can never invoke.
+ */
+export function filterDiscoverableMcpOperationsForAuth<T extends { name: string; scope?: string }>(
+  available: readonly T[],
+  auth: Pick<AuthInfo, 'allowedTools' | 'scopes'>,
+): T[] {
+  return filterMcpOperationsForAuth(available, auth)
+    .filter(op => hasScope(auth.scopes, op.scope || 'read'));
+}
+
+/**
  * Skill-publishing status for the startup banner + operator nudge. When OFF,
  * connected agents (Codex / Claude Code / Perplexity / Cowork) cannot call
  * `list_skills` / `get_skill`, so the host's skill catalog is INVISIBLE to them
@@ -1462,6 +1491,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   app.post('/mcp', requireBearerAuth({ verifier: oauthProvider }), async (req: Request, res: Response) => {
     const startTime = Date.now();
     const authInfo = (req as any).auth as AuthInfo;
+    const authorizedMcpOperations = filterMcpOperationsForAuth(mcpOperations, authInfo);
+    const discoverableMcpOperations = filterDiscoverableMcpOperationsForAuth(mcpOperations, authInfo);
 
     // Human-readable agent name is now threaded through AuthInfo by
     // verifyAccessToken (which JOINs oauth_clients in its existing token
@@ -1499,7 +1530,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         timestamp: new Date().toISOString(),
       });
       return {
-        tools: mcpOperations.map(op => ({
+        tools: discoverableMcpOperations.map(op => ({
           name: op.name,
           description: op.description,
           inputSchema: {
@@ -1515,7 +1546,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: params } = request.params;
-      const op = mcpOperations.find(o => o.name === name);
+      const op = authorizedMcpOperations.find(o => o.name === name);
       if (!op) {
         // v0.28.10: persist unknown-op attempts. Operators investigating
         // misbehaving agents need to see the full attempt log, not just

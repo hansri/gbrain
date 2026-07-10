@@ -26,7 +26,10 @@ import { InvalidTokenError, InvalidClientMetadataError } from '@modelcontextprot
 import { hashToken, generateToken, isUndefinedColumnError } from './utils.ts';
 import { hasScope, assertAllowedScopes, parseScopeString, InvalidScopeError } from './scope.ts';
 import type { AuthInfo as CoreAuthInfo } from './operations.ts';
-import { parseLegacyTokenScope } from './legacy-token-scope.ts';
+import {
+  parseLegacyTokenCapabilities,
+  parseLegacyTokenScope,
+} from './legacy-token-scope.ts';
 import type { SqlQuery, SqlValue } from './sql-query.ts';
 export type { SqlQuery, SqlValue };
 
@@ -692,7 +695,10 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     }
 
     if (legacyRows.length > 0) {
-      // Legacy tokens get full admin access (grandfather in).
+      // Legacy rows without capability keys retain their historical access.
+      // Operators can narrow an existing static token in place by writing
+      // permissions.scopes and permissions.allowed_tools; explicit malformed
+      // or empty values fail closed in parseLegacyTokenCapabilities().
       // For legacy tokens, name = clientId = clientName (single identifier).
       // Update last_used_at
       await this.sql`
@@ -712,11 +718,18 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
         ? (permissions as Record<string, unknown>).source_id
         : undefined;
       const { sourceId, allowedSources } = parseLegacyTokenScope(sourceGrant);
+      // Parse capabilities from the raw DB value. In particular, an invalid
+      // serialized value must remain fail-closed; the source-scope parser can
+      // still fall back to `default` independently.
+      const capabilities = parseLegacyTokenCapabilities(permissionsRaw);
       return {
         token,
         clientId: name,
         clientName: name,
-        scopes: ['read', 'write', 'admin'],
+        scopes: capabilities.scopes,
+        ...(capabilities.allowedTools !== undefined
+          ? { allowedTools: capabilities.allowedTools }
+          : {}),
         expiresAt: Math.floor(Date.now() / 1000) + 365 * 24 * 3600, // Legacy tokens never expire — set 1yr future
         // Legacy tokens without an explicit permissions.source_id grant keep
         // the historical 'default' source floor. Array grants become

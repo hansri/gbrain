@@ -242,6 +242,13 @@ export interface AuthInfo {
    */
   clientName?: string;
   scopes: string[];
+  /**
+   * Exact remote MCP tool allow-list attached to a legacy bearer principal.
+   * Undefined preserves the historical unrestricted tool-discovery contract;
+   * an explicit empty array denies every tool. HTTP transports enforce this
+   * before operation scope checks and before dispatch.
+   */
+  allowedTools?: string[];
   expiresAt?: number;
   /**
    * v0.34.1 (#861, D2): the source the calling OAuth client is scoped
