@@ -12,6 +12,7 @@ import type { PageType } from './types.ts';
 import { importFromContent } from './import-file.ts';
 import { writePageThrough } from './write-through.ts';
 import { hybridSearch, hybridSearchCached, stampContentFlags } from './search/hybrid.ts';
+import { normalizeSearchDateWindow } from './search/date-window.ts';
 import { expandQuery } from './search/expansion.ts';
 import { dedupResults } from './search/dedup.ts';
 import { captureEvalCandidate, isEvalCaptureEnabled, isEvalScrubEnabled } from './eval-capture.ts';
@@ -1602,14 +1603,23 @@ const query: Operation = {
       const [vec] = await embedMultimodal([
         { kind: 'image_base64', data: imageData, mime: imageMime },
       ]);
+      const imageWindow = normalizeSearchDateWindow({
+        since: typeof p.since === 'string' ? p.since : undefined,
+        until: typeof p.until === 'string' ? p.until : undefined,
+      });
       // v0.34.1 (#861 F2 — 6th leak surface): the image path bypasses
       // hybridSearch and calls searchVector directly, so it needs its
-      // own thread of the source scope. Pre-fix, this branch leaked
-      // image pages across sources independent of the text path's fix.
+      // own thread of the source scope and canonical temporal window.
+      // Pre-fix, this branch leaked image pages across sources independent
+      // of the text path's fix and silently ignored since/until.
       const results = await ctx.engine.searchVector(vec, {
         limit: (p.limit as number) || 20,
         offset: (p.offset as number) || 0,
         embeddingColumn: 'embedding_image',
+        afterDate: imageWindow.since,
+        beforeDate: imageWindow.until,
+        afterDateInclusive: imageWindow.since !== undefined,
+        beforeDateInclusive: imageWindow.until !== undefined,
         ...querySourceScope,
       });
       return results;

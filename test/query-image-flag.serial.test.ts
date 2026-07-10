@@ -32,13 +32,15 @@ function fakeImage1024(seed: number): Float32Array {
   return out;
 }
 
-async function seedImagePage(slug: string, vec: Float32Array) {
+async function seedImagePage(slug: string, vec: Float32Array, effectiveDate?: string) {
   await engine.putPage(slug, {
     type: 'image',
     page_kind: 'image',
     title: slug,
     compiled_truth: '',
     timeline: '',
+    effective_date: effectiveDate ? new Date(effectiveDate) : undefined,
+    effective_date_source: effectiveDate ? 'event_date' : undefined,
   });
   await engine.upsertChunks(slug, [
     {
@@ -88,6 +90,28 @@ describe('query op with --image (v0.27.1 follow-up)', () => {
     } catch (e) { err = e; }
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).message).toMatch(/query.*or.*image/i);
+  });
+
+  test('image branch enforces the same inclusive since/until window as text search', async () => {
+    const vec = fakeImage1024(3);
+    await seedImagePage('photos/outside', vec, '2026-07-08T12:00:00.000Z');
+    await seedImagePage('photos/inside', vec, '2026-07-09T12:00:00.000Z');
+
+    mock.module('../src/core/ai/gateway.ts', () => ({
+      embedMultimodal: async () => [vec],
+    }));
+
+    const queryOp = OPERATIONS.find(o => o.name === 'query')!;
+    const ctx = { engine, config: null, logger: console, dryRun: false, remote: false } as any;
+    const results = await queryOp.handler(ctx, {
+      image: 'aGVsbG8=',
+      image_mime: 'image/png',
+      since: '2026-07-09',
+      until: '2026-07-09',
+      limit: 10,
+    }) as Array<{ slug: string }>;
+
+    expect(results.map(result => result.slug)).toEqual(['photos/inside']);
   });
 
   test('image branch ignores text-page hits (modality filter)', async () => {
