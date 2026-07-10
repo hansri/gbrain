@@ -143,13 +143,30 @@ brain_push() {
   return 1
 }`;
 
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
+}
+
 function renderPostCommitHook(): string {
+  const installedGbrainHome = shellSingleQuote(gbrainHome());
   return `#!/usr/bin/env bash
 ${HOOK_BANNER}
 # LOCAL + untracked — NEVER commit this file. Best-effort background auto-push so
 # agent writes don't sit local-only. The real guarantee is ${HELPER_REL}.
-# Bypass: git commit --no-verify.
+# Internal scaffolding commits set GBRAIN_DURABILITY_SKIP_HOOK=1 because they
+# push synchronously before hardenBrainRepo returns.
 set -euo pipefail
+
+# Some Git launchers sanitize variables mutated by their parent process. Keep
+# an install-time, shell-escaped fallback so receipts still land in the same
+# GBrain home; an explicitly supplied runtime GBRAIN_HOME continues to win.
+if [ -z "\${GBRAIN_HOME:-}" ]; then
+  export GBRAIN_HOME=${installedGbrainHome}
+fi
+
+if [ "\${GBRAIN_DURABILITY_SKIP_HOOK:-0}" = "1" ]; then
+  exit 0
+fi
 
 _branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
 if [ "$_branch" = "HEAD" ]; then
@@ -679,7 +696,11 @@ function commitScaffolding(repoPath: string, branch: string, redact: (s: string)
     }).toString().trim();
     if (!staged) return { status: 'ok', detail: 'scaffolding already committed' };
     execFileSync('git', ['-C', repoPath, 'commit', '-m', 'chore(gbrain): install brain durability scaffolding'], {
-      stdio: 'ignore', timeout: 30_000, env: { ...process.env, ...GIT_ENV },
+      stdio: 'ignore', timeout: 30_000,
+      // The scaffolding push below is synchronous. Suppress the freshly
+      // installed background hook for this one internal commit so it cannot
+      // race the caller's first post-hardening write via a rebase/index.lock.
+      env: { ...process.env, ...GIT_ENV, GBRAIN_DURABILITY_SKIP_HOOK: '1' },
     });
     execFileSync('git', ['-C', repoPath, ...['-c', 'http.followRedirects=false'], 'push', 'origin', `HEAD:${branch}`], {
       stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000, env: { ...process.env, ...GIT_ENV_AUTH },

@@ -52,6 +52,7 @@ import {
 import { gbrainPath } from './config.ts';
 import { isValidSourceId } from './source-id.ts';
 import { resolveSourceWithTier, type SourceTier } from './source-resolver.ts';
+import { canonicalSourcePath } from './source-path.ts';
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -340,13 +341,14 @@ export async function addSource(
     finalPath = opts.cloneDir ?? defaultCloneDir(opts.id);
   }
   if (finalPath) {
+    finalPath = canonicalSourcePath(finalPath);
     const others = await engine.executeRaw<{ id: string; local_path: string }>(
       `SELECT id, local_path FROM sources WHERE local_path IS NOT NULL AND id != $1`,
       [opts.id],
     );
     for (const other of others) {
       const a = finalPath;
-      const b = other.local_path;
+      const b = canonicalSourcePath(other.local_path);
       if (a === b || a.startsWith(b + '/') || b.startsWith(a + '/')) {
         throw new SourceOpError(
           'overlapping_path',

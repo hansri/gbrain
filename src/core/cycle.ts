@@ -51,6 +51,8 @@ import { createProgress, type ProgressReporter } from './progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from './cli-options.ts';
 import { tryAcquireDbLock, reapDeadHolderLocks, type DbLockHandle } from './db-lock.ts';
 import { assertValidSourceId } from './source-id.ts';
+import { isUndefinedTableError } from './utils.ts';
+import { canonicalSourcePath } from './source-path.ts';
 
 // ─── Types ─────────────────────────────────────────────────────────
 
@@ -832,16 +834,28 @@ async function resolveSourceForDir(
   // No checkout → no path-derived source. Callers fall back to opts.sourceId
   // (the cycleSourceId precedence) or 'default'.
   if (brainDir === null) return undefined;
+  let rows: Array<{ id: string; local_path: string }>;
   try {
-    const rows = await engine.executeRaw<{ id: string }>(
-      `SELECT id FROM sources WHERE local_path = $1 LIMIT 1`,
-      [brainDir],
+    rows = await engine.executeRaw<{ id: string; local_path: string }>(
+      `SELECT id, local_path FROM sources WHERE local_path IS NOT NULL ORDER BY id`,
     );
-    return rows[0]?.id;
-  } catch {
-    // sources table might not exist on very old brains — fall through.
-    return undefined;
+  } catch (error) {
+    // sources table might not exist on very old brains — fall through. Any
+    // other database failure is operationally significant and must be loud.
+    if (isUndefinedTableError(error)) return undefined;
+    throw error;
   }
+  const requestedPath = canonicalSourcePath(brainDir);
+  const matches = rows.filter((row) => canonicalSourcePath(row.local_path) === requestedPath);
+  if (matches.length > 1) {
+    throw new Error(
+      `Ambiguous source mapping for brain directory "${brainDir}": multiple sources share local_path. `
+      + 'Repair the sources table before running a cycle.',
+    );
+  }
+  const sourceId = matches[0]?.id;
+  if (sourceId !== undefined) assertValidSourceId(sourceId);
+  return sourceId;
 }
 
 // v0.41 T9 D4-B — orchestrator-level pack gate for lens-pack phases.
@@ -886,13 +900,14 @@ async function runPhaseSync(
   dryRun: boolean,
   pull: boolean,
   willRunExtractPhase: boolean,
+  explicitSourceId?: string,
 ): Promise<SyncPhaseResult> {
   try {
     const { performSync } = await import('../commands/sync.ts');
     // Resolve the per-source id so sync reads source-scoped last_commit
     // instead of the global config key. The global key can drift out of
     // git history (force push, GC) causing a full reimport of all files.
-    const sourceId = await resolveSourceForDir(engine, brainDir);
+    const sourceId = explicitSourceId ?? await resolveSourceForDir(engine, brainDir);
     const result = await performSync(engine, {
       repoPath: brainDir,
       sourceId,
@@ -956,6 +971,7 @@ async function runPhaseExtract(
   dryRun: boolean,
   changedSlugs?: string[],
   signal?: AbortSignal,
+  sourceId?: string,
 ): Promise<PhaseResult> {
   try {
     const { runExtractCore } = await import('../commands/extract.ts');
@@ -978,6 +994,7 @@ async function runPhaseExtract(
       dir: brainDir,
       slugs: changedSlugs,  // undefined = full walk (first run / manual)
       signal,
+      sourceId,
     });
     const linksCreated = result?.links_created ?? 0;
     const timelineCreated = result?.timeline_entries_created ?? 0;
@@ -1437,9 +1454,15 @@ export async function runCycle(
   // cycle still locks + stamps last_full_cycle_at for repo-a — a freshness
   // stamp that lies. resolveSourceForDir returns undefined when brainDir is
   // null, so opts.sourceId is the only signal in the no-checkout case.
-  const cycleSourceId: string | undefined = engine
-    ? (opts.sourceId ?? (await resolveSourceForDir(engine, brainDir)))
-    : opts.sourceId;
+  if (opts.sourceId !== undefined) assertValidSourceId(opts.sourceId);
+  const pathSourceId = engine ? await resolveSourceForDir(engine, brainDir) : undefined;
+  if (opts.sourceId !== undefined && brainDir !== null && pathSourceId !== opts.sourceId) {
+    throw new Error(
+      `Source/path mismatch: source "${opts.sourceId}" is not registered for brain directory "${brainDir}" `
+      + `(resolved source: ${pathSourceId ?? 'none'}). Refusing to run the cycle.`,
+    );
+  }
+  const cycleSourceId: string | undefined = opts.sourceId ?? pathSourceId;
 
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
 
@@ -1641,7 +1664,9 @@ export async function runCycle(
       } else {
         progress.start('cycle.sync');
         syncAttempted = true; // sync ran its work; undefined pagesAffected now means failure
-        const { result, duration_ms } = await timePhase(() => runPhaseSync(engine, brainDir, dryRun, pull, phases.includes('extract')));
+        const { result, duration_ms } = await timePhase(() => runPhaseSync(
+          engine, brainDir, dryRun, pull, phases.includes('extract'), cycleSourceId,
+        ));
         result.duration_ms = duration_ms;
         // Capture changed slugs for incremental extract.
         syncPagesAffected = (result as SyncPhaseResult).pagesAffected;
@@ -1706,7 +1731,9 @@ export async function runCycle(
         // If sync didn't run (phases exclude it) or failed, syncPagesAffected
         // is undefined → extract falls back to full walk (safe default).
         progress.start('cycle.extract');
-        const { result, duration_ms } = await timePhase(() => runPhaseExtract(engine, brainDir, dryRun, syncPagesAffected, opts.signal));
+        const { result, duration_ms } = await timePhase(() => runPhaseExtract(
+          engine, brainDir, dryRun, syncPagesAffected, opts.signal, cycleSourceId,
+        ));
         result.duration_ms = duration_ms;
         phaseResults.push(result);
         progress.finish();
@@ -2175,7 +2202,9 @@ export async function runCycle(
         });
       } else {
         progress.start('cycle.embed');
-        const { result, duration_ms } = await timePhase(() => runPhaseEmbed(engine, dryRun, opts.signal));
+        const { result, duration_ms } = await timePhase(() => runPhaseEmbed(
+          engine, dryRun, opts.signal,
+        ));
         result.duration_ms = duration_ms;
         phaseResults.push(result);
         progress.finish();

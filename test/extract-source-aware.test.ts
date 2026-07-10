@@ -15,6 +15,9 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runExtract } from '../src/commands/extract.ts';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 let engine: PGLiteEngine;
 
@@ -121,5 +124,76 @@ describe('extract --source-id flag (#1204)', () => {
       `SELECT COUNT(*)::text AS n FROM links`,
     );
     expect(Number(linkRows[0]?.n ?? 0)).toBe(0);
+  });
+
+  test('filesystem CLI dispatch writes links and timeline rows into the explicit source', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-extract-source-'));
+    mkdirSync(join(dir, 'people'), { recursive: true });
+    writeFileSync(
+      join(dir, 'people/alice.md'),
+      '# Alice\n\nMet [[people/bob]].\n\n- **2026-07-09** | Test — Boundary checkpoint.\n',
+    );
+    writeFileSync(join(dir, 'people/bob.md'), '# Bob\n');
+    await engine.executeRaw(
+      `UPDATE sources SET local_path = $1 WHERE id = 'alpha'`,
+      [dir],
+    );
+
+    const originalLog = console.log;
+    console.log = () => {};
+    try {
+      await runExtract(engine, [
+        'all', '--source', 'fs', '--source-id', 'alpha', '--dir', dir,
+      ]);
+    } finally {
+      console.log = originalLog;
+      rmSync(dir, { recursive: true, force: true });
+    }
+
+    const links = await engine.executeRaw<{ from_source: string; to_source: string }>(
+      `SELECT fp.source_id AS from_source, tp.source_id AS to_source
+         FROM links l
+         JOIN pages fp ON fp.id = l.from_page_id
+         JOIN pages tp ON tp.id = l.to_page_id`,
+    );
+    expect(links.length).toBeGreaterThanOrEqual(1);
+    expect(links.every((row) => row.from_source === 'alpha' && row.to_source === 'alpha')).toBe(true);
+
+    const timeline = await engine.executeRaw<{ source_id: string }>(
+      `SELECT p.source_id
+         FROM timeline_entries te
+         JOIN pages p ON p.id = te.page_id`,
+    );
+    expect(timeline.length).toBeGreaterThanOrEqual(1);
+    expect(timeline.every((row) => row.source_id === 'alpha')).toBe(true);
+  });
+
+  test('filesystem CLI dispatch preserves implicit local_path source resolution', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gbrain-extract-source-implicit-'));
+    mkdirSync(join(dir, 'people'), { recursive: true });
+    writeFileSync(join(dir, 'people/alice.md'), '# Alice\n\nMet [[people/bob]].\n');
+    writeFileSync(join(dir, 'people/bob.md'), '# Bob\n');
+    await engine.executeRaw(
+      `UPDATE sources SET local_path = $1 WHERE id = 'alpha'`,
+      [dir],
+    );
+
+    const originalLog = console.log;
+    console.log = () => {};
+    try {
+      await runExtract(engine, ['links', '--source', 'fs', '--dir', dir]);
+    } finally {
+      console.log = originalLog;
+      rmSync(dir, { recursive: true, force: true });
+    }
+
+    const links = await engine.executeRaw<{ from_source: string; to_source: string }>(
+      `SELECT fp.source_id AS from_source, tp.source_id AS to_source
+         FROM links l
+         JOIN pages fp ON fp.id = l.from_page_id
+         JOIN pages tp ON tp.id = l.to_page_id`,
+    );
+    expect(links.length).toBeGreaterThanOrEqual(1);
+    expect(links.every((row) => row.from_source === 'alpha' && row.to_source === 'alpha')).toBe(true);
   });
 });

@@ -70,6 +70,10 @@ function escapeSqlStringLiteral(value: string): string {
   return value.replace(/'/g, "''");
 }
 
+function embeddingModelForChunkWrite(): string {
+  return process.env.GBRAIN_EMBEDDING_MODEL?.trim() || DEFAULT_EMBEDDING_MODEL;
+}
+
 export function getPostgresSchema(
   dims: number = DEFAULT_EMBEDDING_DIMENSIONS,
   model: string = DEFAULT_EMBEDDING_MODEL,
@@ -1600,12 +1604,14 @@ export class PostgresEngine implements BrainEngine {
     let afterDateClause = '';
     if (opts?.afterDate) {
       params.push(opts.afterDate);
-      afterDateClause = `AND COALESCE(p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      const operator = opts.afterDateInclusive ? '>=' : '>';
+      afterDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${operator} $${params.length}::timestamptz`;
     }
     let beforeDateClause = '';
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
-      beforeDateClause = `AND COALESCE(p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      const operator = opts.beforeDateInclusive ? '<=' : '<';
+      beforeDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${operator} $${params.length}::timestamptz`;
     }
     // v0.34.1 (#861 — P0 leak seal): source-isolation filter. When the
     // caller's auth scope is set, narrow the inner CTE candidate set so
@@ -1749,12 +1755,14 @@ export class PostgresEngine implements BrainEngine {
     let afterDateClause = '';
     if (opts?.afterDate) {
       params.push(opts.afterDate);
-      afterDateClause = `AND COALESCE(p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      const operator = opts.afterDateInclusive ? '>=' : '>';
+      afterDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${operator} $${params.length}::timestamptz`;
     }
     let beforeDateClause = '';
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
-      beforeDateClause = `AND COALESCE(p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      const operator = opts.beforeDateInclusive ? '<=' : '<';
+      beforeDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${operator} $${params.length}::timestamptz`;
     }
     // v0.34.1 (#861 — P0 leak seal): source-isolation. Anchor primitive
     // for two-pass retrieval, so cross-source anchors would let the walk
@@ -1871,12 +1879,14 @@ export class PostgresEngine implements BrainEngine {
     let afterDateClause = '';
     if (opts?.afterDate) {
       params.push(opts.afterDate);
-      afterDateClause = `AND COALESCE(p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      const operator = opts.afterDateInclusive ? '>=' : '>';
+      afterDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${operator} $${params.length}::timestamptz`;
     }
     let beforeDateClause = '';
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
-      beforeDateClause = `AND COALESCE(p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      const operator = opts.beforeDateInclusive ? '<=' : '<';
+      beforeDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${operator} $${params.length}::timestamptz`;
     }
     // v0.34.1 (#861, F2 — P0 leak seal): source-isolation in the INNER CTE
     // specifically. Pushing the filter inside narrows the HNSW candidate set
@@ -2156,7 +2166,7 @@ export class PostgresEngine implements BrainEngine {
       if (embeddingImageStr) params.push(embeddingImageStr);
       params.push(
         pageId, chunk.chunk_index, chunk.chunk_text, chunk.chunk_source,
-        chunk.model || DEFAULT_EMBEDDING_MODEL, chunk.token_count || null,
+        chunk.model || embeddingModelForChunkWrite(), chunk.token_count || null,
         chunk.language || null, chunk.symbol_name || null, chunk.symbol_type || null,
         chunk.start_line ?? null, chunk.end_line ?? null,
         parentPath, chunk.doc_comment || null, chunk.symbol_name_qualified || null,
@@ -3097,7 +3107,8 @@ export class PostgresEngine implements BrainEngine {
              array_agg(DISTINCT n.last_link_type)
                FILTER (WHERE n.last_link_type IS NOT NULL) AS via_link_types,
              (array_agg(array_to_string(n.path, chr(9))
-               ORDER BY n.depth ASC, array_length(n.path, 1) ASC))[1] AS path_str,
+               ORDER BY n.depth ASC, array_length(n.path, 1) ASC,
+                        array_to_string(n.path, chr(9)) ASC))[1] AS path_str,
              (SELECT cc.id FROM content_chunks cc
                WHERE cc.page_id = n.id ORDER BY cc.chunk_index ASC LIMIT 1) AS canonical_chunk_id
       FROM walk n
@@ -4977,7 +4988,7 @@ export class PostgresEngine implements BrainEngine {
     // is working as intended, not an orphan.
     const [h] = await sql`
       WITH entity_pages AS (
-        SELECT id, slug FROM pages WHERE type IN ('person', 'company')
+        SELECT id, slug FROM pages WHERE type IN ('entity', 'person', 'company', 'organization')
       )
       SELECT
         (SELECT count(*) FROM pages) as page_count,
@@ -5008,7 +5019,7 @@ export class PostgresEngine implements BrainEngine {
       SELECT p.slug,
              (SELECT count(*) FROM links l WHERE l.from_page_id = p.id OR l.to_page_id = p.id)::int as link_count
       FROM pages p
-      WHERE p.type IN ('person', 'company')
+      WHERE p.type IN ('entity', 'person', 'company', 'organization')
       ORDER BY link_count DESC
       LIMIT 5
     `;

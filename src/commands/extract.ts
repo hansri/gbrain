@@ -63,6 +63,7 @@ import { createHash } from 'crypto';
 import { runSlidingPool } from '../core/worker-pool.ts';
 import { isAborted } from '../core/abort-check.ts';
 import { parseWorkers, resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
+import { canonicalSourcePath } from '../core/source-path.ts';
 
 // Batch size for addLinksBatch / addTimelineEntriesBatch.
 // Postgres bind-parameter limit is 65535. Links use 4 cols/row → 16K hard ceiling;
@@ -515,6 +516,8 @@ export interface ExtractOpts {
    * Pass undefined or omit for a full walk (CLI / first-run path).
    */
   slugs?: string[];
+  /** Scope filesystem-derived link and timeline writes to this brain source. */
+  sourceId?: string;
   /**
    * v0.41.15.0 (D9): in-process parallel file workers for the fs-walk
    * loops. Default 1. PGLite engines clamp to 1 (single-writer; though
@@ -574,7 +577,10 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
       // Nothing changed — skip entirely.
       return result;
     }
-    const r = await extractForSlugs(engine, opts.dir, opts.slugs, opts.mode, dryRun, jsonMode, workers, opts.signal);
+    const r = await extractForSlugs(
+      engine, opts.dir, opts.slugs, opts.mode, dryRun, jsonMode,
+      workers, opts.signal, opts.sourceId,
+    );
     result.links_created = r.links_created;
     result.timeline_entries_created = r.timeline_created;
     result.pages_processed = r.pages;
@@ -583,12 +589,16 @@ export async function runExtractCore(engine: BrainEngine, opts: ExtractOpts): Pr
 
   // Full walk path: CLI `gbrain extract` or first-run.
   if (opts.mode === 'links' || opts.mode === 'all') {
-    const r = await extractLinksFromDir(engine, opts.dir, dryRun, jsonMode, workers, opts.signal);
+    const r = await extractLinksFromDir(
+      engine, opts.dir, dryRun, jsonMode, workers, opts.signal, opts.sourceId,
+    );
     result.links_created = r.created;
     result.pages_processed = r.pages;
   }
   if (opts.mode === 'timeline' || opts.mode === 'all') {
-    const r = await extractTimelineFromDir(engine, opts.dir, dryRun, jsonMode, workers, opts.signal);
+    const r = await extractTimelineFromDir(
+      engine, opts.dir, dryRun, jsonMode, workers, opts.signal, opts.sourceId,
+    );
     result.timeline_entries_created = r.created;
     result.pages_processed = Math.max(result.pages_processed, r.pages);
   }
@@ -664,7 +674,8 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
   const source = (sourceIdx >= 0 && sourceIdx + 1 < args.length) ? args[sourceIdx + 1] : 'fs';
   // v0.37.7.0 #1204: --source-id <id> scopes extraction to one brain
   // source. Separate flag from --source (fs|db) which is the
-  // data-source axis. When unset, walks all sources together as today.
+  // data-source axis. DB extraction may span sources when unset; FS
+  // extraction resolves exactly one registered source/path tuple below.
   const sourceIdIdx = args.indexOf('--source-id');
   const sourceIdFilter = (sourceIdIdx >= 0 && sourceIdIdx + 1 < args.length) ? args[sourceIdIdx + 1] : undefined;
   const typeIdx = args.indexOf('--type');
@@ -809,21 +820,59 @@ Status (v0.42):
     process.exit(2);
   }
 
-  // FS source needs a brain dir. When --dir wasn't passed, resolve from
-  // sources(local_path) — same path `gbrain sync` uses — instead of
-  // silently walking cwd. See the brainDir comment above for the footgun.
-  if (source === 'fs' && !explicitDir) {
-    const { getDefaultSourcePath } = await import('../core/source-resolver.ts');
-    const configured = await getDefaultSourcePath(engine);
-    if (configured) {
-      brainDir = configured;
-    } else {
+  // Resolve FS source identity and checkout path as one fail-closed tuple.
+  // The source-id resolver uses the explicit --source-id first, then the
+  // normal env/dotfile/local_path/default chain. When --dir is explicit, use
+  // that directory for implicit local_path resolution, but never let it
+  // override a conflicting env/dotfile/flag source identity.
+  let fsSourceId: string | undefined;
+  if (source === 'fs') {
+    const { resolveSourceWithTier } = await import('../core/source-resolver.ts');
+    let resolved: Awaited<ReturnType<typeof resolveSourceWithTier>>;
+    try {
+      resolved = await resolveSourceWithTier(
+        engine,
+        sourceIdFilter,
+        explicitDir ? brainDir : process.cwd(),
+      );
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exit(1);
+      return;
+    }
+    fsSourceId = resolved.source_id;
+
+    const rows = await engine.executeRaw<{ local_path: string | null }>(
+      `SELECT local_path FROM sources WHERE id = $1`,
+      [fsSourceId],
+    );
+    let configuredPath = rows[0]?.local_path ?? null;
+    if (!configuredPath && fsSourceId === 'default') {
+      configuredPath = await engine.getConfig('sync.repo_path');
+    }
+    if (!configuredPath) {
       console.error(
-        `No brain directory configured. Pass --dir <path> explicitly, or use --source db ` +
-        `to extract from already-synced pages. To register a brain dir as the default, ` +
-        `run: gbrain sources add default --path <brain-dir>`,
+        `No brain directory configured for source "${fsSourceId}". Register it with ` +
+        `gbrain sources add ${fsSourceId} --path <brain-dir>, or use --source db ` +
+        `to extract from already-synced pages.`,
       );
       process.exit(1);
+      return;
+    }
+
+    if (explicitDir) {
+      const requestedPath = canonicalSourcePath(brainDir);
+      const registeredPath = canonicalSourcePath(configuredPath);
+      if (requestedPath !== registeredPath) {
+        console.error(
+          `Source/path mismatch: source "${fsSourceId}" is registered at "${configuredPath}", ` +
+          `but --dir resolved to "${brainDir}". Refusing filesystem extraction.`,
+        );
+        process.exit(1);
+        return;
+      }
+    } else {
+      brainDir = configuredPath;
     }
   }
 
@@ -912,6 +961,7 @@ Status (v0.42):
       result = await runExtractCore(engine, {
         mode: subcommand as 'links' | 'timeline' | 'all',
         dir: brainDir,
+        sourceId: fsSourceId,
         dryRun,
         jsonMode,
         workers,
@@ -953,10 +1003,14 @@ async function extractForSlugs(
   // shared counter increments atomic.
   workers: number = 1,
   signal?: AbortSignal,
+  sourceId?: string,
 ): Promise<{ links_created: number; timeline_created: number; pages: number }> {
   // Build the full slug set for link resolution (fast: just readdir, no file reads)
   const allFiles = walkMarkdownFiles(brainDir);
   const allSlugs = new Set(allFiles.map(f => pathToSlug(f.relPath)));
+  const linkSourceFields = sourceId
+    ? { from_source_id: sourceId, to_source_id: sourceId, origin_source_id: sourceId }
+    : undefined;
 
   const doLinks = mode === 'links' || mode === 'all';
   const doTimeline = mode === 'timeline' || mode === 'all';
@@ -1033,7 +1087,7 @@ async function extractForSlugs(
               if (!jsonMode) console.log(`  ${link.from_slug} → ${link.to_slug} (${link.link_type})`);
               linksCreated++;
             } else {
-              linkBatch.push(link);
+              linkBatch.push(linkSourceFields ? { ...link, ...linkSourceFields } : link);
               if (linkBatch.length >= BATCH_SIZE) await flushLinks();
             }
           }
@@ -1046,7 +1100,14 @@ async function extractForSlugs(
               if (!jsonMode) console.log(`  ${entry.slug}: ${entry.date} — ${entry.summary}`);
               timelineCreated++;
             } else {
-              timelineBatch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail });
+              timelineBatch.push({
+                slug: entry.slug,
+                date: entry.date,
+                source: entry.source,
+                summary: entry.summary,
+                detail: entry.detail,
+                ...(sourceId ? { source_id: sourceId } : {}),
+              });
               if (timelineBatch.length >= BATCH_SIZE) await flushTimeline();
             }
           }
@@ -1075,9 +1136,13 @@ async function extractLinksFromDir(
   // v0.41.15.0 (T7): in-process worker count. Default 1.
   workers: number = 1,
   signal?: AbortSignal,
+  sourceId?: string,
 ): Promise<{ created: number; pages: number }> {
   const files = walkMarkdownFiles(brainDir);
   const allSlugs = new Set(files.map(f => pathToSlug(f.relPath)));
+  const linkSourceFields = sourceId
+    ? { from_source_id: sourceId, to_source_id: sourceId, origin_source_id: sourceId }
+    : undefined;
 
   // Issue #972: read once before the walk so the per-file calls don't
   // re-query the DB. globalBasename = true emits one edge per basename
@@ -1131,7 +1196,7 @@ async function extractLinksFromDir(
             if (!jsonMode) console.log(`  ${link.from_slug} → ${link.to_slug} (${link.link_type})`);
             created++;
           } else {
-            batch.push(link);
+            batch.push(linkSourceFields ? { ...link, ...linkSourceFields } : link);
             if (batch.length >= BATCH_SIZE) await flush();
           }
         }
@@ -1154,6 +1219,7 @@ async function extractTimelineFromDir(
   // v0.41.15.0 (T7): in-process worker count. Default 1.
   workers: number = 1,
   signal?: AbortSignal,
+  sourceId?: string,
 ): Promise<{ created: number; pages: number }> {
   const files = walkMarkdownFiles(brainDir);
 
@@ -1200,7 +1266,14 @@ async function extractTimelineFromDir(
             if (!jsonMode) console.log(`  ${entry.slug}: ${entry.date} — ${entry.summary}`);
             created++;
           } else {
-            batch.push({ slug: entry.slug, date: entry.date, source: entry.source, summary: entry.summary, detail: entry.detail });
+            batch.push({
+              slug: entry.slug,
+              date: entry.date,
+              source: entry.source,
+              summary: entry.summary,
+              detail: entry.detail,
+              ...(sourceId ? { source_id: sourceId } : {}),
+            });
             if (batch.length >= BATCH_SIZE) await flush();
           }
         }
@@ -1595,6 +1668,14 @@ async function extractStaleFromDB(
 ): Promise<{ linksCreated: number; timelineCreated: number; pagesProcessed: number; staleRemaining: number }> {
   const { dryRun, jsonMode, includeFrontmatter, sourceIdFilter, catchUp } = opts;
   const versionTs = LINK_EXTRACTOR_VERSION_TS;
+  const versionMs = Date.parse(versionTs);
+  const freshnessStampFor = (updatedAtIso: string): string => {
+    const updatedMs = Date.parse(updatedAtIso);
+    if (Number.isFinite(updatedMs) && Number.isFinite(versionMs) && updatedMs < versionMs) {
+      return versionTs;
+    }
+    return updatedAtIso;
+  };
 
   // Pre-flight count — cheap indexed COUNT. dry-run reports and returns.
   const totalStale = await engine.countStalePagesForExtraction({ sourceId: sourceIdFilter, versionTs });
@@ -1675,7 +1756,13 @@ async function extractStaleFromDB(
       // `page.updated_at.toISOString()` — the JS Date is ms-truncated, so the
       // µs-precision DB updated_at stayed strictly greater and the page never
       // cleared on Postgres. Stamping the exact value makes them equal.
-      processedRefs.push({ slug: page.slug, source_id: page.source_id, extractedAt: page.updated_at_iso });
+      //
+      // CDX-7: when the extractor version is newer than an old page update,
+      // stamping the old updated_at leaves the version arm permanently stale.
+      // Use max(updated_at, LINK_EXTRACTOR_VERSION_TS). A concurrent edit after
+      // the read is still preserved because its new updated_at will exceed this
+      // stamp and remain stale for the next run.
+      processedRefs.push({ slug: page.slug, source_id: page.source_id, extractedAt: freshnessStampFor(page.updated_at_iso) });
     }
 
     // Flush NON-swallowing (CDX-4): a throw here propagates out of the sweep so

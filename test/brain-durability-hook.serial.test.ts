@@ -34,7 +34,9 @@ let oldHome: string | undefined, oldGbrainHome: string | undefined;
 beforeEach(async () => {
   root = mkdtempSync(join(tmpdir(), 'bdh-'));
   oldHome = process.env.HOME; oldGbrainHome = process.env.GBRAIN_HOME;
-  process.env.HOME = mkdtempSync(join(root, 'home-'));
+  // Exercise the install-time shell-escaped GBRAIN_HOME fallback as well as
+  // ordinary hook behavior. Git launchers may sanitize runtime env updates.
+  process.env.HOME = mkdtempSync(join(root, "home with ' quote-"));
   process.env.GBRAIN_HOME = join(process.env.HOME, '.gbrain');
   process.env.GBRAIN_GIT_ALLOW_FILE_TRANSPORT = '1';
   bare = mkdtempSync(join(root, 'origin-')) + '.git';

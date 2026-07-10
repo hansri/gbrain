@@ -31,6 +31,10 @@ import { autoDetectDetail, classifyQuery, isAmbiguousModalityQuery } from './que
 import { isTitlePhraseMatch } from './title-match.ts';
 import { normalizeAlias } from './alias-normalize.ts';
 import { stampEvidence } from './evidence.ts';
+import {
+  isRelativeSearchDateBoundary,
+  normalizeSearchDateWindow,
+} from './date-window.ts';
 import { expandAnchors, hydrateChunks } from './two-pass.ts';
 import { enforceTokenBudget } from './token-budget.ts';
 import { recordSearchTelemetry } from './telemetry.ts';
@@ -739,6 +743,84 @@ export interface HybridSearchOpts extends SearchOpts {
    * a fresh per-call deadline. Not part of the public contract.
    */
   _queryEmbedDeadline?: QueryEmbedDeadline;
+  /** Internal: relative temporal windows bypass cache to avoid one row per millisecond. */
+  _relativeDateWindow?: boolean;
+}
+
+function normalizeHybridSearchDateOpts(opts?: HybridSearchOpts): HybridSearchOpts | undefined {
+  const rawSince = opts?.since ?? opts?.afterDate;
+  const rawUntil = opts?.until ?? opts?.beforeDate;
+  if (rawSince === undefined && rawUntil === undefined) return opts;
+
+  const window = normalizeSearchDateWindow({
+    since: rawSince,
+    until: rawUntil,
+    // Deprecated beforeDate treated a date-only value as midnight and used
+    // a strict `<` comparison. Only public until expands through end-of-day.
+    untilDateOnlyEndOfDay: opts?.until !== undefined,
+  });
+  return {
+    ...opts,
+    // Keep the public and deprecated fields distinct. Public since/until are
+    // inclusive; legacy afterDate/beforeDate retain their historical strict
+    // >/< behavior at the engine boundary.
+    since: opts?.since !== undefined ? window.since : undefined,
+    until: opts?.until !== undefined ? window.until : undefined,
+    afterDate: opts?.since === undefined ? window.since : undefined,
+    beforeDate: opts?.until === undefined ? window.until : undefined,
+    _relativeDateWindow:
+      opts?._relativeDateWindow === true
+      || isRelativeSearchDateBoundary(rawSince)
+      || isRelativeSearchDateBoundary(rawUntil),
+  };
+}
+
+/**
+ * Enforce temporal containment after every retrieval arm has merged.
+ *
+ * Keyword/vector SQL already filters at candidate selection, but relational
+ * recall, alias injection, and structural hydration can add pages later. A
+ * final database-side fence preserves PostgreSQL microsecond precision and
+ * prevents any post-retrieval arm from escaping the requested window.
+ */
+async function filterResultsToDateWindow(
+  engine: BrainEngine,
+  results: SearchResult[],
+  opts?: HybridSearchOpts,
+): Promise<SearchResult[]> {
+  const lower = opts?.since ?? opts?.afterDate;
+  const upper = opts?.until ?? opts?.beforeDate;
+  if ((!lower && !upper) || results.length === 0) return results;
+
+  const refs = Array.from(new Map(results.map((result) => {
+    const sourceId = result.source_id ?? 'default';
+    return [`${sourceId}::${result.slug}`, { slug: result.slug, source_id: sourceId }];
+  })).values());
+  const slugs = refs.map((ref) => ref.slug);
+  const sourceIds = refs.map((ref) => ref.source_id);
+  const params: unknown[] = [slugs, sourceIds];
+  const clauses = ['p.deleted_at IS NULL'];
+  const effectiveDate = 'COALESCE(p.effective_date, p.updated_at, p.created_at)';
+
+  if (lower) {
+    params.push(lower);
+    clauses.push(`${effectiveDate} ${opts?.since !== undefined ? '>=' : '>'} $${params.length}::timestamptz`);
+  }
+  if (upper) {
+    params.push(upper);
+    clauses.push(`${effectiveDate} ${opts?.until !== undefined ? '<=' : '<'} $${params.length}::timestamptz`);
+  }
+
+  const eligible = await engine.executeRaw<{ slug: string; source_id: string }>(
+    `SELECT p.slug, p.source_id
+       FROM pages p
+       JOIN unnest($1::text[], $2::text[]) AS u(slug, source_id)
+         ON p.slug = u.slug AND p.source_id = u.source_id
+      WHERE ${clauses.join(' AND ')}`,
+    params,
+  );
+  const allowed = new Set(eligible.map((row) => `${row.source_id}::${row.slug}`));
+  return results.filter((result) => allowed.has(`${result.source_id ?? 'default'}::${result.slug}`));
 }
 
 /**
@@ -811,6 +893,11 @@ export async function hybridSearch(
   query: string,
   opts?: HybridSearchOpts,
 ): Promise<SearchResult[]> {
+  // Normalize public temporal inputs once before any engine call. This makes
+  // date-only `until` inclusive through end-of-day, resolves relative windows
+  // deterministically, and gives both engines identical ISO boundaries.
+  opts = normalizeHybridSearchDateOpts(opts);
+
   // v0.32.3 search-lite mode: resolve the active mode + per-key overrides
   // once at entry. Mode supplies DEFAULTS for intentWeighting, tokenBudget,
   // expansion, and searchLimit when the caller leaves those undefined.
@@ -902,6 +989,8 @@ export async function hybridSearch(
     // PR #618 callers compiling while the new names are the public surface.
     afterDate: opts?.since ?? opts?.afterDate,
     beforeDate: opts?.until ?? opts?.beforeDate,
+    afterDateInclusive: opts?.since !== undefined,
+    beforeDateInclusive: opts?.until !== undefined,
     // v0.34.1 (#861, D9 — P0 leak seal): thread source-scoping through so the
     // inner engine.searchKeyword / engine.searchVector calls apply the
     // WHERE source_id filter at SQL level. Pre-fix, this explicit pick
@@ -1064,8 +1153,9 @@ export async function hybridSearch(
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
     });
-    stampEvidence(noEmbedHopped);
-    const noEmbedSliced = noEmbedHopped.slice(offset, offset + limit);
+    const noEmbedContained = await filterResultsToDateWindow(engine, noEmbedHopped, opts);
+    stampEvidence(noEmbedContained);
+    const noEmbedSliced = noEmbedContained.slice(offset, offset + limit);
     // v0.32.3 search-lite: budget enforcement on the no-embedding-provider path.
     const { results: noEmbedBudgeted, meta: noEmbedBudgetMeta } = enforceTokenBudget(noEmbedSliced, resolvedMode.tokenBudget);
     await stampContentFlags(engine, noEmbedBudgeted);
@@ -1296,8 +1386,9 @@ export async function hybridSearch(
       sourceId: opts?.sourceId,
       sourceIds: opts?.sourceIds,
     });
-    stampEvidence(kwHopped);
-    const kwSliced = kwHopped.slice(offset, offset + limit);
+    const kwContained = await filterResultsToDateWindow(engine, kwHopped, opts);
+    stampEvidence(kwContained);
+    const kwSliced = kwContained.slice(offset, offset + limit);
     // v0.32.3 search-lite: budget enforcement on the keyword-fallback path too.
     const { results: kwBudgeted, meta: kwBudgetMeta } = enforceTokenBudget(kwSliced, resolvedMode.tokenBudget);
     await stampContentFlags(engine, kwBudgeted);
@@ -1469,12 +1560,13 @@ export async function hybridSearch(
     sourceId: opts?.sourceId,
     sourceIds: opts?.sourceIds,
   });
+  const dateContained = await filterResultsToDateWindow(engine, aliasHopped, opts);
 
   // T4 — stamp evidence + create_safety so the agent's don't-duplicate
   // decision keys off WHY a page matched, not a raw blended score. Stamp on
   // the full alias-hopped set before any adaptive trim so the kept results
   // carry evidence regardless of where the cap lands.
-  stampEvidence(aliasHopped);
+  stampEvidence(dateContained);
 
   // v0.42 — intent-aware adaptive return-sizing (opt-in, default off). Trim
   // the ranked candidate set to an intent-driven cap BEFORE the limit slice,
@@ -1486,10 +1578,10 @@ export async function hybridSearch(
     opts?.adaptiveReturn,
     adaptiveReturnFromConfig(cfgForColumn as Record<string, unknown> | null),
   );
-  let returnPool = aliasHopped;
+  let returnPool = dateContained;
   let adaptiveDecision: AdaptiveReturnDecision | undefined;
   if (adaptiveCfg.enabled && offset === 0) {
-    const r = applyAdaptiveReturn(aliasHopped, suggestions.intent, adaptiveCfg);
+    const r = applyAdaptiveReturn(dateContained, suggestions.intent, adaptiveCfg);
     returnPool = r.kept;
     adaptiveDecision = r.decision;
   }
@@ -1571,6 +1663,11 @@ export async function hybridSearchCached(
   query: string,
   opts?: HybridSearchOpts,
 ): Promise<SearchResult[]> {
+  // The cache key and the fresh-search path must see the same exact window.
+  // In particular, relative inputs are resolved once here rather than once
+  // for lookup and again for search/writeback.
+  opts = normalizeHybridSearchDateOpts(opts);
+
   // v0.32.3 search-lite mode: resolve mode + per-key overrides once. The
   // resolved knob set drives cache enable/threshold/TTL AND the knobs_hash
   // that scopes the cache row so a tokenmax write can't be served to a
@@ -1631,6 +1728,10 @@ export async function hybridSearchCached(
   const cacheKnobsHash = knobsHash(resolvedForCache, {
     embeddingColumn: resolvedColCached.name,
     embeddingModel: resolvedColCached.embeddingModel,
+    since: opts?.since ?? opts?.afterDate,
+    until: opts?.until ?? opts?.beforeDate,
+    sinceInclusive: opts?.since !== undefined,
+    untilInclusive: opts?.until !== undefined,
   });
 
   // Cache decision: opts.useCache (explicit) wins over global config; global
@@ -1662,6 +1763,7 @@ export async function hybridSearchCached(
     (opts?.walkDepth ?? 0) > 0 ||
     Boolean(opts?.nearSymbol) ||
     isNonDefaultColumn ||
+    opts?._relativeDateWindow === true ||
     adaptiveReturnOn;
 
   let cacheStatus: 'hit' | 'miss' | 'disabled' = skipCache ? 'disabled' : 'miss';

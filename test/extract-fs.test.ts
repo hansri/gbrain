@@ -55,6 +55,10 @@ const companyPage = (title: string, body = ''): PageInput => ({
 beforeEach(async () => {
   await truncateAll();
   brainDir = mkdtempSync(join(tmpdir(), 'gbrain-extract-fs-'));
+  await engine.executeRaw(
+    `UPDATE sources SET local_path = $1 WHERE id = 'default'`,
+    [brainDir],
+  );
 }, 15_000);
 
 function writeFile(rel: string, content: string) {
@@ -221,10 +225,10 @@ describe('gbrain extract --dir default resolution', () => {
     const all = errBuf.join('\n');
     expect(all).toContain('No brain directory configured');
     expect(all).toContain('--source db');
-    expect(all).toContain('--dir');
+    expect(all).toContain('sources add default --path');
   });
 
-  test('explicit --dir always wins over configured source', async () => {
+  test('explicit --dir fails closed when it conflicts with the resolved source', async () => {
     await engine.putPage('people/alice', personPage('Alice'));
     await engine.putPage('people/bob', personPage('Bob'));
     writeFile('people/alice.md', '---\ntitle: Alice\n---\n\n[Bob](../people/bob.md) is a friend.\n');
@@ -236,14 +240,26 @@ describe('gbrain extract --dir default resolution', () => {
       `UPDATE sources SET local_path = '${decoyDir.replace(/'/g, "''")}' WHERE id = 'default'`,
     );
 
+    let exitCode: number | null = null;
+    const errBuf: string[] = [];
+    const savedExit = process.exit;
+    const savedConsoleError = console.error;
     try {
-      await runExtract(engine, ['links', '--dir', brainDir]);
-      const links = await engine.getLinks('people/alice');
-      expect(links.length).toBe(1);
-      expect(links[0]).toMatchObject({ to_slug: 'people/bob' });
+      (process as any).exit = (code: number) => { exitCode = code; throw new Error('__test_exit__'); };
+      console.error = (...parts: unknown[]) => { errBuf.push(parts.join(' ')); };
+      try {
+        await runExtract(engine, ['links', '--dir', brainDir]);
+      } catch (error) {
+        if (!(error instanceof Error && error.message === '__test_exit__')) throw error;
+      }
     } finally {
+      (process as any).exit = savedExit;
+      console.error = savedConsoleError;
       try { rmSync(decoyDir, { recursive: true, force: true }); } catch { /* ignore */ }
     }
+    expect(exitCode as unknown).toBe(1);
+    expect(errBuf.join('\n')).toContain('Source/path mismatch');
+    expect((await engine.getLinks('people/alice')).length).toBe(0);
   });
 });
 
