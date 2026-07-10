@@ -747,7 +747,10 @@ export function attributeKnob<K extends keyof ModeBundle>(
 // to post-fix lookups. Same one-time global cold-miss pattern as the bumps
 // above (the hash is global, not per-provider); refills within
 // cache.ttl_seconds (3600s default).
-export const KNOBS_HASH_VERSION = 11;
+// bump 11→12: canonical temporal boundaries participate in the semantic-cache
+// key. A date-filtered query must never reuse an unfiltered (or differently
+// filtered) row, even when the query embeddings are nearly identical.
+export const KNOBS_HASH_VERSION = 12;
 
 /**
  * v0.36 (D8 / CDX-2) — second-arg context for the cache key. The
@@ -776,6 +779,14 @@ export interface KnobsHashContext {
    */
   schemaPack?: string;
   schemaPackVersion?: string;
+  /** Canonical inclusive lower temporal boundary (ISO timestamp). */
+  since?: string;
+  /** Canonical inclusive upper temporal boundary (ISO timestamp). */
+  until?: string;
+  /** Preserve legacy exclusive vs public inclusive lower-bound semantics. */
+  sinceInclusive?: boolean;
+  /** Preserve legacy exclusive vs public inclusive upper-bound semantics. */
+  untilInclusive?: boolean;
 }
 
 export function knobsHash(
@@ -863,6 +874,12 @@ export function knobsHash(
     // test/model-pricing.test.ts-style drift guards and the mode tests.
     `rel=${knobs.relationalRetrieval ? 1 : 0}`,
     `reld=${knobs.relational_retrieval_depth ?? 2}`,
+    // v=12 additions (append-only): temporal containment. Date-filtered and
+    // unfiltered result sets cannot share a semantic-cache row.
+    `since=${ctx?.since ?? 'none'}`,
+    `until=${ctx?.until ?? 'none'}`,
+    `since_i=${ctx?.sinceInclusive ? 1 : 0}`,
+    `until_i=${ctx?.untilInclusive ? 1 : 0}`,
   ];
   const h = createHash('sha256');
   h.update(parts.join('|'));
@@ -1134,4 +1151,3 @@ export async function loadSearchModeConfig(
     overrides: loadOverridesFromConfig(configMap),
   };
 }
-

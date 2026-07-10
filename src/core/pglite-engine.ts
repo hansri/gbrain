@@ -1582,11 +1582,13 @@ export class PGLiteEngine implements BrainEngine {
     // got reimported). Same param shape as Postgres engine.
     if (opts?.afterDate) {
       params.push(opts.afterDate);
-      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      const operator = opts.afterDateInclusive ? '>=' : '>';
+      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${operator} $${params.length}::timestamptz`;
     }
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
-      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      const operator = opts.beforeDateInclusive ? '<=' : '<';
+      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${operator} $${params.length}::timestamptz`;
     }
     // v0.34.1 (#861 — P0 leak seal): source-isolation. Array wins over scalar.
     if (opts?.sourceIds && opts.sourceIds.length > 0) {
@@ -1685,11 +1687,13 @@ export class PGLiteEngine implements BrainEngine {
     }
     if (opts?.afterDate) {
       params.push(opts.afterDate);
-      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      const operator = opts.afterDateInclusive ? '>=' : '>';
+      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${operator} $${params.length}::timestamptz`;
     }
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
-      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      const operator = opts.beforeDateInclusive ? '<=' : '<';
+      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${operator} $${params.length}::timestamptz`;
     }
     // v0.34.1 (#861 — P0 leak seal): source-isolation on the CJK fallback path.
     if (opts?.sourceIds && opts.sourceIds.length > 0) {
@@ -1811,11 +1815,13 @@ export class PGLiteEngine implements BrainEngine {
     // v0.29.1 since/until parity (codex pass-1 #10).
     if (opts?.afterDate) {
       params.push(opts.afterDate);
-      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      const operator = opts.afterDateInclusive ? '>=' : '>';
+      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${operator} $${params.length}::timestamptz`;
     }
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
-      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      const operator = opts.beforeDateInclusive ? '<=' : '<';
+      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${operator} $${params.length}::timestamptz`;
     }
     // v0.34.1 (#861 — P0 leak seal): source-isolation for the chunk-grain
     // anchor primitive. Layer 7 two-pass walks from these anchors so a
@@ -1902,11 +1908,13 @@ export class PGLiteEngine implements BrainEngine {
     // pages — preserves pagination contract.
     if (opts?.afterDate) {
       params.push(opts.afterDate);
-      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      const operator = opts.afterDateInclusive ? '>=' : '>';
+      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${operator} $${params.length}::timestamptz`;
     }
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
-      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      const operator = opts.beforeDateInclusive ? '<=' : '<';
+      extraFilter += ` AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${operator} $${params.length}::timestamptz`;
     }
     // v0.34.1 (#861, F2 — P0 leak seal): source-isolation in the INNER CTE
     // so HNSW candidate pool narrows before re-rank. Mirrors postgres-engine
@@ -3054,7 +3062,8 @@ export class PGLiteEngine implements BrainEngine {
              array_agg(DISTINCT n.last_link_type)
                FILTER (WHERE n.last_link_type IS NOT NULL) AS via_link_types,
              (array_agg(array_to_string(n.path, chr(9))
-               ORDER BY n.depth ASC, array_length(n.path, 1) ASC))[1] AS path_str,
+               ORDER BY n.depth ASC, array_length(n.path, 1) ASC,
+                        array_to_string(n.path, chr(9)) ASC))[1] AS path_str,
              (SELECT cc.id FROM content_chunks cc
                WHERE cc.page_id = n.id ORDER BY cc.chunk_index ASC LIMIT 1) AS canonical_chunk_id
       FROM walk n

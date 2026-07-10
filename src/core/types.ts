@@ -1003,11 +1003,15 @@ export interface SearchOpts {
    * v0.27.0: filter results to pages updated/created after this date. ISO-8601 string.
    */
   afterDate?: string;
+  /** Internal engine contract: public `since` is inclusive; legacy `afterDate` remains exclusive. */
+  afterDateInclusive?: boolean;
   /**
    * @deprecated v0.29.1: use `until` instead. Removed in v0.30.
    * v0.27.0: filter results to pages updated/created before this date. ISO-8601 string.
    */
   beforeDate?: string;
+  /** Internal engine contract: public `until` is inclusive; legacy `beforeDate` remains exclusive. */
+  beforeDateInclusive?: boolean;
   /**
    * @deprecated v0.29.1: use `recency` ('off' | 'on' | 'strong') instead. Removed in v0.30.
    * v0.27.0: recency boost strength. 0 = off, 1 = moderate, 2 = aggressive.

@@ -1604,12 +1604,14 @@ export class PostgresEngine implements BrainEngine {
     let afterDateClause = '';
     if (opts?.afterDate) {
       params.push(opts.afterDate);
-      afterDateClause = `AND COALESCE(p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      const operator = opts.afterDateInclusive ? '>=' : '>';
+      afterDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${operator} $${params.length}::timestamptz`;
     }
     let beforeDateClause = '';
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
-      beforeDateClause = `AND COALESCE(p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      const operator = opts.beforeDateInclusive ? '<=' : '<';
+      beforeDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${operator} $${params.length}::timestamptz`;
     }
     // v0.34.1 (#861 — P0 leak seal): source-isolation filter. When the
     // caller's auth scope is set, narrow the inner CTE candidate set so
@@ -1753,12 +1755,14 @@ export class PostgresEngine implements BrainEngine {
     let afterDateClause = '';
     if (opts?.afterDate) {
       params.push(opts.afterDate);
-      afterDateClause = `AND COALESCE(p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      const operator = opts.afterDateInclusive ? '>=' : '>';
+      afterDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${operator} $${params.length}::timestamptz`;
     }
     let beforeDateClause = '';
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
-      beforeDateClause = `AND COALESCE(p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      const operator = opts.beforeDateInclusive ? '<=' : '<';
+      beforeDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${operator} $${params.length}::timestamptz`;
     }
     // v0.34.1 (#861 — P0 leak seal): source-isolation. Anchor primitive
     // for two-pass retrieval, so cross-source anchors would let the walk
@@ -1875,12 +1879,14 @@ export class PostgresEngine implements BrainEngine {
     let afterDateClause = '';
     if (opts?.afterDate) {
       params.push(opts.afterDate);
-      afterDateClause = `AND COALESCE(p.updated_at, p.created_at) > $${params.length}::timestamptz`;
+      const operator = opts.afterDateInclusive ? '>=' : '>';
+      afterDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${operator} $${params.length}::timestamptz`;
     }
     let beforeDateClause = '';
     if (opts?.beforeDate) {
       params.push(opts.beforeDate);
-      beforeDateClause = `AND COALESCE(p.updated_at, p.created_at) < $${params.length}::timestamptz`;
+      const operator = opts.beforeDateInclusive ? '<=' : '<';
+      beforeDateClause = `AND COALESCE(p.effective_date, p.updated_at, p.created_at) ${operator} $${params.length}::timestamptz`;
     }
     // v0.34.1 (#861, F2 — P0 leak seal): source-isolation in the INNER CTE
     // specifically. Pushing the filter inside narrows the HNSW candidate set
@@ -3101,7 +3107,8 @@ export class PostgresEngine implements BrainEngine {
              array_agg(DISTINCT n.last_link_type)
                FILTER (WHERE n.last_link_type IS NOT NULL) AS via_link_types,
              (array_agg(array_to_string(n.path, chr(9))
-               ORDER BY n.depth ASC, array_length(n.path, 1) ASC))[1] AS path_str,
+               ORDER BY n.depth ASC, array_length(n.path, 1) ASC,
+                        array_to_string(n.path, chr(9)) ASC))[1] AS path_str,
              (SELECT cc.id FROM content_chunks cc
                WHERE cc.page_id = n.id ORDER BY cc.chunk_index ASC LIMIT 1) AS canonical_chunk_id
       FROM walk n

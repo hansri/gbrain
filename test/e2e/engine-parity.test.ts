@@ -34,6 +34,7 @@ interface SeedPage {
   title: string;
   body: string;
   embeddingDim: number;
+  effectiveDate?: string;
 }
 
 const SEED_PAGES: SeedPage[] = [
@@ -76,6 +77,20 @@ const SEED_PAGES: SeedPage[] = [
     body: 'example founder unrelated content for distraction',
     embeddingDim: 50,
   },
+  ...([
+    ['meetings/temporal-parity-before', '2026-07-08T23:59:59.999Z'],
+    ['meetings/temporal-parity-start', '2026-07-09T00:00:00.000Z'],
+    ['meetings/temporal-parity-end', '2026-07-09T23:59:59.999Z'],
+    ['meetings/temporal-parity-microsecond-end', '2026-07-09T23:59:59.999500Z'],
+    ['meetings/temporal-parity-after', '2026-07-10T00:00:00.000Z'],
+  ] as const).map(([slug, effectiveDate]) => ({
+    slug,
+    type: 'note' as const,
+    title: 'Temporal Parity Sentinel',
+    body: 'temporal parity sentinel evidence',
+    embeddingDim: 90,
+    effectiveDate,
+  })),
 ];
 
 async function seedEngine(eng: BrainEngine) {
@@ -85,7 +100,15 @@ async function seedEngine(eng: BrainEngine) {
       title: p.title,
       compiled_truth: p.body,
       timeline: '',
+      effective_date: p.effectiveDate ? new Date(p.effectiveDate) : undefined,
+      effective_date_source: p.effectiveDate ? 'event_date' : undefined,
     });
+    if (p.effectiveDate) {
+      await eng.executeRaw(
+        `UPDATE pages SET effective_date = $1::timestamptz WHERE slug = $2 AND source_id = 'default'`,
+        [p.effectiveDate, p.slug],
+      );
+    }
     const chunks: ChunkInput[] = [
       {
         chunk_index: 0,
@@ -147,6 +170,36 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
     const pgliteResults = await pgliteEngine.searchVector(queryVec, { limit: 5 });
 
     expect(pgResults[0]?.slug).toBe(pgliteResults[0]?.slug);
+  });
+
+  test('temporal bounds are inclusive and effective-date based on both engines', async () => {
+    const dateWindow = {
+      afterDate: '2026-07-09T00:00:00.000Z',
+      beforeDate: '2026-07-09T23:59:59.999999Z',
+      afterDateInclusive: true,
+      beforeDateInclusive: true,
+      limit: 20,
+    };
+    const expected = new Set([
+      'meetings/temporal-parity-start',
+      'meetings/temporal-parity-end',
+      'meetings/temporal-parity-microsecond-end',
+    ]);
+
+    const pgKeyword = await pgEngine.searchKeyword('temporal parity sentinel', dateWindow);
+    const liteKeyword = await pgliteEngine.searchKeyword('temporal parity sentinel', dateWindow);
+    expect(new Set(pgKeyword.map((result) => result.slug))).toEqual(expected);
+    expect(new Set(liteKeyword.map((result) => result.slug))).toEqual(expected);
+
+    const pgChunks = await pgEngine.searchKeywordChunks('temporal parity sentinel', dateWindow);
+    const liteChunks = await pgliteEngine.searchKeywordChunks('temporal parity sentinel', dateWindow);
+    expect(new Set(pgChunks.map((result) => result.slug))).toEqual(expected);
+    expect(new Set(liteChunks.map((result) => result.slug))).toEqual(expected);
+
+    const pgVector = await pgEngine.searchVector(basisEmbedding(90), dateWindow);
+    const liteVector = await pgliteEngine.searchVector(basisEmbedding(90), dateWindow);
+    expect(new Set(pgVector.map((result) => result.slug))).toEqual(expected);
+    expect(new Set(liteVector.map((result) => result.slug))).toEqual(expected);
   });
 
   test('hard-exclude is consistent across engines', async () => {

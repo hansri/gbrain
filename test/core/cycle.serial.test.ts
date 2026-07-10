@@ -18,7 +18,7 @@ import { existsSync, unlinkSync } from 'fs';
 let lintCalls: Array<{ target: string; fix: boolean; dryRun: boolean | undefined }> = [];
 let backlinksCalls: Array<{ action: string; dir: string; dryRun: boolean | undefined }> = [];
 let syncCalls: Array<{ dryRun: boolean | undefined; noPull: boolean | undefined; noExtract: boolean | undefined; sourceId: string | undefined }> = [];
-let extractCalls: Array<{ mode: string; dir: string; slugs: string[] | undefined }> = [];
+let extractCalls: Array<{ mode: string; dir: string; slugs: string[] | undefined; sourceId: string | undefined }> = [];
 let embedCalls: Array<{ stale: boolean | undefined; dryRun: boolean | undefined }> = [];
 let orphansCalls: number = 0;
 
@@ -72,7 +72,7 @@ mock.module('../../src/commands/sync.ts', () => ({
 // Mock extract
 mock.module('../../src/commands/extract.ts', () => ({
   runExtractCore: async (_engine: any, opts: any) => {
-    extractCalls.push({ mode: opts.mode, dir: opts.dir, slugs: opts.slugs });
+    extractCalls.push({ mode: opts.mode, dir: opts.dir, slugs: opts.slugs, sourceId: opts.sourceId });
     return { links_created: 7, timeline_entries_created: 3, pages_processed: opts.slugs?.length ?? 5 };
   },
   walkMarkdownFiles: () => [],
@@ -531,32 +531,70 @@ describe('runCycle — sourceId resolution (regression #475)', () => {
     }
   });
 
-  test('multiple rows with same local_path → resolver returns one matching id (non-deterministic)', async () => {
-    // Schema has no UNIQUE on local_path; SQL has no ORDER BY. Either id
-    // is acceptable; the contract is "any matching id, never null when
-    // matches exist." This test pins behavior so the follow-up
-    // UNIQUE-constraint TODO has a regression target.
+  test('multiple rows with the same local_path fail closed', async () => {
     await (sharedEngine as any).db.query(
       `INSERT INTO sources (id, name, local_path) VALUES
         ('first', 'first', '/tmp/brain-475-e'),
         ('second', 'second', '/tmp/brain-475-e')`,
     );
-    await runCycle(sharedEngine, { brainDir: '/tmp/brain-475-e' });
-    const sourceId = syncCalls.at(-1)?.sourceId;
-    expect(sourceId).toBeDefined();
-    expect(['first', 'second']).toContain(sourceId as string);
+    await expect(runCycle(sharedEngine, { brainDir: '/tmp/brain-475-e' }))
+      .rejects.toThrow(/Ambiguous source mapping/);
+    expect(syncCalls.length).toBe(0);
   });
 
-  test('empty-string id row → resolver propagates as "" (defensive)', async () => {
-    // Schema has id as PRIMARY KEY (NOT NULL), so NULL id can't happen.
-    // Empty string CAN be inserted, and the resolver's `rows[0]?.id`
-    // would treat any falsy id as "no source" via the optional chain.
-    // This test pins the current behavior (we DO pass '' through to
-    // performSync) so a future refactor doesn't silently regress it.
+  test('empty-string source ids fail closed', async () => {
     await (sharedEngine as any).db.query(
       `INSERT INTO sources (id, name, local_path) VALUES ('', 'empty', '/tmp/brain-475-f')`,
     );
-    await runCycle(sharedEngine, { brainDir: '/tmp/brain-475-f' });
-    expect(syncCalls.at(-1)?.sourceId).toBe('');
+    await expect(runCycle(sharedEngine, { brainDir: '/tmp/brain-475-f' }))
+      .rejects.toThrow(/Invalid source_id/);
+    expect(syncCalls.length).toBe(0);
+  });
+
+  test('explicit sourceId is authoritative for sync and filesystem extraction', async () => {
+    await (sharedEngine as any).db.query(
+      `INSERT INTO sources (id, name, local_path) VALUES ($1, $2, $3)`,
+      ['alpha', 'alpha', '/tmp/brain-475-alpha'],
+    );
+
+    await runCycle(sharedEngine, {
+      brainDir: '/tmp/brain-475-alpha',
+      sourceId: 'alpha',
+      phases: ['sync', 'extract'],
+    });
+
+    expect(syncCalls.at(-1)?.sourceId).toBe('alpha');
+    expect(extractCalls.at(-1)?.sourceId).toBe('alpha');
+  });
+
+  test('explicit sourceId must match the source registered for brainDir', async () => {
+    await (sharedEngine as any).db.query(
+      `INSERT INTO sources (id, name, local_path) VALUES
+        ('alpha', 'alpha', '/tmp/brain-475-alpha'),
+        ('beta', 'beta', '/tmp/brain-475-beta')`,
+    );
+
+    await expect(runCycle(sharedEngine, {
+      brainDir: '/tmp/brain-475-beta',
+      sourceId: 'alpha',
+      phases: ['sync', 'extract'],
+    })).rejects.toThrow(/Source\/path mismatch/);
+    expect(syncCalls.length).toBe(0);
+    expect(extractCalls.length).toBe(0);
+  });
+
+  test('global embed phase remains unscoped even in a validated source cycle', async () => {
+    await (sharedEngine as any).db.query(
+      `INSERT INTO sources (id, name, local_path) VALUES ($1, $2, $3)`,
+      ['alpha', 'alpha', '/tmp/brain-475-alpha'],
+    );
+
+    await runCycle(sharedEngine, {
+      brainDir: '/tmp/brain-475-alpha',
+      sourceId: 'alpha',
+      phases: ['embed'],
+    });
+
+    expect(embedCalls.at(-1)).toEqual({ stale: true, dryRun: false });
   });
 });
