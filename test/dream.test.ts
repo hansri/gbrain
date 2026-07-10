@@ -259,12 +259,16 @@ describe('runDream — --source / --source-id (v0.41.13)', () => {
   let repo: string;
   let engine: InstanceType<typeof PGLiteEngine>;
 
-  async function seedSource(id: string, archived: boolean = false): Promise<void> {
+  async function seedSource(
+    id: string,
+    archived: boolean = false,
+    localPath = repo,
+  ): Promise<void> {
     await engine.executeRaw(
       `INSERT INTO sources (id, name, local_path, config, archived, created_at)
        VALUES ($1, $2, $3, '{}'::jsonb, $4, NOW())
        ON CONFLICT (id) DO UPDATE SET local_path = EXCLUDED.local_path, archived = EXCLUDED.archived`,
-      [id, id, repo, archived],
+      [id, id, localPath, archived],
     );
   }
 
@@ -450,8 +454,11 @@ describe('runDream — --source / --source-id (v0.41.13)', () => {
   // ─── Back-compat: bare `gbrain dream` does NOT write per-source stamp ─
 
   test('gbrain dream (no --source) leaves all sources untouched (back-compat regression)', async () => {
-    await seedSource('alpha');
-    await seedSource('beta');
+    // Multiple sources must not claim the same canonical checkout path. This
+    // bare invocation intentionally matches neither source and therefore keeps
+    // the legacy no-per-source-writeback behavior under test.
+    await seedSource('alpha', false, join(repo, 'alpha'));
+    await seedSource('beta', false, join(repo, 'beta'));
     const report = await runDream(engine, ['--dir', repo, '--phase', 'lint', '--json']);
     expect(report).toBeTruthy();
     expect(await readLastFullCycleAt('alpha')).toBeNull();
