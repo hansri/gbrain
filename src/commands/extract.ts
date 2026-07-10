@@ -674,7 +674,8 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
   const source = (sourceIdx >= 0 && sourceIdx + 1 < args.length) ? args[sourceIdx + 1] : 'fs';
   // v0.37.7.0 #1204: --source-id <id> scopes extraction to one brain
   // source. Separate flag from --source (fs|db) which is the
-  // data-source axis. When unset, walks all sources together as today.
+  // data-source axis. DB extraction may span sources when unset; FS
+  // extraction resolves exactly one registered source/path tuple below.
   const sourceIdIdx = args.indexOf('--source-id');
   const sourceIdFilter = (sourceIdIdx >= 0 && sourceIdIdx + 1 < args.length) ? args[sourceIdIdx + 1] : undefined;
   const typeIdx = args.indexOf('--type');
