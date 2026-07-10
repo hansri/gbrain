@@ -14,7 +14,7 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { runExtract, runExtractCore } from '../src/commands/extract.ts';
+import { runExtract } from '../src/commands/extract.ts';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -126,7 +126,7 @@ describe('extract --source-id flag (#1204)', () => {
     expect(Number(linkRows[0]?.n ?? 0)).toBe(0);
   });
 
-  test('filesystem cycle writes links and timeline rows into the explicit source', async () => {
+  test('filesystem CLI dispatch writes links and timeline rows into the explicit source', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'gbrain-extract-source-'));
     mkdirSync(join(dir, 'people'), { recursive: true });
     writeFileSync(
@@ -134,11 +134,17 @@ describe('extract --source-id flag (#1204)', () => {
       '# Alice\n\nMet [[people/bob]].\n\n- **2026-07-09** | Test — Boundary checkpoint.\n',
     );
     writeFileSync(join(dir, 'people/bob.md'), '# Bob\n');
+    await engine.executeRaw(
+      `UPDATE sources SET local_path = $1 WHERE id = 'alpha'`,
+      [dir],
+    );
 
     const originalLog = console.log;
     console.log = () => {};
     try {
-      await runExtractCore(engine, { mode: 'all', dir, sourceId: 'alpha' });
+      await runExtract(engine, [
+        'all', '--source', 'fs', '--source-id', 'alpha', '--dir', dir,
+      ]);
     } finally {
       console.log = originalLog;
       rmSync(dir, { recursive: true, force: true });

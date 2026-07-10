@@ -63,6 +63,7 @@ import { createHash } from 'crypto';
 import { runSlidingPool } from '../core/worker-pool.ts';
 import { isAborted } from '../core/abort-check.ts';
 import { parseWorkers, resolveWorkersWithClamp } from '../core/sync-concurrency.ts';
+import { canonicalSourcePath } from '../core/source-path.ts';
 
 // Batch size for addLinksBatch / addTimelineEntriesBatch.
 // Postgres bind-parameter limit is 65535. Links use 4 cols/row → 16K hard ceiling;
@@ -818,21 +819,59 @@ Status (v0.42):
     process.exit(2);
   }
 
-  // FS source needs a brain dir. When --dir wasn't passed, resolve from
-  // sources(local_path) — same path `gbrain sync` uses — instead of
-  // silently walking cwd. See the brainDir comment above for the footgun.
-  if (source === 'fs' && !explicitDir) {
-    const { getDefaultSourcePath } = await import('../core/source-resolver.ts');
-    const configured = await getDefaultSourcePath(engine);
-    if (configured) {
-      brainDir = configured;
-    } else {
+  // Resolve FS source identity and checkout path as one fail-closed tuple.
+  // The source-id resolver uses the explicit --source-id first, then the
+  // normal env/dotfile/local_path/default chain. When --dir is explicit, use
+  // that directory for implicit local_path resolution, but never let it
+  // override a conflicting env/dotfile/flag source identity.
+  let fsSourceId: string | undefined;
+  if (source === 'fs') {
+    const { resolveSourceWithTier } = await import('../core/source-resolver.ts');
+    let resolved: Awaited<ReturnType<typeof resolveSourceWithTier>>;
+    try {
+      resolved = await resolveSourceWithTier(
+        engine,
+        sourceIdFilter,
+        explicitDir ? brainDir : process.cwd(),
+      );
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exit(1);
+      return;
+    }
+    fsSourceId = resolved.source_id;
+
+    const rows = await engine.executeRaw<{ local_path: string | null }>(
+      `SELECT local_path FROM sources WHERE id = $1`,
+      [fsSourceId],
+    );
+    let configuredPath = rows[0]?.local_path ?? null;
+    if (!configuredPath && fsSourceId === 'default') {
+      configuredPath = await engine.getConfig('sync.repo_path');
+    }
+    if (!configuredPath) {
       console.error(
-        `No brain directory configured. Pass --dir <path> explicitly, or use --source db ` +
-        `to extract from already-synced pages. To register a brain dir as the default, ` +
-        `run: gbrain sources add default --path <brain-dir>`,
+        `No brain directory configured for source "${fsSourceId}". Register it with ` +
+        `gbrain sources add ${fsSourceId} --path <brain-dir>, or use --source db ` +
+        `to extract from already-synced pages.`,
       );
       process.exit(1);
+      return;
+    }
+
+    if (explicitDir) {
+      const requestedPath = canonicalSourcePath(brainDir);
+      const registeredPath = canonicalSourcePath(configuredPath);
+      if (requestedPath !== registeredPath) {
+        console.error(
+          `Source/path mismatch: source "${fsSourceId}" is registered at "${configuredPath}", ` +
+          `but --dir resolved to "${brainDir}". Refusing filesystem extraction.`,
+        );
+        process.exit(1);
+        return;
+      }
+    } else {
+      brainDir = configuredPath;
     }
   }
 
@@ -921,6 +960,7 @@ Status (v0.42):
       result = await runExtractCore(engine, {
         mode: subcommand as 'links' | 'timeline' | 'all',
         dir: brainDir,
+        sourceId: fsSourceId,
         dryRun,
         jsonMode,
         workers,
