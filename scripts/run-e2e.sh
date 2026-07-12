@@ -23,9 +23,9 @@
 #
 # HOME isolation: E2E tests call paths that resolve to gbrain init / saveConfig
 # (e.g. setupDB writing config for the test container) and would otherwise
-# write the user's real ~/.gbrain/config.json. The wrapper redirects HOME and
-# GBRAIN_HOME to a tmpdir before bun starts so config writes land in the
-# tmpdir, then verifies the user's real config md5 didn't change after the run.
+# write the user's real ~/.gbrain/config.json. The wrapper gives every file a
+# private child HOME + GBRAIN_HOME under one outer tmpdir so config state cannot
+# leak across files, then verifies the user's real config md5 did not change.
 # Both env vars are required: loadConfig/saveConfig resolve via HOME, while
 # configPath/getDbUrlSource honor GBRAIN_HOME; setting only one leaves the
 # other path escaping isolation. HOME is set before bun starts because Bun's
@@ -168,13 +168,36 @@ for f in "${files[@]}"; do
   # suite advances. gtimeout (macOS via coreutils) preferred; timeout (Linux)
   # fallback; bare bun (no outer cap) if neither is installed.
   if command -v gtimeout >/dev/null 2>&1; then
-    TIMEOUT_CMD="gtimeout 180"
+    timeout_bin="gtimeout"
   elif command -v timeout >/dev/null 2>&1; then
-    TIMEOUT_CMD="timeout 180"
+    timeout_bin="timeout"
   else
-    TIMEOUT_CMD=""
+    timeout_bin=""
   fi
-  if output=$($TIMEOUT_CMD bun test --timeout=60000 "$f" 2>&1); then
+
+  # A fresh process alone is insufficient isolation when every process shares
+  # the same config directory. Keep only the outer breach-detector root shared;
+  # each file receives a disposable child home and cannot inherit a previous
+  # file's selected model, source, or other persisted configuration.
+  file_home=$(mktemp -d "$E2E_TMP_HOME/file.XXXXXX")
+  mkdir -p "$file_home/.gbrain"
+  file_failed=0
+  if [ -n "$timeout_bin" ]; then
+    if output=$(HOME="$file_home" GBRAIN_HOME="$file_home" "$timeout_bin" 180 bun test --timeout=60000 "$f" 2>&1); then
+      :
+    else
+      file_failed=1
+    fi
+  else
+    if output=$(HOME="$file_home" GBRAIN_HOME="$file_home" bun test --timeout=60000 "$f" 2>&1); then
+      :
+    else
+      file_failed=1
+    fi
+  fi
+  rm -rf "$file_home"
+
+  if [ "$file_failed" = "0" ]; then
     pass_files=$((pass_files + 1))
     # Extract pass/fail counts from bun's summary (e.g., "123 pass")
     p=$(echo "$output" | grep -oE '[0-9]+ pass' | tail -1 | grep -oE '[0-9]+' || echo 0)

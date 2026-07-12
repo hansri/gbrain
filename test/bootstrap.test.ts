@@ -161,6 +161,69 @@ describe('PGLiteEngine#applyForwardReferenceBootstrap', () => {
     }
   }, 30000);
 
+  test('legacy v125 timeline table upgrades before managed_by index replay', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      const db = (engine as any).db;
+      await engine.putPage('migration/timeline-owner', {
+        type: 'concept', title: 'Timeline owner', compiled_truth: '', timeline: '', frontmatter: {},
+      });
+      await db.exec(`
+        INSERT INTO timeline_entries (page_id, date, source, summary, detail, managed_by)
+        SELECT id, '2026-07-10', 'gbrain-markdown:Meeting', 'legacy generated', '', NULL
+          FROM pages WHERE source_id = 'default' AND slug = 'migration/timeline-owner';
+        INSERT INTO timeline_entries (page_id, date, source, summary, detail, managed_by)
+        SELECT id, '2026-07-11', 'Meeting', 'manual evidence', '', NULL
+          FROM pages WHERE source_id = 'default' AND slug = 'migration/timeline-owner';
+      `);
+      await db.exec(`
+        DROP INDEX IF EXISTS idx_timeline_managed_page;
+        ALTER TABLE timeline_entries DROP COLUMN IF EXISTS managed_by;
+      `);
+      await engine.setConfig('version', '125');
+
+      // Exact production ordering under test:
+      // bootstrap -> latest schema replay -> migration 126.
+      await engine.initSchema();
+
+      expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+      const { rows: columns } = await db.query(`
+        SELECT column_name
+          FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'timeline_entries'
+           AND column_name = 'managed_by'
+      `);
+      expect(columns).toHaveLength(1);
+      const { rows: indexes } = await db.query(`
+        SELECT indexname
+          FROM pg_indexes
+         WHERE schemaname = 'public'
+           AND tablename = 'timeline_entries'
+           AND indexname = 'idx_timeline_managed_page'
+      `);
+      expect(indexes).toHaveLength(1);
+      const { rows: rawOwnership } = await db.query(`
+        SELECT source, managed_by
+          FROM timeline_entries te JOIN pages p ON p.id = te.page_id
+         WHERE p.source_id = 'default' AND p.slug = 'migration/timeline-owner'
+         ORDER BY source
+      `);
+      const ownership = rawOwnership as Array<{ source: string; managed_by: string | null }>;
+      expect(ownership.find(r => r.source === 'gbrain-markdown:Meeting')?.managed_by)
+        .toBe('gbrain:markdown-timeline:v1');
+      expect(ownership.find(r => r.source === 'Meeting')?.managed_by).toBeNull();
+
+      // Idempotent replay on the now-current shape.
+      await engine.initSchema();
+      expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30000);
+
   test('pre-v0.13 links shape: bootstrap adds link_source + origin_page_id', async () => {
     // Issues #266 / #357 — pre-v0.13 brains had `links` without
     // `link_source` / `origin_page_id`. Schema blob's

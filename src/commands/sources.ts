@@ -27,6 +27,7 @@ import { writeFileSync, unlinkSync, existsSync } from 'fs';
 import { join } from 'path';
 import { createHash } from 'crypto';
 import type { BrainEngine } from '../core/engine.ts';
+import type { HardenOpts } from '../core/brain-repo-durability.ts';
 import {
   assessDestructiveImpact,
   checkDestructiveConfirmation,
@@ -95,6 +96,21 @@ interface SourceListEntry {
 // with existing call sites that import `parseConfig`/`isFederated` by intent.
 const parseConfig = parseSourceConfig;
 const isFederated = isSourceFederated;
+
+/** Build the managed-source hardening boundary from the just-persisted row. */
+export function buildManagedSourceHardenOptions(
+  created: Pick<OpsSourceRow, 'id' | 'local_path'>,
+  registeredRemoteUrl: string,
+  pat: string,
+): HardenOpts {
+  if (!created.local_path) throw new Error(`Managed source "${created.id}" has no clone path`);
+  return {
+    repoPath: created.local_path,
+    sourceId: created.id,
+    expectedRemoteUrl: registeredRemoteUrl,
+    pat,
+  };
+}
 
 async function fetchSource(engine: BrainEngine, id: string): Promise<SourceRow | null> {
   const rows = await engine.executeRaw<SourceRow>(
@@ -200,7 +216,7 @@ async function runAdd(engine: BrainEngine, args: string[]): Promise<void> {
       } else {
         console.error('[gbrain] Hardening brain repo for durability…');
         const report = await hardenBrainRepo({
-          repoPath: created.local_path, sourceId: id, pat: pat.token,
+          ...buildManagedSourceHardenOptions(created, finalRemoteUrl, pat.token),
           logger: (l) => console.error(`  ${l}`),
         });
         if (report.needs_attention.length) {
@@ -405,7 +421,12 @@ async function runRemove(engine: BrainEngine, args: string[]): Promise<void> {
   // repo/cron/credential independently.
   try {
     const { unhardenBrainRepo } = await import('../core/brain-repo-durability.ts');
-    await unhardenBrainRepo({ repoPath: src.local_path ?? '', sourceId: id, logger: (l) => console.error(l) });
+    const configured = parseConfig(src.config);
+    const expectedRemoteUrl = typeof configured.remote_url === 'string' ? configured.remote_url : undefined;
+    await unhardenBrainRepo({
+      repoPath: src.local_path ?? '', sourceId: id, expectedRemoteUrl,
+      logger: (l) => console.error(l),
+    });
   } catch (e) {
     console.error(`[gbrain] durability teardown skipped (non-fatal): ${(e as Error).message}`);
   }
@@ -1337,6 +1358,8 @@ export async function runSources(engine: BrainEngine, args: string[]): Promise<v
     // v0.42.44 brain-repo git durability
     case 'harden':     { const { runHarden } = await import('./sources-harden.ts'); return runHarden(engine, rest); }
     case 'pull':       { const { runPull } = await import('./sources-harden.ts'); return runPull(engine, rest); }
+    case 'push':       { const { runPush } = await import('./sources-harden.ts'); return runPush(rest); }
+    case 'commit-push': { const { runCommitPush } = await import('./sources-harden.ts'); return runCommitPush(rest); }
     case 'unharden':   { const { runUnharden } = await import('./sources-harden.ts'); return runUnharden(engine, rest); }
     case undefined:
     case '--help':
@@ -1391,12 +1414,14 @@ Subcommands:
                                     to the global search.mode bundle).
   harden <id|--all> [--pat-file <p>] [--branch <b>] [--no-cron] [--no-verify] [--dry-run] [--json]
                                     v0.42.44 — make a brain repo durable: local
-                                    auto-push hook, committed commit-push helper,
+                                    auto-push hook, trusted installed commit CLI,
                                     always-on agent rules, 30-min pull cron, and
-                                    repo-scoped credential. Idempotent.
+                                    owner-only GBrain credential store. Idempotent.
   pull <id> | --path <dir> [--branch <b>]
                                     Divergence-safe rebase-pull (skip-on-dirty).
                                     --path is DB-free (the harden cron's entry).
+  push --path <dir> [--branch <b>]  Policy-checked DB-free push used by the
+                                    local durability hook.
   unharden <id>                     Remove durability cron/hook/credential wiring.
 
 Source id: [a-z0-9-]{1,32}. Immutable citation key.

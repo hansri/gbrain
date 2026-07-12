@@ -20,6 +20,17 @@ describe('migrate', () => {
   // and are covered in the E2E suite (test/e2e/mechanical.test.ts)
 });
 
+describe('migration v126 — explicit managed timeline ownership', () => {
+  test('adopts only the reserved legacy extractor namespace', () => {
+    const migration = MIGRATIONS.find(m => m.version === 126);
+    expect(migration?.name).toBe('timeline_entries_explicit_managed_owner');
+    expect(migration?.sql).toContain('ADD COLUMN IF NOT EXISTS managed_by TEXT');
+    expect(migration?.sql).toContain("SET managed_by = 'gbrain:markdown-timeline:v1'");
+    expect(migration?.sql).toContain('newer.managed_by IS NOT NULL');
+    expect(migration?.sql).toContain("source LIKE 'gbrain-markdown:%'");
+  });
+});
+
 // v0.28.5 — A1: cheap probe used by `connectEngine` to gate `initSchema()`
 // so already-migrated brains don't pay the schema-replay cost on every
 // short-lived CLI invocation. Closes #651 in cooperation with X1's
@@ -2242,4 +2253,76 @@ describe('v117 — context_volunteer_events_table', () => {
     );
     expect(left.map(r => r.slug)).toEqual(['people/alice-example']);
   });
+});
+
+describe('v124 — pages_source_path_single_owner', () => {
+  const migration = MIGRATIONS.find(m => m.version === 124);
+
+  test('declares a fail-closed duplicate preflight and partial unique index', () => {
+    expect(migration?.name).toBe('pages_source_path_single_owner');
+    expect(migration?.idempotent).toBe(true);
+    expect(migration?.sql).toContain('HAVING COUNT(*) > 1');
+    expect(migration?.sql).toContain('v124 source_path ownership preflight failed');
+    expect(migration?.sql).toContain('CREATE UNIQUE INDEX IF NOT EXISTS pages_source_path_owner_uniq');
+    expect(migration?.sql).toContain('ON pages(source_id, source_path)');
+    expect(migration?.sql).toContain('WHERE source_path IS NOT NULL');
+  });
+
+  test('aborts without guessing when legacy duplicate owners exist', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      await engine.executeRaw(`DROP INDEX pages_source_path_owner_uniq`);
+      await engine.executeRaw(
+        `INSERT INTO pages
+           (source_id, slug, source_path, type, title, compiled_truth, timeline, frontmatter)
+         VALUES
+           ('default', 'dupe/a', 'dupe/shared.md', 'note', 'A', '', '', '{}'::jsonb),
+           ('default', 'dupe/b', 'dupe/shared.md', 'note', 'B', '', '', '{}'::jsonb)`,
+      );
+      await expect(engine.runMigration(124, migration!.sql!))
+        .rejects.toThrow('v124 source_path ownership preflight failed');
+      const indexes = await engine.executeRaw<{ indexname: string }>(
+        `SELECT indexname FROM pg_indexes WHERE indexname = 'pages_source_path_owner_uniq'`,
+      );
+      expect(indexes).toHaveLength(0);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 60_000);
+});
+
+describe('v125 — gbrain_cycle_locks_owner_token', () => {
+  const migration = MIGRATIONS.find(m => m.version === 125);
+
+  test('adds, backfills, and fences the acquisition-specific owner token', () => {
+    expect(migration?.name).toBe('gbrain_cycle_locks_owner_token');
+    expect(migration?.idempotent).toBe(true);
+    expect(migration?.sql).toContain('ADD COLUMN IF NOT EXISTS holder_token TEXT');
+    expect(migration?.sql).toContain("WHERE holder_token IS NULL OR holder_token = ''");
+    expect(migration?.sql).toContain('ALTER COLUMN holder_token SET NOT NULL');
+    expect(migration?.sql).toContain("ALTER COLUMN holder_token SET DEFAULT 'legacy-unfenced'");
+  });
+
+  test('fresh schema exposes a non-null holder_token column', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      const rows = await engine.executeRaw<{
+        is_nullable: string;
+        column_default: string | null;
+      }>(
+        `SELECT is_nullable, column_default
+           FROM information_schema.columns
+          WHERE table_name = 'gbrain_cycle_locks' AND column_name = 'holder_token'`,
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.is_nullable).toBe('NO');
+      expect(rows[0]!.column_default).toContain('legacy-unfenced');
+    } finally {
+      await engine.disconnect();
+    }
+  }, 60_000);
 });

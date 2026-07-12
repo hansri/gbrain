@@ -184,6 +184,35 @@ describe('runModePicker non-TTY surfaces full matrix + [AGENT] directive', () =>
 });
 
 describe('runModePicker — non-TTY auto-select + idempotent', () => {
+  test('--non-interactive auto-selects even when stdin reports a TTY', async () => {
+    const ownDescriptor = Object.getOwnPropertyDescriptor(process.stdin, 'isTTY');
+    const inheritedValue = process.stdin.isTTY;
+    const originalLog = console.log;
+    const captured: string[] = [];
+
+    Object.defineProperty(process.stdin, 'isTTY', {
+      configurable: true,
+      value: true,
+    });
+    console.log = (...args: unknown[]) => {
+      captured.push(args.map(String).join(' '));
+    };
+
+    try {
+      const picked = await runModePicker(engine, { nonInteractive: true });
+      expect(await engine.getConfig('search.mode')).toBe(picked);
+      expect(captured.join('\n')).toContain('[AGENT]');
+    } finally {
+      console.log = originalLog;
+      if (ownDescriptor) {
+        Object.defineProperty(process.stdin, 'isTTY', ownDescriptor);
+      } else {
+        delete (process.stdin as unknown as { isTTY?: boolean }).isTTY;
+        expect(process.stdin.isTTY).toBe(inheritedValue);
+      }
+    }
+  }, 5_000);
+
   test('non-TTY auto-selects + writes config + emits operator hint', async () => {
     // Bun test runs non-TTY by default.
     const picked = await runModePicker(engine);

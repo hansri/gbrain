@@ -6,7 +6,7 @@
  * documented escape hatch the durability paths honor).
  */
 import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync, existsSync, mkdirSync, chmodSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { execFileSync } from 'child_process';
@@ -128,6 +128,28 @@ describe('divergenceSafePull', () => {
     // Working tree is usable (HEAD is the local commit, not a conflicted state).
     expect(gitIn(work, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('main');
   });
+
+  test('repo-controlled pre-rebase and post-rewrite hooks never execute', () => {
+    const { bare, work } = makePair();
+    const other = secondClone(bare);
+    const hooks = join(work, '.git', 'attacker-hooks');
+    const sentinel = join(root, 'rebase-hook-ran');
+    mkdirSync(hooks);
+    for (const name of ['pre-rebase', 'post-rewrite']) {
+      const hook = join(hooks, name);
+      writeFileSync(hook, `#!/bin/sh\ntouch ${JSON.stringify(sentinel)}\n`);
+      chmodSync(hook, 0o755);
+    }
+    git(work, 'config', 'core.hooksPath', hooks);
+
+    writeFileSync(join(other, 'remote.txt'), 'remote\n');
+    git(other, 'add', 'remote.txt'); git(other, 'commit', '-qm', 'remote'); git(other, 'push', '-q', 'origin', 'main');
+    writeFileSync(join(work, 'local.txt'), 'local\n');
+    git(work, 'add', 'local.txt'); git(work, 'commit', '-qm', 'local');
+
+    expect(() => divergenceSafePull(work, 'main')).toThrow(/unsafe repo-local executable\/network config/);
+    expect(existsSync(sentinel)).toBe(false);
+  });
 });
 
 describe('pushProbe', () => {
@@ -149,5 +171,41 @@ describe('pushProbe', () => {
     const r = pushProbe(work, 'main', { redactDetail: (s) => s.replaceAll('ghp_SECRETTOKEN', '***') });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.detail.includes('ghp_SECRETTOKEN')).toBe(false);
+  });
+
+  test('repo-controlled pre-push hook never executes', () => {
+    const { work } = makePair();
+    const hooks = join(work, '.git', 'attacker-hooks');
+    const sentinel = join(root, 'pre-push-ran');
+    mkdirSync(hooks);
+    const hook = join(hooks, 'pre-push');
+    writeFileSync(hook, `#!/bin/sh\ntouch ${JSON.stringify(sentinel)}\n`);
+    chmodSync(hook, 0o755);
+    git(work, 'config', 'core.hooksPath', hooks);
+
+    expect(pushProbe(work, 'main').ok).toBe(false);
+    expect(existsSync(sentinel)).toBe(false);
+  });
+
+  test('clean filter and signer config are rejected before status/rebase can execute them', () => {
+    for (const mode of ['filter', 'signer'] as const) {
+      const { work } = makePair();
+      const sentinel = join(root, `${mode}-ran`);
+      const executable = join(root, `${mode}.sh`);
+      writeFileSync(executable, `#!/bin/sh\ntouch ${JSON.stringify(sentinel)}\ncat\n`);
+      chmodSync(executable, 0o755);
+      if (mode === 'filter') {
+        writeFileSync(join(work, '.gitattributes'), '*.md filter=hostile\n');
+        git(work, 'config', 'filter.hostile.clean', executable);
+        writeFileSync(join(work, 'README.md'), 'dirty\n');
+      } else {
+        git(work, 'config', 'commit.gpgSign', 'true');
+        git(work, 'config', 'gpg.program', executable);
+      }
+
+      expect(() => divergenceSafePull(work, 'main', { expectedRemoteUrl: git(work, 'remote', 'get-url', 'origin') }))
+        .toThrow(/unsafe repo-local executable\/network config/);
+      expect(existsSync(sentinel)).toBe(false);
+    }
   });
 });

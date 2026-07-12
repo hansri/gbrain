@@ -1262,6 +1262,7 @@ export interface TimelineEntry {
   source: string;
   summary: string;
   detail: string;
+  managed_by?: string | null;
   created_at: Date;
 }
 

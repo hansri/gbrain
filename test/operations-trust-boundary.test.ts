@@ -247,6 +247,25 @@ describe('handler invocation — historically-broken trust-boundary classes', ()
     expect(result).toMatchObject({ dry_run: true, action: 'submit_job', name: 'shell' });
   });
 
+  test('submit_job overwrites caller sourceId with authenticated ctx.sourceId', async () => {
+    // resetPgliteState preserves the base schema marker (v1), while the
+    // minion queue intentionally refuses to run below its migration gate.
+    // The fixture schema already contains minion_jobs, so advance only to the
+    // queue's minimum supported version for this handler-level contract test.
+    await engine.setConfig('version', '7');
+    const submitJob = operations.find(op => op.name === 'submit_job')!;
+    const ctx = makeContext({ remote: true, sourceId: 'trusted-source' });
+    const result = await submitJob.handler(ctx, {
+      name: 'import',
+      data: { dir: '/tmp/fixture', sourceId: 'spoofed-source', noEmbed: true },
+    }) as { id: number };
+    const rows = await engine.executeRaw<{ data: Record<string, unknown> }>(
+      `SELECT data FROM minion_jobs WHERE id = $1`,
+      [result.id],
+    );
+    expect(rows[0]?.data.sourceId).toBe('trusted-source');
+  });
+
   test('search_by_image rejects image_path with ctx.remote=true (D18 P0)', async () => {
     const searchByImage = operations.find(op => op.name === 'search_by_image');
     expect(searchByImage).toBeDefined();

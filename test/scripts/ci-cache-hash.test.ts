@@ -36,7 +36,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { devNull, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const REPO_ROOT = resolve(import.meta.dir, "..", "..");
@@ -47,12 +47,26 @@ interface Sandbox {
   scriptPath: string;
 }
 
+function git(cwd: string, ...args: string[]): void {
+  execFileSync("git", args, {
+    cwd,
+    env: {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: devNull,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_AUTHOR_NAME: "Test",
+      GIT_AUTHOR_EMAIL: "test@example.com",
+      GIT_COMMITTER_NAME: "Test",
+      GIT_COMMITTER_EMAIL: "test@example.com",
+    },
+  });
+}
+
 function makeSandbox(files: Record<string, string>): Sandbox {
   const dir = mkdtempSync(join(tmpdir(), "ci-cache-hash-"));
   // Init git repo
-  execFileSync("git", ["init", "--quiet"], { cwd: dir });
-  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: dir });
-  execFileSync("git", ["config", "user.name", "Test"], { cwd: dir });
+  git(dir, "init", "--quiet");
 
   // Copy script under scripts/ so cd "$(dirname "$0")/.." lands at sandbox root
   mkdirSync(join(dir, "scripts"), { recursive: true });
@@ -66,8 +80,8 @@ function makeSandbox(files: Record<string, string>): Sandbox {
   }
 
   // Stage + commit so git ls-files returns them
-  execFileSync("git", ["add", "-A"], { cwd: dir });
-  execFileSync("git", ["commit", "--quiet", "-m", "fixture"], { cwd: dir });
+  git(dir, "add", "-A");
+  git(dir, "commit", "--quiet", "-m", "fixture");
 
   return { dir, scriptPath: join(dir, "scripts/ci-cache-hash.sh") };
 }
@@ -89,10 +103,8 @@ function modify(s: Sandbox, path: string, content: string) {
   // the working tree. Stage + commit so the change is visible to the
   // hash. This matches what CI sees on a checked-out PR (committed
   // tree, not working tree).
-  execFileSync("git", ["add", path], { cwd: s.dir });
-  execFileSync("git", ["commit", "--quiet", "-m", `modify ${path}`], {
-    cwd: s.dir,
-  });
+  git(s.dir, "add", path);
+  git(s.dir, "commit", "--quiet", "-m", `modify ${path}`);
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -330,7 +342,7 @@ describe("ci-cache-hash.sh — edge cases", () => {
   it("rename detection: same content, new path → DIFFERENT hash", () => {
     withSandbox(BASELINE_FILES, (sb) => {
       const before = hash(sb);
-      execFileSync("git", ["mv", "src/cli.ts", "src/main.ts"], { cwd: sb.dir });
+      git(sb.dir, "mv", "src/cli.ts", "src/main.ts");
       const after = hash(sb);
       // Same content, new path. Our hash includes the path, so it changes.
       // This is correct: a rename can absolutely affect test outcomes
@@ -348,10 +360,8 @@ describe("ci-cache-hash.sh — edge cases", () => {
       // tests read).
       mkdirSync(join(sb.dir, "prompts"), { recursive: true });
       writeFileSync(join(sb.dir, "prompts/extract-takes.md"), "system prompt\n");
-      execFileSync("git", ["add", "prompts/extract-takes.md"], { cwd: sb.dir });
-      execFileSync("git", ["commit", "--quiet", "-m", "add prompts"], {
-        cwd: sb.dir,
-      });
+      git(sb.dir, "add", "prompts/extract-takes.md");
+      git(sb.dir, "commit", "--quiet", "-m", "add prompts");
       const after = hash(sb);
       expect(after).not.toBe(before);
     });
@@ -366,19 +376,15 @@ describe("ci-cache-hash.sh — edge cases", () => {
     withSandbox(BASELINE_FILES, (sb) => {
       // Create a symlink and commit.
       symlinkSync("./db.ts", join(sb.dir, "src/core/db-link.ts"));
-      execFileSync("git", ["add", "src/core/db-link.ts"], { cwd: sb.dir });
-      execFileSync("git", ["commit", "--quiet", "-m", "add link"], {
-        cwd: sb.dir,
-      });
+      git(sb.dir, "add", "src/core/db-link.ts");
+      git(sb.dir, "commit", "--quiet", "-m", "add link");
       const before = hash(sb);
       // Point the symlink elsewhere — and commit so it lands in the
       // index that `git ls-files -s` reads.
       rmSync(join(sb.dir, "src/core/db-link.ts"));
       symlinkSync("./cli.ts", join(sb.dir, "src/core/db-link.ts"));
-      execFileSync("git", ["add", "src/core/db-link.ts"], { cwd: sb.dir });
-      execFileSync("git", ["commit", "--quiet", "-m", "repoint link"], {
-        cwd: sb.dir,
-      });
+      git(sb.dir, "add", "src/core/db-link.ts");
+      git(sb.dir, "commit", "--quiet", "-m", "repoint link");
       const after = hash(sb);
       expect(after).not.toBe(before);
     });

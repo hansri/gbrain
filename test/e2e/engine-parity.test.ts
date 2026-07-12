@@ -18,14 +18,27 @@ import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import type { ChunkInput, SearchResult } from '../../src/core/types.ts';
 import type { BrainEngine } from '../../src/core/engine.ts';
 import { hasDatabase, setupDB, teardownDB, getEngine } from './helpers.ts';
+import {
+  DEFAULT_EMBEDDING_DIMENSIONS,
+  DEFAULT_EMBEDDING_MODEL,
+} from '../../src/core/ai/defaults.ts';
+import { configureGateway } from '../../src/core/ai/gateway.ts';
 
 const SKIP_PG = !hasDatabase();
 const describeBoth = SKIP_PG ? describe.skip : describe;
 
-function basisEmbedding(idx: number, dim = 1536): Float32Array {
+function basisEmbedding(idx: number, dim = DEFAULT_EMBEDDING_DIMENSIONS): Float32Array {
   const emb = new Float32Array(dim);
   emb[idx % dim] = 1.0;
   return emb;
+}
+
+function configureCanonicalTestEmbedding(): void {
+  configureGateway({
+    embedding_model: DEFAULT_EMBEDDING_MODEL,
+    embedding_dimensions: DEFAULT_EMBEDDING_DIMENSIONS,
+    env: {},
+  });
 }
 
 interface SeedPage {
@@ -133,6 +146,7 @@ describeBoth('Engine parity — Postgres vs PGLite', () => {
   let pgliteEngine: PGLiteEngine;
 
   beforeAll(async () => {
+    configureCanonicalTestEmbedding();
     pgEngine = await setupDB();
     await seedEngine(pgEngine);
 
@@ -627,6 +641,7 @@ describeBoth('Engine parity — relationalFanout', () => {
   let pgliteEngine: PGLiteEngine;
 
   beforeAll(async () => {
+    configureCanonicalTestEmbedding();
     pgEngine = await setupDB();
     await seedRelational(pgEngine);
     pgliteEngine = new PGLiteEngine();
@@ -699,6 +714,7 @@ describeBoth('Engine parity — federated sourceIds[] secondary reads (#2200)', 
   const grant = { sourceIds: ['beta'] };
 
   beforeAll(async () => {
+    configureCanonicalTestEmbedding();
     pgEngine = await setupDB();
     await seedFederated(pgEngine);
     pgliteEngine = new PGLiteEngine();

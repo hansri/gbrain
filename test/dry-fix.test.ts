@@ -1,8 +1,8 @@
 import { describe, test, expect, afterEach } from "bun:test";
 import { join } from "path";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "fs";
-import { tmpdir } from "os";
-import { execSync } from "child_process";
+import { devNull, tmpdir } from "os";
+import { execFileSync } from "child_process";
 import {
   autoFixDryViolations,
   isInsideCodeFence,
@@ -17,6 +17,23 @@ import {
 // ---------------------------------------------------------------------------
 
 let fixtures: string[] = [];
+
+function git(cwd: string, ...args: string[]): void {
+  execFileSync("git", args, {
+    cwd,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: devNull,
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_AUTHOR_NAME: "test",
+      GIT_AUTHOR_EMAIL: "test@test",
+      GIT_COMMITTER_NAME: "test",
+      GIT_COMMITTER_EMAIL: "test@test",
+    },
+  });
+}
 
 afterEach(() => {
   for (const f of fixtures) {
@@ -38,10 +55,9 @@ function makeSkillsFixture(files: Record<string, string>, opts: { gitInit?: bool
     writeFileSync(join(dir, name, "SKILL.md"), body);
   }
   if (opts.gitInit) {
-    execSync("git init --quiet", { cwd: dir });
-    execSync("git config user.email test@test", { cwd: dir });
-    execSync("git config user.name test", { cwd: dir });
-    execSync("git add -A && git commit --quiet -m init", { cwd: dir });
+    git(dir, "init", "--quiet");
+    git(dir, "add", "-A");
+    git(dir, "commit", "--quiet", "-m", "init");
   }
   return dir;
 }

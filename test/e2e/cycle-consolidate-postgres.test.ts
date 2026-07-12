@@ -13,6 +13,7 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { setupDB, teardownDB, hasDatabase, getEngine } from './helpers.ts';
 import { runPhaseConsolidate } from '../../src/core/cycle/phases/consolidate.ts';
+import { DEFAULT_EMBEDDING_DIMENSIONS } from '../../src/core/ai/defaults.ts';
 
 const RUN = hasDatabase();
 const d = RUN ? describe : describe.skip;
@@ -22,7 +23,7 @@ afterAll(async () => { if (RUN) await teardownDB(); });
 
 const oldDate = () => new Date(Date.now() - 30 * 60 * 60 * 1000).toISOString();
 function unitVec(): string {
-  const a = new Float32Array(1536);
+  const a = new Float32Array(DEFAULT_EMBEDDING_DIMENSIONS);
   a[0] = 1.0;
   return '[' + Array.from(a).join(',') + ']';
 }

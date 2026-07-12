@@ -95,6 +95,17 @@ export async function setupDB(): Promise<PostgresEngine> {
     }
   }
 
+  // Reset the source authority after dependent rows are gone. The old helper
+  // left non-default `sources` behind, so cwd/local_path resolution in a later
+  // file could silently query a stale source even though its pages were gone.
+  // TRUNCATE ... CASCADE also clears source-owned tables not yet represented in
+  // ALL_TABLES (including restricted auth bindings) without FK-order races.
+  await conn.unsafe(`TRUNCATE sources CASCADE`);
+  await conn.unsafe(`
+    INSERT INTO sources (id, name, config)
+    VALUES ('default', 'default', '{"federated": true}'::jsonb)
+  `);
+
   // Re-seed config (initSchema inserts default config rows)
   await conn.unsafe(`
     INSERT INTO config (key, value) VALUES ('schema_version', '1')

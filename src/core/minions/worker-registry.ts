@@ -143,21 +143,45 @@ function processLiveness(pid: number): 'alive' | 'dead' | 'unknown' {
 }
 
 /**
- * Best-effort process start time (epoch ms) via `ps`. Used for the PID-reuse
- * guard: a stale `worker-<pid>.json` plus an OS-reused pid would otherwise make
- * us report an unrelated process's niceness (Codex #8). Returns null when
- * undeterminable — callers must NOT treat null as "reused".
+ * Parse the portable `ps -o etime=` shape into elapsed milliseconds.
+ * Supported forms are `MM:SS`, `HH:MM:SS`, and `DD-HH:MM:SS`.
+ *
+ * `ps -o lstart=` deliberately is not used here: its output has no timezone.
+ * Bun's test runner can parse that timezone-less string as UTC while `ps`
+ * emitted local time, shifting the inferred start by the local UTC offset and
+ * making a newly registered live worker look like a reused PID.
+ */
+export function parseElapsedProcessTimeMs(raw: string): number | null {
+  const match = /^(?:(\d+)-)?(?:(\d+):)?(\d{1,2}):(\d{2})$/.exec(raw.trim());
+  if (!match) return null;
+  const days = Number(match[1] ?? 0);
+  const hours = Number(match[2] ?? 0);
+  const minutes = Number(match[3]);
+  const seconds = Number(match[4]);
+  if (![days, hours, minutes, seconds].every(Number.isSafeInteger)) return null;
+  if (minutes >= 60 || seconds >= 60 || (match[2] !== undefined && hours >= 24)) {
+    return null;
+  }
+  return (((days * 24 + hours) * 60 + minutes) * 60 + seconds) * 1000;
+}
+
+/**
+ * Best-effort process start time (epoch ms) via elapsed runtime from `ps`.
+ * Used for the PID-reuse guard: a stale `worker-<pid>.json` plus an OS-reused
+ * pid would otherwise make us report an unrelated process's niceness (Codex
+ * #8). Returns null when undeterminable — callers must NOT treat null as
+ * "reused".
  */
 function processStartMs(pid: number): number | null {
   try {
-    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+    const out = execFileSync('ps', ['-o', 'etime=', '-p', String(pid)], {
       encoding: 'utf8',
       timeout: 2000,
       stdio: ['ignore', 'pipe', 'ignore'],
     }).trim();
     if (!out) return null;
-    const t = Date.parse(out);
-    return Number.isNaN(t) ? null : t;
+    const elapsedMs = parseElapsedProcessTimeMs(out);
+    return elapsedMs === null ? null : Date.now() - elapsedMs;
   } catch {
     return null;
   }

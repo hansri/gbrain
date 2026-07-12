@@ -2,6 +2,29 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.59.0] - 2026-07-12
+
+**Multi-source sync can now finish cleanly after interruptions without crossing source boundaries, publishing half-written files, or deleting content it could not prove was gone.** A sync owns one source at a time, stages file objects before publishing them, and fences its final commit against the same database and source state it started from. When a source is partial, a file is unreadable, or a rename batch cannot finish, gbrain preserves the last known-good data and records a resumable failure instead of guessing. The result is a brain that converges deterministically across repeated runs and is much easier to recover after a crash, network loss, or overlapping scheduler tick.
+
+### Added
+- **Per-source writer leases and commit fences.** Import, sync, stale extraction, and file publication coordinate through one source-scoped lease. The final write verifies the database identity and lease owner before advancing checkpoints, so a resumed process cannot commit into a different brain or over a newer writer.
+- **Content-addressed file staging with atomic publication.** Imported file objects land in a source-confined staging area, are verified, and are promoted atomically. Object paths carry source ownership, and remote/untrusted callers cannot resolve or publish outside their granted source.
+- **Full-convergence evidence.** A source records the complete observed path set before destructive reconciliation. Deletion happens only when the scan is complete; partial listings, lookup failures, unreadable files, and cancelled runs retain the last known-good page and leave an actionable failure record.
+- **Migrations v123-v126.** File storage identity, single-owner source paths, renewable lock ownership, and explicit timeline ownership are enforced on existing Postgres and PGLite brains.
+
+### Fixed
+- **Overlapping or interrupted syncs no longer corrupt convergence state.** Rename batches roll back as a unit, checkpoint writes are source-scoped and append-safe, stale owners cannot release a newer lease, and no-change reruns produce no material diff.
+- **Git-backed durability ignores machine-global hooks and signing configuration.** Repository recovery and promotion use bounded, explicit Git invocations, validate remotes and refs, and fail loudly instead of inheriting a workstation hook or silently losing a commit.
+- **Extraction and file reads stay source-isolated.** Timeline ownership, stale extraction, image/file metadata, aliases, and by-path resolution retain the originating source instead of collapsing equal slugs or basenames across sources.
+- **`gbrain init --non-interactive` never prompts on a terminal.** Search-mode selection now honors the flag even when stdin is a TTY, so automated installs cannot hang on the 60-second picker.
+
+### Changed
+- **Parallel test and E2E runners are bounded and deterministic.** Weighted sharding, per-file timeouts, hermetic Git fixtures, explicit Postgres lifecycle checks, and warning-strict verification make local and CI failures reproducible without hiding resource exhaustion.
+- **Operational status exposes incomplete work honestly.** Doctor, source status, jobs, and failure ledgers distinguish active, partial, resumable, and fully converged states instead of reporting a healthy-looking success after only part of a source completed.
+
+### To take advantage of v0.42.59.0
+Run `gbrain upgrade`, then `gbrain apply-migrations --yes` and `gbrain doctor`. Run `gbrain sync --all` once to reconcile each source under the new lease and convergence rules. No source deletion or manual data rewrite is required; incomplete sources remain preserved until a later complete run proves the final state.
+
 ## [0.42.58.0] - 2026-07-06
 
 **gbrain now runs cleanly on the stack you already have — a local Ollama box, a self-hosted LiteLLM proxy, llama.cpp's llama-server, or gbrain running as a Claude Code MCP subprocess — instead of silently degrading or hard-failing when you're not on a raw OpenAI/Anthropic key.** A provider-agnostic plumbing pass across the AI gateway: environment handling, base-URL normalization, and embedding-dimension validation all stop tripping on the non-frontier-vendor setups that used to fail without a clear signal.

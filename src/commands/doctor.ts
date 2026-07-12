@@ -4158,6 +4158,184 @@ export function buildRetrievalReflexCheck(skillsDir: string | null): Check {
   }
 }
 
+type ImageAssetStorageProbe = {
+  exists(path: string): Promise<boolean>;
+};
+
+export interface ImageAssetsHealthDeps {
+  /** Test seam; undefined resolves the configured backend, null forces legacy mode. */
+  resolveStorage?: () => Promise<ImageAssetStorageProbe | null>;
+  /** Legacy absolute-path probe. Object keys must never reach this seam. */
+  statLocalPath?: (path: string) => void;
+}
+
+async function resolveConfiguredImageAssetStorage(): Promise<ImageAssetStorageProbe | null> {
+  const config = loadConfig();
+  if (!config?.storage) return null;
+  const { createStorage } = await import('../core/storage.ts');
+  return createStorage(config.storage as any);
+}
+
+/**
+ * Verify image-file references through the configured storage backend.
+ *
+ * `files.storage_path` is an object key for current S3/Supabase/local-storage
+ * rows, not a host filesystem path. Only an absolute path is treated as a
+ * legacy local-file row, even when a backend is configured. Relative keys with a
+ * missing storage configuration are reported as unverifiable instead of being
+ * misclassified by `statSync()` against the doctor's current working directory.
+ */
+export async function imageAssetsHealthCheck(
+  engine: BrainEngine,
+  deps: ImageAssetsHealthDeps = {},
+): Promise<Check | null> {
+  let rows: Array<{ source_id: string; storage_path: string }>;
+  try {
+    rows = await engine.executeRaw<{ source_id: string; storage_path: string }>(
+      `SELECT source_id, storage_path FROM files WHERE mime_type LIKE 'image/%' LIMIT 1000`,
+    );
+  } catch {
+    // Pre-v36 brains may not have the files table on PGLite — quiet skip.
+    return null;
+  }
+
+  if (rows.length === 0) {
+    return { name: 'image_assets', status: 'ok', message: 'No image assets indexed yet' };
+  }
+
+  let storage: ImageAssetStorageProbe | null;
+  try {
+    storage = await (deps.resolveStorage ?? resolveConfiguredImageAssetStorage)();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      name: 'image_assets',
+      status: 'warn',
+      message:
+        `Could not initialize configured storage to verify ${rows.length} image(s): ${message}. ` +
+        'Fix the storage configuration, then run `gbrain files verify --source <id>`.',
+      details: { checked: 0, missing: 0, unverifiable: rows.length, probe_errors: 1 },
+    };
+  }
+
+  const statLocalPath = deps.statLocalPath ?? ((path: string) => { statSync(path); });
+  let checked = 0;
+  let storageChecked = 0;
+  let legacyChecked = 0;
+  let missing = 0;
+  let storageMissing = 0;
+  let legacyMissing = 0;
+  let unverifiable = 0;
+  let probeErrors = 0;
+  const storageMissingPaths: string[] = [];
+  const legacyMissingPaths: string[] = [];
+  const unverifiablePaths: string[] = [];
+
+  for (const row of rows) {
+    const label = `${row.source_id}:${row.storage_path}`;
+    // Absolute paths are the only supported legacy-local representation.
+    // Current publishers always emit relative source-qualified object keys.
+    if (isAbsolute(row.storage_path)) {
+      try {
+        statLocalPath(row.storage_path);
+        checked++;
+        legacyChecked++;
+      } catch {
+        missing++;
+        legacyMissing++;
+        if (legacyMissingPaths.length < 5) legacyMissingPaths.push(label);
+      }
+      continue;
+    }
+
+    if (storage) {
+      try {
+        if (await storage.exists(row.storage_path)) {
+          checked++;
+          storageChecked++;
+        } else {
+          missing++;
+          storageMissing++;
+          if (storageMissingPaths.length < 5) storageMissingPaths.push(label);
+        }
+      } catch {
+        probeErrors++;
+        if (unverifiablePaths.length < 5) unverifiablePaths.push(label);
+      }
+      continue;
+    }
+
+    unverifiable++;
+    if (unverifiablePaths.length < 5) unverifiablePaths.push(label);
+  }
+
+  const mode = storageChecked > 0 && legacyChecked > 0
+    ? 'mixed'
+    : storageChecked > 0
+      ? 'configured_storage'
+      : legacyChecked > 0
+        ? 'legacy_local_paths'
+        : storage
+          ? 'configured_storage'
+          : 'unconfigured';
+  const details = {
+    checked,
+    storage_checked: storageChecked,
+    legacy_checked: legacyChecked,
+    missing,
+    storage_missing: storageMissing,
+    legacy_missing: legacyMissing,
+    unverifiable,
+    probe_errors: probeErrors,
+    mode,
+  };
+  if (missing === 0 && unverifiable === 0 && probeErrors === 0) {
+    return {
+      name: 'image_assets',
+      status: 'ok',
+      message: mode === 'mixed'
+        ? `${rows.length} image(s) all present across configured storage and legacy absolute local paths`
+        : mode === 'configured_storage'
+          ? `${rows.length} image(s) all present in configured storage`
+          : `${rows.length} image(s) all present at legacy absolute local paths`,
+      details,
+    };
+  }
+
+  const issues: string[] = [];
+  if (storageMissing > 0) {
+    issues.push(
+      `${storageMissing} of ${rows.length} image(s) missing from configured storage ` +
+      `(e.g. ${storageMissingPaths.join(', ')})`,
+    );
+  }
+  if (legacyMissing > 0) {
+    issues.push(
+      `${legacyMissing} of ${rows.length} image(s) missing from legacy absolute local paths ` +
+      `(e.g. ${legacyMissingPaths.join(', ')})`,
+    );
+  }
+  if (unverifiable > 0) {
+    issues.push(
+      `${unverifiable} relative object key(s) unverifiable because no storage backend is configured ` +
+      `(e.g. ${unverifiablePaths.join(', ')})`,
+    );
+  }
+  if (probeErrors > 0) {
+    issues.push(
+      `${probeErrors} configured-storage probe(s) errored ` +
+      `(e.g. ${unverifiablePaths.join(', ')})`,
+    );
+  }
+  return {
+    name: 'image_assets',
+    status: 'warn',
+    message: `${issues.join('; ')}. Fix the storage configuration or object, then run ` +
+      '`gbrain files verify --source <id>`.',
+    details,
+  };
+}
+
 export async function buildChecks(
   engine: BrainEngine | null,
   args: string[],
@@ -7152,36 +7330,8 @@ export async function buildChecks(
   // sibling SQL via raw query for cross-engine compatibility.
   if (engine) {
     progress.heartbeat('image_assets');
-    try {
-      const rows = await engine.executeRaw<{ storage_path: string }>(
-        `SELECT storage_path FROM files WHERE mime_type LIKE 'image/%' LIMIT 1000`
-      );
-      let vanished = 0;
-      const vanishedPaths: string[] = [];
-      const fs = await import('node:fs');
-      for (const r of rows) {
-        try {
-          fs.statSync(r.storage_path);
-        } catch {
-          vanished++;
-          if (vanishedPaths.length < 5) vanishedPaths.push(r.storage_path);
-        }
-      }
-      if (rows.length === 0) {
-        checks.push({ name: 'image_assets', status: 'ok', message: 'No image assets indexed yet' });
-      } else if (vanished === 0) {
-        checks.push({ name: 'image_assets', status: 'ok', message: `${rows.length} image(s) all present on disk` });
-      } else {
-        checks.push({
-          name: 'image_assets',
-          status: 'warn',
-          message: `${vanished} of ${rows.length} image(s) missing from disk (e.g. ${vanishedPaths.join(', ')}). ` +
-                   `Fix: restore from git, or \`gbrain sync --skip-failed\` to acknowledge.`,
-        });
-      }
-    } catch {
-      // Pre-v36 brains may not have the files table on PGLite — quiet skip.
-    }
+    const imageAssets = await imageAssetsHealthCheck(engine);
+    if (imageAssets) checks.push(imageAssets);
 
     // v0.27.1 Eng-1B: ocr_health — counters incremented by importImageFile.
     // Warns when OCR is opted-in (attempted > 0) but never succeeds.

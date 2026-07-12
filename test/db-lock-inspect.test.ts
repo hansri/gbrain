@@ -23,6 +23,7 @@ import {
   deleteLockRow,
   liveSyncStatus,
   syncLockId,
+  LockOwnershipLostError,
 } from '../src/core/db-lock.ts';
 
 let engine: PGLiteEngine;
@@ -137,8 +138,9 @@ describe('deleteLockRow', () => {
     // Row should be gone.
     const snap = await inspectLock(engine, 'gbrain-sync:to-delete');
     expect(snap).toBeNull();
-    // handle.release() would also have run a DELETE — verify it's idempotent.
-    await handle!.release();
+    // A fenced handle must fail closed when an administrative delete removed
+    // its acquisition row; silently succeeding would hide lost ownership.
+    await expect(handle!.release()).rejects.toBeInstanceOf(LockOwnershipLostError);
   });
 
   test('returns deleted=false when row was already cleared (race)', async () => {
@@ -182,7 +184,7 @@ describe('deleteLockRow', () => {
     // Calling again is a no-op (idempotent).
     const r2 = await deleteLockRow(engine, 'gbrain-sync:atomic-test', process.pid);
     expect(r2.deleted).toBe(false);
-    await handle!.release();
+    await expect(handle!.release()).rejects.toBeInstanceOf(LockOwnershipLostError);
   });
 });
 

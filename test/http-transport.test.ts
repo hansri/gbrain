@@ -312,6 +312,42 @@ describe('http-transport: legacy capability boundary', () => {
     }
   });
 
+  test('whoami receives exact legacy tool/source grants without exposing bearer material', async () => {
+    const bearer = 'legacy-auth-evidence-secret';
+    const srv = await startTest({
+      validTokens: new Map([[hash(bearer), {
+        id: 'tok-agent-evidence',
+        name: 'routine-agent',
+        permissions: {
+          scopes: ['read'],
+          allowed_tools: ['whoami', 'get_page', 'search'],
+          source_id: ['shared', 'source-a'],
+        },
+      }]]),
+    });
+    try {
+      const response = await fetch(`${srv.url}/mcp`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${bearer}`, 'Content-Type': 'application/json' },
+        body: rpc('tools/call', { name: 'whoami', arguments: {} }),
+      });
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      const evidence = JSON.parse(body.result.content[0].text);
+      expect(evidence).toMatchObject({
+        transport: 'legacy',
+        token_name: 'routine-agent',
+        allowed_tools: ['get_page', 'search', 'whoami'],
+        source_id: 'shared',
+        allowed_sources: ['shared', 'source-a'],
+      });
+      expect(JSON.stringify(body)).not.toContain(bearer);
+      expect(evidence).not.toHaveProperty('token');
+    } finally {
+      srv.stop();
+    }
+  });
+
   test('tools/call rejects a tool outside the exact allow-list before dispatch', async () => {
     const srv = await startTest({
       validTokens: new Map([[hash(TOKEN), {

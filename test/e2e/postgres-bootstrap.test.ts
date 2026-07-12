@@ -91,6 +91,59 @@ describe.skipIf(skip)('PostgresEngine forward-reference bootstrap (E2E)', () => 
     expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
   });
 
+  test('legacy v125 timeline table upgrades before managed_by index replay', async () => {
+    await engine.initSchema();
+    const conn = (engine as any).sql;
+    await engine.putPage('migration/timeline-owner', {
+      type: 'concept', title: 'Timeline owner', compiled_truth: '', timeline: '', frontmatter: {},
+    });
+    await conn.unsafe(`
+      INSERT INTO timeline_entries (page_id, date, source, summary, detail, managed_by)
+      SELECT id, '2026-07-10', 'gbrain-markdown:Meeting', 'legacy generated', '', NULL
+        FROM pages WHERE source_id = 'default' AND slug = 'migration/timeline-owner';
+      INSERT INTO timeline_entries (page_id, date, source, summary, detail, managed_by)
+      SELECT id, '2026-07-11', 'Meeting', 'manual evidence', '', NULL
+        FROM pages WHERE source_id = 'default' AND slug = 'migration/timeline-owner';
+    `);
+    await conn.unsafe(`
+      DROP INDEX IF EXISTS idx_timeline_managed_page;
+      ALTER TABLE timeline_entries DROP COLUMN IF EXISTS managed_by;
+    `);
+    await engine.setConfig('version', '125');
+
+    await engine.initSchema();
+
+    expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+    const columns = await conn`
+      SELECT column_name
+        FROM information_schema.columns
+       WHERE table_schema = current_schema()
+         AND table_name = 'timeline_entries'
+         AND column_name = 'managed_by'
+    `;
+    expect(columns).toHaveLength(1);
+    const indexes = await conn`
+      SELECT indexname
+        FROM pg_indexes
+       WHERE schemaname = current_schema()
+         AND tablename = 'timeline_entries'
+         AND indexname = 'idx_timeline_managed_page'
+    `;
+    expect(indexes).toHaveLength(1);
+    const ownership = await conn`
+      SELECT source, managed_by
+        FROM timeline_entries te JOIN pages p ON p.id = te.page_id
+       WHERE p.source_id = 'default' AND p.slug = 'migration/timeline-owner'
+       ORDER BY source
+    `;
+    expect(ownership.find((r: any) => r.source === 'gbrain-markdown:Meeting')?.managed_by)
+      .toBe('gbrain:markdown-timeline:v1');
+    expect(ownership.find((r: any) => r.source === 'Meeting')?.managed_by).toBeNull();
+
+    await engine.initSchema();
+    expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+  });
+
   // Migration v120 — schema-lint hardening (#1647 / #171). Postgres-only
   // assertions (security_invoker has no surface on embedded PGLite).
   test('v120: page_links view runs with security_invoker=on (#1647b)', async () => {

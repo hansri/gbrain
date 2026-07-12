@@ -1,8 +1,10 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdirSync, writeFileSync, symlinkSync, rmSync, mkdtempSync } from 'fs';
+import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { collectMarkdownFiles } from '../src/commands/import.ts';
+import { collectMarkdownFiles, collectSyncableFiles, filterSyncableGitBlobs } from '../src/commands/import.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 // These tests exercise the filesystem walker that feeds `gbrain import`.
 // They target L002 (report/findings.md): a malicious symlink inside a shared
@@ -71,6 +73,43 @@ describe('collectMarkdownFiles — symlink containment', () => {
     expect(files).toContain(join(root, 'legit.md'));
     expect(files).not.toContain(join(root, 'linked-notes', 'external.md'));
     expect(files).not.toContain(join(outsideSub, 'external.md'));
+  });
+
+  test('Git enumeration scrubs inherited repo poisoning and still honors .gitignore', async () => {
+    execFileSync('git', ['init', '-q', root]);
+    writeFileSync(join(root, '.gitignore'), 'ignored.md\n');
+    writeFileSync(join(root, 'kept.md'), '# kept\n');
+    writeFileSync(join(root, 'ignored.md'), '# ignored\n');
+    await withEnv({ GIT_DIR: '/dev/null', GIT_WORK_TREE: '/dev/null' }, async () => {
+      const files = collectSyncableFiles(root, { strategy: 'markdown' });
+      expect(files).toContain(join(root, 'kept.md'));
+      expect(files).not.toContain(join(root, 'ignored.md'));
+    });
+  });
+
+  test('commit-tree filtering uses canonical isSyncable rules', () => {
+    const blob = (path: string) => ({ path, oid: 'a'.repeat(40), mode: '100644' as const, size: 1 });
+    const filtered = filterSyncableGitBlobs([
+      blob('people/alice.md'),
+      blob('README.md'),
+      blob('ops/private.md'),
+      blob('.hidden/poison.md'),
+      blob('node_modules/pkg/readme.md'),
+    ], { strategy: 'markdown' });
+    expect(filtered.map(x => x.path)).toEqual(['people/alice.md']);
+  });
+
+  test('commit-tree filtering preserves markdown multimodal images without admitting pruned paths', async () => {
+    const blob = (path: string) => ({ path, oid: 'a'.repeat(40), mode: '100644' as const, size: 1 });
+    await withEnv({ GBRAIN_EMBEDDING_MULTIMODAL: 'true' }, async () => {
+      const filtered = filterSyncableGitBlobs([
+        blob('people/alice.md'),
+        blob('media/photo.png'),
+        blob('ops/private.png'),
+        blob('.hidden/poison.png'),
+      ], { strategy: 'markdown' });
+      expect(filtered.map(x => x.path)).toEqual(['people/alice.md', 'media/photo.png']);
+    });
   });
 
   test('skips broken symlinks without crashing', () => {

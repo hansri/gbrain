@@ -13,13 +13,18 @@
 #
 # Env overrides:
 #   SHARDS=N                     same as --shards
-#   GBRAIN_TEST_SHARD_TIMEOUT    per-shard wallclock cap, seconds (default 600)
-#   GBRAIN_TEST_MAX_CONCURRENCY  passed through to bun test (default 4)
+#   GBRAIN_TEST_SHARD_TIMEOUT      per-shard wallclock cap, seconds (default 1500)
+#   GBRAIN_TEST_SERIAL_TIMEOUT     whole serial-pass wallclock cap (default 1500)
+#   GBRAIN_TEST_TIMEOUT_GRACE      seconds between TERM and KILL (default 5)
+#   GBRAIN_TEST_TOTAL_CONCURRENCY  explicit total worker budget (default min(CPUs, 8))
+#   GBRAIN_TEST_MAX_CONCURRENCY    explicit per-shard override; may exceed the budget
+#   GBRAIN_TEST_FORCE_MANUAL_TIMEOUT=1  exercise the portable timeout fallback
 #
 # Output files (workspace-local; falls back to /tmp if .context/ unwritable):
 #   .context/test-failures.log   failure blocks (cleared at start)
 #   .context/test-summary.txt    per-shard pass/fail/skip/duration (cleared at start)
 #   .context/test-shards/        per-shard logs + exit codes (cleared at start)
+#   .context/test-shards/serial.timeout-fired + serial.wedged on global serial timeout
 
 set -uo pipefail
 
@@ -70,7 +75,38 @@ if [ -z "${SHARDS_OVERRIDE:-}" ] && [ -z "${SHARDS:-}" ] && [ "$N" -gt 4 ]; then
   N=4
 fi
 
-INTRA_CONC="${MAX_CONCURRENCY_OVERRIDE:-${GBRAIN_TEST_MAX_CONCURRENCY:-4}}"
+# Keep the default fan-out bounded across *all* shard processes. Bun applies
+# --max-concurrency independently inside every process, so the former
+# 4 shards x 4 workers silently created 16 concurrent workers (and several
+# simultaneous PGLite WASM instances). The default budget is the smaller of
+# detected CPUs and 8; each shard gets at most 2 workers. An explicit
+# --max-concurrency / GBRAIN_TEST_MAX_CONCURRENCY remains an intentional
+# operator override for dedicated hosts.
+DETECTED_CPUS=$(detect_cpus)
+DEFAULT_TOTAL_BUDGET="$DETECTED_CPUS"
+[ "$DEFAULT_TOTAL_BUDGET" -gt 8 ] && DEFAULT_TOTAL_BUDGET=8
+TOTAL_CONCURRENCY_BUDGET="${GBRAIN_TEST_TOTAL_CONCURRENCY:-$DEFAULT_TOTAL_BUDGET}"
+if ! printf '%s' "$TOTAL_CONCURRENCY_BUDGET" | grep -qE '^[0-9]+$' || [ "$TOTAL_CONCURRENCY_BUDGET" -lt 1 ]; then
+  echo "ERROR: invalid total concurrency budget: $TOTAL_CONCURRENCY_BUDGET" >&2; exit 2
+fi
+
+if [ -n "${MAX_CONCURRENCY_OVERRIDE:-}" ] || [ -n "${GBRAIN_TEST_MAX_CONCURRENCY:-}" ]; then
+  INTRA_CONC="${MAX_CONCURRENCY_OVERRIDE:-${GBRAIN_TEST_MAX_CONCURRENCY}}"
+  CONCURRENCY_SOURCE="explicit"
+else
+  # A total budget is a hard ceiling for the automatic path. If a caller asks
+  # for more shard processes than the budget can support, reduce the process
+  # count instead of silently reporting a budget that is already exceeded.
+  [ "$N" -gt "$TOTAL_CONCURRENCY_BUDGET" ] && N="$TOTAL_CONCURRENCY_BUDGET"
+  INTRA_CONC=$((TOTAL_CONCURRENCY_BUDGET / N))
+  [ "$INTRA_CONC" -lt 1 ] && INTRA_CONC=1
+  [ "$INTRA_CONC" -gt 2 ] && INTRA_CONC=2
+  CONCURRENCY_SOURCE="budgeted"
+fi
+if ! printf '%s' "$INTRA_CONC" | grep -qE '^[0-9]+$' || [ "$INTRA_CONC" -lt 1 ]; then
+  echo "ERROR: invalid max concurrency: $INTRA_CONC" >&2; exit 2
+fi
+EFFECTIVE_TOTAL_CONCURRENCY=$((N * INTRA_CONC))
 # v0.40.10 flake-hardening: bump per-shard cap 600 → 1500 (was 900). At
 # 4-shard default each shard runs 159 files / ~2420 tests with internal
 # wallclock 960-1020s. The 900s value (sized for 8-shard's ~80 files /
@@ -79,6 +115,17 @@ INTRA_CONC="${MAX_CONCURRENCY_OVERRIDE:-${GBRAIN_TEST_MAX_CONCURRENCY:-4}}"
 # 4-shard wallclock; real hangs still hit it. Override via
 # GBRAIN_TEST_SHARD_TIMEOUT=N.
 SHARD_TIMEOUT="${GBRAIN_TEST_SHARD_TIMEOUT:-1500}"
+SERIAL_TIMEOUT="${GBRAIN_TEST_SERIAL_TIMEOUT:-1500}"
+TIMEOUT_GRACE="${GBRAIN_TEST_TIMEOUT_GRACE:-5}"
+if ! printf '%s' "$SHARD_TIMEOUT" | grep -qE '^[0-9]+$' || [ "$SHARD_TIMEOUT" -lt 1 ]; then
+  echo "ERROR: invalid shard timeout: $SHARD_TIMEOUT" >&2; exit 2
+fi
+if ! printf '%s' "$SERIAL_TIMEOUT" | grep -qE '^[0-9]+$' || [ "$SERIAL_TIMEOUT" -lt 1 ]; then
+  echo "ERROR: invalid serial timeout: $SERIAL_TIMEOUT" >&2; exit 2
+fi
+if ! printf '%s' "$TIMEOUT_GRACE" | grep -qE '^[0-9]+$' || [ "$TIMEOUT_GRACE" -lt 1 ]; then
+  echo "ERROR: invalid timeout grace: $TIMEOUT_GRACE" >&2; exit 2
+fi
 
 # ──────────────────────────────────────────────────────────────────────────
 # Output directories. Prefer workspace-local .context/, fall back to /tmp.
@@ -95,7 +142,8 @@ else
   mkdir -p "$LOG_DIR" || { echo "ERROR: cannot create log dir" >&2; exit 2; }
 fi
 # Clear from prior run.
-rm -f "$LOG_DIR"/shard-*.log "$LOG_DIR"/shard-*.exit "$LOG_DIR"/shard-*.wedged 2>/dev/null
+rm -f "$LOG_DIR"/shard-*.log "$LOG_DIR"/shard-*.exit "$LOG_DIR"/shard-*.wedged "$LOG_DIR"/shard-*.timeout-fired \
+  "$LOG_DIR"/serial.log "$LOG_DIR"/serial.timeout-fired "$LOG_DIR"/serial.wedged 2>/dev/null
 : > "$FAILURES_LOG"
 : > "$SUMMARY_FILE"
 
@@ -104,12 +152,14 @@ rm -f "$LOG_DIR"/shard-*.log "$LOG_DIR"/shard-*.exit "$LOG_DIR"/shard-*.wedged 2
 # to bg-pid + sleep cap. For now, prefer gtimeout (brew coreutils) → timeout.
 # ──────────────────────────────────────────────────────────────────────────
 TIMEOUT_BIN=""
-if command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout"
-elif command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN="timeout"
+if [ "${GBRAIN_TEST_FORCE_MANUAL_TIMEOUT:-0}" != "1" ]; then
+  if command -v gtimeout >/dev/null 2>&1; then TIMEOUT_BIN="gtimeout"
+  elif command -v timeout >/dev/null 2>&1; then TIMEOUT_BIN="timeout"
+  fi
 fi
 
 START_TS=$(date +%s)
-echo "[unit-parallel] N=$N shards | --max-concurrency=$INTRA_CONC | timeout=${SHARD_TIMEOUT}s | logs=$LOG_DIR" >&2
+echo "[unit-parallel] N=$N shards | --max-concurrency=$INTRA_CONC ($CONCURRENCY_SOURCE) | total=$EFFECTIVE_TOTAL_CONCURRENCY | budget=$TOTAL_CONCURRENCY_BUDGET | shard-timeout=${SHARD_TIMEOUT}s | serial-timeout=${SERIAL_TIMEOUT}s | logs=$LOG_DIR" >&2
 
 if [ "$DRY_RUN" = "1" ]; then
   echo "[unit-parallel] dry-run: would spawn $N shards with the above settings."
@@ -133,19 +183,31 @@ for i in $(seq 1 "$N"); do
         env SHARD="$i/$N" \
         bash scripts/run-unit-shard.sh --max-concurrency="$INTRA_CONC" \
         > "$SHARD_LOG" 2>&1
+      rc=$?
     else
+      timeout_fired="$LOG_DIR/shard-$i.timeout-fired"
       env SHARD="$i/$N" \
         bash scripts/run-unit-shard.sh --max-concurrency="$INTRA_CONC" \
         > "$SHARD_LOG" 2>&1 &
       pid=$!
-      ( sleep "$SHARD_TIMEOUT" && kill -TERM "$pid" 2>/dev/null && \
-        sleep 5 && kill -KILL "$pid" 2>/dev/null ) &
+      (
+        sleep "$SHARD_TIMEOUT" || exit 0
+        if kill -0 "$pid" 2>/dev/null; then
+          # Persist timeout provenance before signalling. A child may trap TERM
+          # and exit 0; the parent must still classify that run as timed out.
+          : > "$timeout_fired"
+          kill -TERM "$pid" 2>/dev/null || true
+          sleep "$TIMEOUT_GRACE"
+          kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+        fi
+      ) &
       cap_pid=$!
       wait "$pid" 2>/dev/null
+      rc=$?
       kill "$cap_pid" 2>/dev/null
-      wait "$cap_pid" 2>/dev/null
+      wait "$cap_pid" 2>/dev/null || true
+      [ -f "$timeout_fired" ] && rc=124
     fi
-    rc=$?
     echo "$rc" > "$LOG_DIR/shard-$i.exit"
     [ "$rc" = "124" ] && echo "WEDGED" > "$LOG_DIR/shard-$i.wedged"
   ) &
@@ -279,8 +341,8 @@ HB_PID=$!
 # propagate to the sleep child before the wait returns. Without this,
 # each invocation of this script leaks ONE orphan sleep; CI's "orphan
 # process cleanup" at end-of-job reports them as (unnamed) test failures.
-# Seen on the garrytan/port-pr-1406 PR, 2 CI runs in a row, 6 orphans
-# matching the 6 invocations in test/scripts/run-unit-parallel.test.ts.
+# Seen on the garrytan/port-pr-1406 PR, where each wrapper invocation in
+# test/scripts/run-unit-parallel.test.ts leaked one orphan.
 trap 'pkill -P "$HB_PID" 2>/dev/null; kill "$HB_PID" 2>/dev/null; wait "$HB_PID" 2>/dev/null' EXIT
 
 # Wait for every shard. Don't care about wait's exit code.
@@ -374,10 +436,62 @@ SERIAL_FILES_COUNT=0
 SERIAL_FILES_COUNT=$(find test -name '*.serial.test.ts' -not -path 'test/e2e/*' 2>/dev/null | wc -l | tr -d ' ')
 if [ "$SERIAL_FILES_COUNT" -gt 0 ]; then
   echo "════════════ serial pass ($SERIAL_FILES_COUNT files) ════════════"
-  bash scripts/run-serial-tests.sh > "$LOG_DIR/serial.log" 2>&1
-  SERIAL_RC=$?
+  SERIAL_TIMEOUT_FIRED="$LOG_DIR/serial.timeout-fired"
+  SERIAL_WEDGED_FILE="$LOG_DIR/serial.wedged"
+  if [ -n "$TIMEOUT_BIN" ]; then
+    "$TIMEOUT_BIN" --signal=TERM --kill-after="${TIMEOUT_GRACE}s" "${SERIAL_TIMEOUT}s" \
+      bash scripts/run-serial-tests.sh > "$LOG_DIR/serial.log" 2>&1
+    SERIAL_RC=$?
+    case "$SERIAL_RC" in
+      124|137)
+        : > "$SERIAL_TIMEOUT_FIRED"
+        SERIAL_RC=124
+        ;;
+    esac
+  else
+    bash scripts/run-serial-tests.sh > "$LOG_DIR/serial.log" 2>&1 &
+    serial_pid=$!
+    (
+      sleep "$SERIAL_TIMEOUT" || exit 0
+      if kill -0 "$serial_pid" 2>/dev/null; then
+        # Distinct provenance is written BEFORE signalling. A serial runner
+        # may trap TERM and exit zero; the timeout must still fail closed.
+        : > "$SERIAL_TIMEOUT_FIRED"
+        # Kill the active bun child before its waiting shell so macOS bash 3
+        # cannot orphan it while handling TERM. KILL is the bounded backstop.
+        pkill -TERM -P "$serial_pid" 2>/dev/null || true
+        kill -TERM "$serial_pid" 2>/dev/null || true
+        sleep "$TIMEOUT_GRACE"
+        pkill -KILL -P "$serial_pid" 2>/dev/null || true
+        kill -0 "$serial_pid" 2>/dev/null && kill -KILL "$serial_pid" 2>/dev/null || true
+      fi
+    ) &
+    serial_cap_pid=$!
+    wait "$serial_pid" 2>/dev/null
+    SERIAL_RC=$?
+    kill "$serial_cap_pid" 2>/dev/null || true
+    wait "$serial_cap_pid" 2>/dev/null || true
+    [ -f "$SERIAL_TIMEOUT_FIRED" ] && SERIAL_RC=124
+  fi
   cat "$LOG_DIR/serial.log"
-  if [ "$SERIAL_RC" != "0" ]; then
+  if [ -f "$SERIAL_TIMEOUT_FIRED" ]; then
+    : > "$SERIAL_WEDGED_FILE"
+    TOTAL_RC=1
+    s_pass=$(bun_summary_count "pass" "$LOG_DIR/serial.log")
+    s_fail=$(bun_summary_count "fail" "$LOG_DIR/serial.log")
+    TOTAL_PASS=$((TOTAL_PASS + s_pass))
+    TOTAL_FAILURES=$((TOTAL_FAILURES + s_fail))
+    # A hung serial file may emit no Bun failure marker. Count the watchdog
+    # trip as one failure so the final banner cannot misleadingly say 0.
+    [ "$s_fail" -eq 0 ] && TOTAL_FAILURES=$((TOTAL_FAILURES + 1))
+    {
+      echo "--- serial suite: WEDGED after ${SERIAL_TIMEOUT}s ---"
+      [ -f "$LOG_DIR/serial.log" ] && tail -50 "$LOG_DIR/serial.log"
+      echo ""
+    } >> "$FAILURES_LOG"
+    echo "serial: WEDGED after ${SERIAL_TIMEOUT}s (rc=$SERIAL_RC)" >> "$SUMMARY_FILE"
+    echo "[unit-parallel] SERIAL WEDGED after ${SERIAL_TIMEOUT}s (rc=$SERIAL_RC)" >&2
+  elif [ "$SERIAL_RC" != "0" ]; then
     TOTAL_RC=1
     s_fail=$(bun_summary_count "fail" "$LOG_DIR/serial.log")
     TOTAL_FAILURES=$((TOTAL_FAILURES + s_fail))

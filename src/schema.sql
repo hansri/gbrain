@@ -536,6 +536,10 @@ CREATE TABLE IF NOT EXISTS timeline_entries (
   source   TEXT    NOT NULL DEFAULT '',
   summary  TEXT    NOT NULL,
   detail   TEXT    NOT NULL DEFAULT '',
+  -- Explicit extractor ownership. NULL means manual/unowned. The reserved
+  -- legacy `gbrain-markdown` source namespace is adopted by migration/runtime
+  -- reconciliation; non-reserved free-text provenance is never authority.
+  managed_by TEXT,
   -- v0.42.x (Life Chronicle #2390): when this row is the date-index projection
   -- of a `type:event` page, event_page_id points at that event page; page_id
   -- stays the depth/meeting page. NULL for ordinary timeline entries. Reads
@@ -548,6 +552,8 @@ CREATE TABLE IF NOT EXISTS timeline_entries (
 
 CREATE INDEX IF NOT EXISTS idx_timeline_page ON timeline_entries(page_id);
 CREATE INDEX IF NOT EXISTS idx_timeline_date ON timeline_entries(date);
+CREATE INDEX IF NOT EXISTS idx_timeline_managed_page
+  ON timeline_entries(managed_by, page_id) WHERE managed_by IS NOT NULL;
 -- v0.41.18.0 (codex finding #11): widened from (page_id, date, summary) to
 -- include `source` so distinct meeting provenance survives. Legacy rows
 -- have source='' (schema default) so legacy dedup behavior is preserved.
@@ -786,8 +792,7 @@ CREATE TABLE IF NOT EXISTS files (
   size_bytes   BIGINT,
   content_hash TEXT   NOT NULL,
   metadata     JSONB  NOT NULL DEFAULT '{}',
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE(storage_path)
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Migration: drop storage_url if it exists (renamed to storage_path only)
@@ -797,6 +802,8 @@ CREATE INDEX IF NOT EXISTS idx_files_page ON files(page_slug);
 CREATE INDEX IF NOT EXISTS idx_files_page_id ON files(page_id);
 CREATE INDEX IF NOT EXISTS idx_files_source_id ON files(source_id);
 CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_files_source_storage_path
+  ON files(source_id, storage_path);
 
 -- ============================================================
 -- file_migration_ledger (v0.18.0 Step 7)
@@ -1100,6 +1107,9 @@ CREATE TABLE IF NOT EXISTS gbrain_cycle_locks (
   id                 TEXT        PRIMARY KEY,
   holder_pid         INT         NOT NULL,
   holder_host        TEXT,
+  -- Opaque per-acquisition identity. PID/host can both be reused after a TTL
+  -- takeover; refresh/release match this token as the fencing key.
+  holder_token       TEXT        NOT NULL DEFAULT 'legacy-unfenced',
   acquired_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   ttl_expires_at     TIMESTAMPTZ NOT NULL,
   -- v0.41.13.0 (migration v97 + D-V3-4): bumped on every withRefreshingLock

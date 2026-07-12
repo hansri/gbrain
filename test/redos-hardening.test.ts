@@ -86,9 +86,9 @@ describe('#1569 --no-schema-pack + heartbeat wiring (structural)', () => {
     expect(SYNC).toContain('if (opts.noSchemaPack)');
   });
 
-  test('begin heartbeat fires before importFile (GBRAIN_SYNC_TRACE)', () => {
+  test('begin heartbeat fires before committed-blob import (GBRAIN_SYNC_TRACE)', () => {
     const beginIdx = SYNC.indexOf('begin import:');
-    const importIdx = SYNC.indexOf('importFile(eng, filePath, path');
+    const importIdx = SYNC.indexOf('importGitBlob(eng, pinSnapshot, blob');
     expect(beginIdx).toBeGreaterThan(0);
     expect(importIdx).toBeGreaterThan(0);
     expect(beginIdx).toBeLessThan(importIdx);

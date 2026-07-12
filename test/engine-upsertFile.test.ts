@@ -26,6 +26,7 @@ beforeEach(async () => {
 describe('BrainEngine.upsertFile (Phase 3 + Eng-3E)', () => {
   test('happy path: inserts a new files row', async () => {
     const result = await engine.upsertFile({
+      source_id: 'default',
       filename: 'photo.jpg',
       storage_path: 'originals/photos/photo.jpg',
       mime_type: 'image/jpeg',
@@ -46,6 +47,7 @@ describe('BrainEngine.upsertFile (Phase 3 + Eng-3E)', () => {
 
   test('Eng-3E: ON CONFLICT idempotency — same path, same hash is no-op-ish', async () => {
     const r1 = await engine.upsertFile({
+      source_id: 'default',
       filename: 'photo.jpg',
       storage_path: 'originals/photos/photo.jpg',
       mime_type: 'image/jpeg',
@@ -53,6 +55,7 @@ describe('BrainEngine.upsertFile (Phase 3 + Eng-3E)', () => {
       content_hash: 'sha256:original',
     });
     const r2 = await engine.upsertFile({
+      source_id: 'default',
       filename: 'photo.jpg',
       storage_path: 'originals/photos/photo.jpg',
       mime_type: 'image/jpeg',
@@ -71,6 +74,7 @@ describe('BrainEngine.upsertFile (Phase 3 + Eng-3E)', () => {
 
   test('Eng-3E: ON CONFLICT updates metadata when content_hash changes', async () => {
     await engine.upsertFile({
+      source_id: 'default',
       filename: 'photo.jpg',
       storage_path: 'originals/photos/photo.jpg',
       mime_type: 'image/jpeg',
@@ -79,6 +83,7 @@ describe('BrainEngine.upsertFile (Phase 3 + Eng-3E)', () => {
     });
     // Image was replaced — same path, different content.
     const r2 = await engine.upsertFile({
+      source_id: 'default',
       filename: 'photo.jpg',
       storage_path: 'originals/photos/photo.jpg',
       mime_type: 'image/jpeg',
@@ -100,6 +105,7 @@ describe('BrainEngine.upsertFile (Phase 3 + Eng-3E)', () => {
       timeline: '',
     });
     await engine.upsertFile({
+      source_id: 'default',
       page_id: page.id,
       page_slug: page.slug,
       filename: 'whiteboard.jpg',
@@ -109,6 +115,7 @@ describe('BrainEngine.upsertFile (Phase 3 + Eng-3E)', () => {
       content_hash: 'sha256:wb',
     });
     await engine.upsertFile({
+      source_id: 'default',
       page_id: page.id,
       page_slug: page.slug,
       filename: 'sketch.png',
@@ -127,19 +134,47 @@ describe('BrainEngine.upsertFile (Phase 3 + Eng-3E)', () => {
     expect(row).toBeNull();
   });
 
-  test('upsertFile honors source_id for multi-source brains', async () => {
-    // Insert into source 'default'.
-    await engine.upsertFile({
-      filename: 'a.jpg',
-      storage_path: 'photos/a.jpg',
-      content_hash: 'sha256:a-default',
+  test('same storage path is isolated by source_id', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config)
+       VALUES ('source-a', 'source-a', '{}'::jsonb),
+              ('source-b', 'source-b', '{}'::jsonb)`,
+    );
+
+    const a = await engine.upsertFile({
+      source_id: 'source-a',
+      filename: 'shared.jpg',
+      storage_path: 'photos/shared.jpg',
+      content_hash: 'sha256:a-v1',
     });
-    // The (source_id, storage_path) UNIQUE pattern is enforced via the
-    // single UNIQUE(storage_path) constraint shared with Postgres — this
-    // mirrors the v0.18 design. Per-source path namespacing is the brain's
-    // responsibility (sources mount at distinct path prefixes). This test
-    // verifies the API returns the source_id field correctly.
-    const row = await engine.getFile('default', 'photos/a.jpg');
-    expect(row!.source_id).toBe('default');
+    const b = await engine.upsertFile({
+      source_id: 'source-b',
+      filename: 'shared.jpg',
+      storage_path: 'photos/shared.jpg',
+      content_hash: 'sha256:b-v1',
+    });
+
+    expect(a.created).toBe(true);
+    expect(b.created).toBe(true);
+    expect(b.id).not.toBe(a.id);
+    expect((await engine.getFile('source-a', 'photos/shared.jpg'))?.content_hash).toBe('sha256:a-v1');
+    expect((await engine.getFile('source-b', 'photos/shared.jpg'))?.content_hash).toBe('sha256:b-v1');
+
+    const updated = await engine.upsertFile({
+      source_id: 'source-a',
+      filename: 'shared.jpg',
+      storage_path: 'photos/shared.jpg',
+      content_hash: 'sha256:a-v2',
+    });
+    expect(updated.id).toBe(a.id);
+    expect(updated.created).toBe(false);
+    expect((await engine.getFile('source-a', 'photos/shared.jpg'))?.content_hash).toBe('sha256:a-v2');
+    expect((await engine.getFile('source-b', 'photos/shared.jpg'))?.content_hash).toBe('sha256:b-v1');
+
+    const rows = await engine.executeRaw<{ source_id: string }>(
+      `SELECT source_id FROM files WHERE storage_path = $1 ORDER BY source_id`,
+      ['photos/shared.jpg'],
+    );
+    expect(rows.map(row => row.source_id)).toEqual(['source-a', 'source-b']);
   });
 });

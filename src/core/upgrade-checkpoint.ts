@@ -15,8 +15,8 @@
 
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { createHash } from 'node:crypto';
 import { gbrainPath, loadConfig } from './config.ts';
+import { databaseIdentity } from './database-identity.ts';
 
 export type UpgradeStep = 'pull' | 'install' | 'schema' | 'features' | 'backfills' | 'verify';
 
@@ -51,16 +51,11 @@ function checkpointPath(): string {
  * 'unknown' when no URL is configured.
  */
 export function computeBrainId(databaseUrl?: string | null): string {
-  if (!databaseUrl) {
-    // PGLite or no config — derive from the configured database_path
-    // when present, else 'pglite-default'.
-    const cfg = loadConfig();
-    const path = cfg?.database_path;
-    return createHash('sha256').update(`pglite:${path ?? 'default'}`).digest('hex').slice(0, 16);
-  }
-  // Strip userinfo so the hash is stable across credential rotations.
-  const stripped = databaseUrl.replace(/\/\/[^@]*@/, '//');
-  return createHash('sha256').update(stripped).digest('hex').slice(0, 16);
+  const cfg = loadConfig();
+  return databaseIdentity({
+    database_url: databaseUrl ?? cfg?.database_url,
+    database_path: cfg?.database_path,
+  });
 }
 
 /**

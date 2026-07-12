@@ -2,6 +2,7 @@ import { describe, it, expect } from 'bun:test';
 import {
   extractMarkdownLinks,
   extractLinksFromFile,
+  extractManagedTimelineFromContent,
   extractTimelineFromContent,
   walkMarkdownFiles,
 } from '../src/commands/extract.ts';
@@ -134,6 +135,72 @@ describe('extractTimelineFromContent', () => {
     const content = `- **2025-03-18** | Meeting – Discussed partnership`;
     const entries = extractTimelineFromContent(content, 'test');
     expect(entries).toHaveLength(1);
+  });
+
+  it('preserves a source label separated by a compact Unicode dash', () => {
+    const content = `- **2025-03-18** | MeetingTool—Decision captured without separator spaces`;
+    const entries = extractTimelineFromContent(content, 'meetings/test');
+    expect(entries).toEqual([expect.objectContaining({
+      date: '2025-03-18',
+      source: 'MeetingTool',
+      summary: 'Decision captured without separator spaces',
+    })]);
+    expect(extractManagedTimelineFromContent(content, 'meetings/test'))
+      .toContainEqual(expect.objectContaining({
+        source: 'gbrain-markdown:MeetingTool',
+        summary: 'Decision captured without separator spaces',
+      }));
+  });
+
+  it('keeps the backward-compatible compact ASCII dash source label', () => {
+    const entries = extractTimelineFromContent(
+      '- **2025-03-19** | ChatTool-Follow-up promised',
+      'meetings/test',
+    );
+    expect(entries).toEqual([expect.objectContaining({
+      source: 'ChatTool',
+      summary: 'Follow-up promised',
+    })]);
+  });
+
+  it('managed projection treats a compact ASCII hyphen as an ambiguous source-less summary', () => {
+    const entries = extractManagedTimelineFromContent(
+      '- **2025-03-19** | ChatTool-Follow-up promised',
+      'meetings/test',
+    );
+    expect(entries).toEqual([expect.objectContaining({
+      date: '2025-03-19',
+      source: 'gbrain-markdown',
+      summary: 'ChatTool-Follow-up promised',
+    })]);
+  });
+
+  it('managed projection preserves source-labelled bullets without duplicate generic rows', () => {
+    const content = [
+      '## Timeline',
+      '- **2025-03-18** | Meeting — Discussed partnership',
+      '- **2025-03-19** | Source-less compatibility entry',
+      '### 2025-03-20 — Signed agreement',
+      '',
+      'All documents signed.',
+    ].join('\n');
+    const entries = extractManagedTimelineFromContent(content, 'people/test');
+    expect(entries).toHaveLength(3);
+    expect(entries).toContainEqual(expect.objectContaining({
+      date: '2025-03-18',
+      source: 'gbrain-markdown:Meeting',
+      summary: 'Discussed partnership',
+    }));
+    expect(entries).toContainEqual(expect.objectContaining({
+      date: '2025-03-19',
+      source: 'gbrain-markdown',
+      summary: 'Source-less compatibility entry',
+    }));
+    expect(entries).toContainEqual(expect.objectContaining({
+      date: '2025-03-20',
+      source: 'gbrain-markdown',
+      summary: 'Signed agreement',
+    }));
   });
 });
 

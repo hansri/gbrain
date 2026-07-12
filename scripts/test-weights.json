@@ -655,6 +655,8 @@
   "test/sync-trigger-cli.test.ts": 3100,
   "test/sync-walker-submodule.test.ts": 5,
   "test/sync-walker-symlink.test.ts": 12,
+  "test/sync-lookup-failure.serial.test.ts": 1000,
+  "test/sync-rename-rollback.serial.test.ts": 1000,
   "test/sync.test.ts": 5841,
   "test/synth-enabled-default.test.ts": 3,
   "test/system-prompt.test.ts": 8,

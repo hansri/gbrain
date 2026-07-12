@@ -1580,16 +1580,35 @@ export async function registerBuiltinHandlers(
   });
 
   worker.register('import', async (job) => {
-    // import.ts Core extraction deferred to v0.12.0 (import has parallel
-    // workers + checkpointing). Keep the CLI wrapper call but note the
-    // worker-kill risk is bounded: import's only process.exit fires on
-    // a missing dir arg, which this handler always passes.
-    const { runImport } = await import('./import.ts');
+    const { runImport, ImportInvocationError } = await import('./import.ts');
     const importArgs: string[] = [];
     if (job.data.dir) importArgs.push(String(job.data.dir));
     if (job.data.noEmbed) importArgs.push('--no-embed');
-    await runImport(engine, importArgs);
-    return { imported: true };
+    if (job.data.workers !== undefined) importArgs.push('--workers', String(job.data.workers));
+    const sourceId = typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined;
+    let result;
+    try {
+      result = await runImport(engine, importArgs, { sourceId });
+    } catch (error) {
+      if (!(error instanceof ImportInvocationError)) throw error;
+      const failed = new Error(
+        `Import job rejected (${error.importResult.code}): ${error.message}`,
+        { cause: error },
+      ) as Error & { importResult?: typeof error.importResult; exitCode?: number };
+      failed.importResult = error.importResult;
+      failed.exitCode = error.exitCode;
+      throw failed;
+    }
+    if (result.exitCode !== 0 || result.status !== 'success') {
+      const error = new Error(
+        `Import job ${result.status} (exitCode=${result.exitCode}, ` +
+        `${result.failures.length} failure(s)); checkpoint preserved for retry`,
+      ) as Error & { importResult?: typeof result; exitCode?: number };
+      error.importResult = result;
+      error.exitCode = result.exitCode;
+      throw error;
+    }
+    return result;
   });
 
   worker.register('extract', async (job) => {

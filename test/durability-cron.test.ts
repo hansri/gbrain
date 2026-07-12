@@ -9,11 +9,15 @@ import { renderCronWrapper, generateBrainPullPlist } from '../src/core/brain-rep
 const TOKEN = 'ghp_SHOULD_NEVER_APPEAR';
 
 describe('renderCronWrapper (D2 DB-free)', () => {
-  const w = renderCronWrapper('wiki', '/data/clones/wiki', 'main', '/usr/local/bin/gbrain', '/home/u/.gbrain/brain-push.log');
+  const w = renderCronWrapper(
+    'wiki', '/data/clones/wiki', 'main', 'https://github.com/acme/wiki.git',
+    '/usr/local/bin/gbrain', '/home/u/.gbrain/brain-push.log',
+  );
 
   test('calls the DB-free path command, not the engine-opening one', () => {
     expect(w).toContain("sources pull --path '/data/clones/wiki'");
     expect(w).toContain("--branch 'main'");
+    expect(w).toContain("--expected-remote 'https://github.com/acme/wiki.git'");
     expect(w).not.toMatch(/sources pull '?wiki'?(\s|$)/); // never `sources pull wiki`
   });
 

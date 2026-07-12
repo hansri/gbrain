@@ -20,6 +20,7 @@ import { tmpdir } from 'os';
 import { hasDatabase, setupDB, teardownDB, getEngine } from './helpers.ts';
 import { withEnv } from '../helpers/with-env.ts';
 import { runExtractFacts } from '../../src/core/cycle/extract-facts.ts';
+import { DEFAULT_EMBEDDING_DIMENSIONS } from '../../src/core/ai/defaults.ts';
 // v0.40: per-source lock id replaces the legacy bare SYNC_LOCK_ID constant.
 // Tests below hand-craft the lock row via SQL to simulate contention.
 
@@ -205,9 +206,13 @@ describeMaybe('phantom-redirect E2E (Postgres)', () => {
       const engine = getEngine();
       // Seed a phantom fact in DB with an embedding (must round-trip
       // through postgres-js's text representation per round 12).
-      // Build a 1536-d vector (canonical OpenAI embedding shape) of small
-      // values so we can verify the parse doesn't mangle.
-      const vec = Array(1536).fill(0).map((_, i) => i / 1536).map((v) => v.toFixed(6)).join(',');
+      // Build the canonical fresh-schema vector shape with small values so
+      // we can verify the postgres-js text parse does not mangle it. Import
+      // the default instead of pinning a historical provider width.
+      const vec = Array.from(
+        { length: DEFAULT_EMBEDDING_DIMENSIONS },
+        (_, i) => (i / DEFAULT_EMBEDDING_DIMENSIONS).toFixed(6),
+      ).join(',');
       await engine.executeRaw(
         `INSERT INTO facts (
            source_id, entity_slug, fact, kind, valid_from,

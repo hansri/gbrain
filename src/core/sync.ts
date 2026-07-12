@@ -2,7 +2,7 @@
  * Sync utilities — pure functions for git diff parsing, filtering, and slug management.
  *
  * SYNC DATA FLOW:
- *   git diff --name-status -M LAST..HEAD
+ *   git diff --name-status -z -M LAST..HEAD
  *       │
  *   buildSyncManifest()  →  parse A/M/D/R lines
  *       │
@@ -110,6 +110,32 @@ export function buildSyncManifest(gitDiffOutput: string): SyncManifest {
     renamed: [],
   };
 
+  // Production Git calls use `-z`, which makes every status/path field an
+  // exact NUL-delimited token. This preserves tabs, newlines, leading/trailing
+  // spaces, and other legal filename bytes that line/tab parsing corrupts.
+  if (gitDiffOutput.includes('\0')) {
+    const tokens = gitDiffOutput.split('\0');
+    let i = 0;
+    while (i < tokens.length) {
+      const action = tokens[i++];
+      if (!action) continue;
+      if (action.startsWith('R') || action.startsWith('C')) {
+        const from = tokens[i++];
+        const to = tokens[i++];
+        if (action.startsWith('R') && from && to) manifest.renamed.push({ from, to });
+        continue;
+      }
+      const path = tokens[i++];
+      if (!path) continue;
+      if (action === 'A') manifest.added.push(path);
+      else if (action === 'M' || action === 'T') manifest.modified.push(path);
+      else if (action === 'D') manifest.deleted.push(path);
+    }
+    return manifest;
+  }
+
+  // Backward-compatible parser for callers/tests that supply the traditional
+  // human-readable tab/newline format. Immutable sync itself never uses it.
   const lines = gitDiffOutput.split('\n');
 
   for (const line of lines) {
@@ -124,7 +150,10 @@ export function buildSyncManifest(gitDiffOutput: string): SyncManifest {
 
     if (action === 'A') {
       manifest.added.push(path);
-    } else if (action === 'M') {
+    } else if (action === 'M' || action === 'T') {
+      // `T` means the Git object type changed. The sync layer checks the
+      // target commit tree: regular targets re-import, non-regular targets
+      // delete any stale file-backed page.
       manifest.modified.push(path);
     } else if (action === 'D') {
       manifest.deleted.push(parts[1]);

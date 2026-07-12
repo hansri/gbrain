@@ -167,9 +167,10 @@ automatically:
 # Clone + register a GitHub repo, then auto-harden it for durability.
 # Use a fine-grained PAT scoped to just this repo.
 gbrain sources add wiki --url https://github.com/you/brain-wiki.git --pat-file ~/.secrets/wiki-pat
-#   → clones, then installs: local auto-push hook, scripts/brain-commit-push.sh,
+#   → clones, then installs: local auto-push hook, a trusted CLI commit-push path,
 #     always-on durability rules in AGENTS.md/RESOLVER.md, a 30-min pull cron,
-#     and a repo-scoped credential. Verifies push works before declaring done.
+#     and an owner-only GBrain credential store. Verifies push works before
+#     declaring done.
 
 # Run the same audit on an existing source any time (idempotent):
 gbrain sources harden wiki --pat-file ~/.secrets/wiki-pat
@@ -187,10 +188,12 @@ What hardening guarantees:
   dirty working tree is skipped (your in-progress edits are never touched); a
   rebase conflict is aborted cleanly and flagged for attention, never left
   half-applied.
-- **Push is never deferred.** `scripts/brain-commit-push.sh "<msg>" <path>`
-  commits and pushes atomically and refuses to report success without a
-  confirmed push. The post-commit hook is a best-effort background fallback;
-  the helper is the guarantee.
+- **Push is never deferred.** The generated resolver instruction calls
+  `gbrain sources commit-push` with the exact registered remote. It refuses
+  unrelated pre-staged work, commits only explicit paths through an isolated
+  index, preserves staging that arrives concurrently, and refuses success
+  without a confirmed push. Hardening removes the retired repo executable;
+  persistent mutation logic exists only in the installed trusted CLI.
 - **No silent staleness.** A 30-minute background pull keeps an idle session
   current. It runs DB-free, so it never contends with a live brain for the
   PGLite single-writer lock.
@@ -200,10 +203,12 @@ probe, `--dry-run` reports what would change, `--json` emits a machine
 report, `--all` hardens every source with a remote (same-account only).
 `--no-harden` on `sources add` opts out of auto-harden.
 
-Security: the push automation is installed locally per machine (never
-committed into the repo), the token is wired per-repo (an existing
-credential helper is reused when present), and it never appears in the repo,
-the remote URL, logs, or the JSON report. For a self-hosted git server
+Security: executed mutation logic lives in the installed CLI, not pulled repo
+code. The token lives in an owner-only store keyed by canonical remote path, so
+two repositories on the same host cannot consume each other's credential.
+Authenticated network operations reset repo/global credential helpers and Git
+hooks, then opt into only that validated store. The token never appears in the
+repo, the remote URL, logs, or the JSON report. For a self-hosted git server
 reachable only over a filesystem path, set `GBRAIN_GIT_ALLOW_FILE_TRANSPORT=1`
 (default is HTTPS-only).
 

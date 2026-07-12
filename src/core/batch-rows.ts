@@ -110,6 +110,7 @@ export interface TimelineRow {
   summary: string;
   detail: string;
   source_id: string;
+  managed_by: string | null;
 }
 
 /** One takes row, keys === the jsonb_to_recordset column list. Numbers/booleans
@@ -152,6 +153,7 @@ export function buildTimelineRows(entries: TimelineBatchInput[]): TimelineRow[] 
     summary: sanitizeForJsonb(e.summary), // free-text body: NUL + lone-surrogate sanitized
     detail: sanitizeForJsonb(e.detail || ''), // free-text body: NUL + lone-surrogate sanitized
     source_id: e.source_id || 'default',
+    managed_by: e.managed_by ?? null,
   }));
 }
 

@@ -102,7 +102,7 @@
     "@ai-sdk/openai": "^3.0.53",
     "@ai-sdk/openai-compatible": "^2.0.41",
     "@anthropic-ai/sdk": "^0.30.0",
-    "@aws-sdk/client-s3": "^3.1028.0",
+    "@aws-sdk/client-s3": "^3.1085.0",
     "@dqbd/tiktoken": "^1.0.22",
     "@electric-sql/pglite": "0.4.3",
     "@jsquash/avif": "^2.1.1",
@@ -118,8 +118,8 @@
     "express-rate-limit": "^7.5.0",
     "gray-matter": "^4.0.3",
     "heic-decode": "^2.1.0",
-    "js-yaml": "^3.14.2",
-    "marked": "^18.0.0",
+    "js-yaml": "^3.15.0",
+    "marked": "^18.0.6",
     "openai": "^4.0.0",
     "pgvector": "^0.2.0",
     "postgres": "^3.4.0",
@@ -128,14 +128,22 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@types/bun": "latest",
     "@types/cookie-parser": "^1.4.7",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/js-yaml": "^3.12.10",
-    "bun-types": "^1.3.13",
+    "bun-types": "1.3.13",
     "fast-check": "^4.8.0",
     "typescript": "^5.6.0"
+  },
+  "overrides": {
+    "@hono/node-server": "1.19.13",
+    "fast-uri": "3.1.2",
+    "form-data": "4.0.6",
+    "hono": "4.12.25",
+    "ip-address": "10.1.1",
+    "js-yaml": "3.15.0",
+    "qs": "6.15.2"
   },
   "trustedDependencies": [
     "@electric-sql/pglite"
@@ -144,5 +152,5 @@
     "bun": ">=1.3.10"
   },
   "license": "MIT",
-  "version": "0.42.58.0"
+  "version": "0.42.59.0"
 }

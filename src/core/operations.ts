@@ -10,6 +10,7 @@ import { clampSearchLimit } from './engine.ts';
 import type { GBrainConfig } from './config.ts';
 import type { PageType } from './types.ts';
 import { importFromContent } from './import-file.ts';
+import { withSourceWriterLease } from './source-writer-lease.ts';
 import { writePageThrough } from './write-through.ts';
 import { hybridSearch, hybridSearchCached, stampContentFlags } from './search/hybrid.ts';
 import { normalizeSearchDateWindow } from './search/date-window.ts';
@@ -23,6 +24,8 @@ import { stripTakesFence } from './takes-fence.ts';
 import { stripFactsFence } from './facts-fence.ts';
 import { getContentFlag } from './quarantine.ts';
 import { bumpLastRetrievedAt } from './last-retrieved.ts';
+import { sourceQualifiedStorageReadPath } from './file-resolver.ts';
+import { publishStoredFile, sha256Hex } from './file-storage-publish.ts';
 import { isSearchMode } from './search/mode.ts';
 import { stampEvidence } from './search/evidence.ts';
 import type { SearchResult } from './types.ts';
@@ -1133,18 +1136,22 @@ async function runAutoLink(
   // inserts. opts.sourceId is set when caller knows the source (put_page from
   // a multi-source-aware handler); when omitted, every read returns the
   // pre-v0.31.8 cross-source view (back-compat for any existing caller).
-  const sourceOpts = opts?.sourceId ? { sourceId: opts.sourceId } : {};
-  const linkSourceOpts = opts?.sourceId
-    ? { fromSourceId: opts.sourceId, toSourceId: opts.sourceId, originSourceId: opts.sourceId }
-    : {};
-  const removeSourceOpts = opts?.sourceId
-    ? { fromSourceId: opts.sourceId, toSourceId: opts.sourceId }
-    : {};
+  const effectiveSourceId = opts?.sourceId ?? 'default';
+  const sourceOpts = { sourceId: effectiveSourceId };
+  const linkSourceOpts = {
+    fromSourceId: effectiveSourceId,
+    toSourceId: effectiveSourceId,
+    originSourceId: effectiveSourceId,
+  };
+  const removeSourceOpts = {
+    fromSourceId: effectiveSourceId,
+    toSourceId: effectiveSourceId,
+  };
 
   // Live-mode resolver: per-put throwaway cache, pg_trgm + optional search.
   // Issue #972 (codex [P1]): pass sourceId so basename resolution stays
   // within this page's source — no cross-source basename edges.
-  const resolver = makeResolver(engine, { mode: 'live', sourceId: opts?.sourceId });
+  const resolver = makeResolver(engine, { mode: 'live', sourceId: effectiveSourceId });
   // Issue #972: opt-in bare-wikilink basename resolution. Off by default.
   const globalBasename = await isGlobalBasenameEnabled(engine);
   const { candidates, unresolved } = await extractPageLinks(
@@ -1300,22 +1307,25 @@ const delete_page: Operation = {
     if (ctx.dryRun) return { dry_run: true, action: 'soft_delete_page', slug };
     // v0.31.8 (D7): thread ctx.sourceId so multi-source brains soft-delete the
     // intended row instead of always targeting (default, slug).
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
+    const sourceId = ctx.sourceId ?? 'default';
+    const sourceOpts = { sourceId };
     // v0.26.5: rewired from hard-delete to soft-delete. The hard-delete primitive
     // (engine.deletePage) is now reserved for purgeDeletedPages and explicit
     // tests. softDeletePage returns null when the slug is unknown OR already
     // soft-deleted (idempotent-as-null) — preserve that as a clean no-op shape.
-    const result = await ctx.engine.softDeletePage(slug, sourceOpts);
-    if (result === null) {
-      // Distinguish "not found" from "already soft-deleted" so the agent gets a
-      // clear signal. Probe once with include_deleted to disambiguate.
-      const existing = await ctx.engine.getPage(slug, { includeDeleted: true, ...sourceOpts });
-      if (!existing) {
-        throw new OperationError('page_not_found', `Page not found: ${slug}`, 'Check the slug.');
+    return withSourceWriterLease(ctx.engine, sourceId, async () => {
+      const result = await ctx.engine.softDeletePage(slug, sourceOpts);
+      if (result === null) {
+        // Distinguish "not found" from "already soft-deleted" so the agent gets a
+        // clear signal. Probe once with include_deleted to disambiguate.
+        const existing = await ctx.engine.getPage(slug, { includeDeleted: true, ...sourceOpts });
+        if (!existing) {
+          throw new OperationError('page_not_found', `Page not found: ${slug}`, 'Check the slug.');
+        }
+        return { status: 'already_soft_deleted', slug, deleted_at: existing.deleted_at };
       }
-      return { status: 'already_soft_deleted', slug, deleted_at: existing.deleted_at };
-    }
-    return { status: 'soft_deleted', slug, recoverable_until: 'now + 72h via restore_page' };
+      return { status: 'soft_deleted', slug, recoverable_until: 'now + 72h via restore_page' };
+    });
   },
   cliHints: { name: 'delete', positional: ['slug'] },
 };
@@ -1332,17 +1342,20 @@ const restore_page: Operation = {
     const slug = p.slug as string;
     if (ctx.dryRun) return { dry_run: true, action: 'restore_page', slug };
     // v0.31.8 (D7): thread ctx.sourceId.
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
-    const ok = await ctx.engine.restorePage(slug, sourceOpts);
-    if (!ok) {
-      // Distinguish "not found" from "already active" (idempotent-as-false).
-      const existing = await ctx.engine.getPage(slug, { includeDeleted: true, ...sourceOpts });
-      if (!existing) {
-        throw new OperationError('page_not_found', `Page not found: ${slug}`, 'Check the slug.');
+    const sourceId = ctx.sourceId ?? 'default';
+    const sourceOpts = { sourceId };
+    return withSourceWriterLease(ctx.engine, sourceId, async () => {
+      const ok = await ctx.engine.restorePage(slug, sourceOpts);
+      if (!ok) {
+        // Distinguish "not found" from "already active" (idempotent-as-false).
+        const existing = await ctx.engine.getPage(slug, { includeDeleted: true, ...sourceOpts });
+        if (!existing) {
+          throw new OperationError('page_not_found', `Page not found: ${slug}`, 'Check the slug.');
+        }
+        return { status: 'already_active', slug };
       }
-      return { status: 'already_active', slug };
-    }
-    return { status: 'restored', slug };
+      return { status: 'restored', slug };
+    });
   },
   cliHints: { name: 'restore', positional: ['slug'] },
 };
@@ -2567,6 +2580,7 @@ const sync_brain: Operation = {
       noEmbed: (p.no_embed as boolean) || false,
       noPull: (p.no_pull as boolean) || false,
       full: (p.full as boolean) || false,
+      sourceId: ctx.sourceId,
     });
   },
   cliHints: { name: 'sync', hidden: true },
@@ -2682,19 +2696,32 @@ const FILE_LIST_LIMIT = 100;
 
 const file_list: Operation = {
   name: 'file_list',
-  description: 'List stored files',
+  description: 'List stored files in the current source',
   params: {
     slug: { type: 'string', description: 'Filter by page slug' },
   },
   scope: 'admin',
   localOnly: true,
-  handler: async (_ctx, p) => {
-    const sql = db.getConnection();
+  handler: async (ctx, p) => {
     const slug = p.slug as string | undefined;
     if (slug) {
-      return sql`SELECT id, page_slug, filename, storage_path, mime_type, size_bytes, content_hash, created_at FROM files WHERE page_slug = ${slug} ORDER BY filename LIMIT ${FILE_LIST_LIMIT}`;
+      return ctx.engine.executeRaw(
+        `SELECT id, source_id, page_slug, filename, storage_path, mime_type, size_bytes, content_hash, created_at
+           FROM files
+          WHERE source_id = $1 AND page_slug = $2
+          ORDER BY filename
+          LIMIT ${FILE_LIST_LIMIT}`,
+        [ctx.sourceId, slug],
+      );
     }
-    return sql`SELECT id, page_slug, filename, storage_path, mime_type, size_bytes, content_hash, created_at FROM files ORDER BY page_slug, filename LIMIT ${FILE_LIST_LIMIT}`;
+    return ctx.engine.executeRaw(
+      `SELECT id, source_id, page_slug, filename, storage_path, mime_type, size_bytes, content_hash, created_at
+         FROM files
+        WHERE source_id = $1
+        ORDER BY page_slug, filename
+        LIMIT ${FILE_LIST_LIMIT}`,
+      [ctx.sourceId],
+    );
   },
 };
 
@@ -2711,9 +2738,8 @@ const file_upload: Operation = {
   handler: async (ctx, p) => {
     if (ctx.dryRun) return { dry_run: true, action: 'file_upload', path: p.path };
 
-    const { readFileSync, statSync } = await import('fs');
+    const { readFileSync } = await import('fs');
     const { basename, extname } = await import('path');
-    const { createHash } = await import('crypto');
 
     const filePath = p.path as string;
     const pageSlug = (p.page_slug as string) || null;
@@ -2728,10 +2754,16 @@ const file_upload: Operation = {
     const filename = basename(filePath);
     validateFilename(filename);
 
-    const stat = statSync(filePath);
+    if (!ctx.config.storage) {
+      throw new OperationError(
+        'storage_error',
+        'No storage backend configured. Refusing to create file metadata without stored bytes.',
+      );
+    }
+
     const content = readFileSync(filePath);
-    const hash = createHash('sha256').update(content).digest('hex');
-    const storagePath = pageSlug ? `${pageSlug}/${filename}` : `unsorted/${hash.slice(0, 8)}-${filename}`;
+    const hash = sha256Hex(content);
+    const logicalPath = pageSlug ? `${pageSlug}/${filename}` : `unsorted/${hash.slice(0, 8)}-${filename}`;
 
     const MIME_TYPES: Record<string, string> = {
       '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
@@ -2740,45 +2772,34 @@ const file_upload: Operation = {
     };
     const mimeType = MIME_TYPES[extname(filePath).toLowerCase()] || null;
 
-    const sql = db.getConnection();
-    const existing = await sql`SELECT id FROM files WHERE content_hash = ${hash} AND storage_path = ${storagePath}`;
-    if (existing.length > 0) {
-      return { status: 'already_exists', storage_path: storagePath };
-    }
-
-    // Upload to storage backend if configured
-    if (ctx.config.storage) {
-      const { createStorage } = await import('./storage.ts');
-      const storage = await createStorage(ctx.config.storage as any);
-      try {
-        await storage.upload(storagePath, content, mimeType || undefined);
-      } catch (uploadErr) {
-        throw new OperationError('storage_error', `Upload failed: ${uploadErr instanceof Error ? uploadErr.message : String(uploadErr)}`);
-      }
-    }
-
+    const { createStorage } = await import('./storage.ts');
+    const storage = await createStorage(ctx.config.storage as any);
+    let published;
     try {
-      await sql`
-        INSERT INTO files (page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
-        VALUES (${pageSlug}, ${filename}, ${storagePath}, ${mimeType}, ${stat.size}, ${hash}, ${'{}'}::jsonb)
-        ON CONFLICT (storage_path) DO UPDATE SET
-          content_hash = EXCLUDED.content_hash,
-          size_bytes = EXCLUDED.size_bytes,
-          mime_type = EXCLUDED.mime_type
-      `;
-    } catch (dbErr) {
-      // Rollback: clean up storage if DB write failed
-      if (ctx.config.storage) {
-        try {
-          const { createStorage } = await import('./storage.ts');
-          const storage = await createStorage(ctx.config.storage as any);
-          await storage.delete(storagePath);
-        } catch { /* best effort cleanup */ }
+      published = await publishStoredFile({
+        engine: ctx.engine,
+        storage,
+        sourceId: ctx.sourceId,
+        logicalPath,
+        pageSlug,
+        filename,
+        mimeType,
+        data: content,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (/storage|upload|object/i.test(message)) {
+        throw new OperationError('storage_error', message);
       }
-      throw dbErr;
+      throw err;
     }
 
-    return { status: 'uploaded', storage_path: storagePath, size_bytes: stat.size };
+    return {
+      status: published.changed || published.objectUploaded ? 'uploaded' : 'already_exists',
+      source_id: ctx.sourceId,
+      storage_path: published.storagePath,
+      size_bytes: published.sizeBytes,
+    };
   },
 };
 
@@ -2790,14 +2811,21 @@ const file_url: Operation = {
   },
   scope: 'admin',
   localOnly: true,
-  handler: async (_ctx, p) => {
-    const sql = db.getConnection();
-    const rows = await sql`SELECT storage_path, mime_type, size_bytes FROM files WHERE storage_path = ${p.storage_path as string}`;
-    if (rows.length === 0) {
-      throw new OperationError('storage_error', `File not found: ${p.storage_path}`);
+  handler: async (ctx, p) => {
+    const storagePath = p.storage_path as string;
+    const row = await ctx.engine.getFile(ctx.sourceId, storagePath);
+    if (!row) {
+      throw new OperationError(
+        'storage_error',
+        `File not found in source "${ctx.sourceId}": ${storagePath}`,
+      );
     }
     // TODO: generate signed URL from Supabase Storage
-    return { storage_path: rows[0].storage_path, url: `gbrain:files/${rows[0].storage_path}` };
+    return {
+      source_id: row.source_id,
+      storage_path: row.storage_path,
+      url: `gbrain:files/${sourceQualifiedStorageReadPath(row.source_id, row.storage_path)}`,
+    };
   },
 };
 
@@ -2841,7 +2869,10 @@ const submit_job: Operation = {
     // name. Strict `=== false` so an untyped/cast context can't escalate.
     const trusted = ctx.remote === false && isProtectedJobName(name) ? { allowProtectedSubmit: true } : undefined;
 
-    const jobData = (p.data as Record<string, unknown>) || {};
+    const requestedJobData = (p.data as Record<string, unknown>) || {};
+    // Write attribution comes from the authenticated context, never an
+    // untrusted job payload. Import/sync workers consume this exact value.
+    const jobData: Record<string, unknown> = { ...requestedJobData, sourceId: ctx.sourceId };
 
     // v0.35.8.0: pre-enqueue shell-job validation, parity with the CLI submit
     // path. Closes the bug class where shell.ts handler-time validation ran
@@ -3682,8 +3713,8 @@ const whoami: Operation = {
   name: 'whoami',
   description:
     'Introspect the calling identity. Returns one of three transport shapes: ' +
-    '{transport: "oauth", client_id, client_name, scopes, expires_at}, ' +
-    '{transport: "legacy", token_name, scopes, expires_at: null}, or ' +
+    '{transport: "oauth", client_id, client_name, scopes, expires_at, allowed_tools, source_id, allowed_sources}, ' +
+    '{transport: "legacy", token_name, scopes, expires_at: null, allowed_tools, source_id, allowed_sources}, or ' +
     '{transport: "local", scopes: []}. Throws unknown_transport when the ' +
     'context is ambiguous (remote=true without auth) — fail-closed posture ' +
     'mirroring the v0.26.9 trust-boundary contract.',
@@ -3710,6 +3741,16 @@ const whoami: Operation = {
     // access_tokens reuse `name` as both clientId and clientName (verifyAccessToken
     // at oauth-provider.ts:417-430). Detect by inspecting the prefix.
     const isOauth = ctx.auth.clientId.startsWith('gbrain_cl_');
+    // Capability evidence is intentionally secret-free: never return token or
+    // other bearer material. Copies are sorted for deterministic policy/drift
+    // checks without mutating the transport-owned AuthInfo arrays.
+    const capabilityEvidence = {
+      allowed_tools: ctx.auth.allowedTools === undefined
+        ? null
+        : [...ctx.auth.allowedTools].sort(),
+      source_id: ctx.auth.sourceId ?? null,
+      allowed_sources: [...(ctx.auth.allowedSources ?? [])].sort(),
+    };
     if (isOauth) {
       return {
         transport: 'oauth',
@@ -3717,6 +3758,7 @@ const whoami: Operation = {
         client_name: ctx.auth.clientName ?? ctx.auth.clientId,
         scopes: ctx.auth.scopes,
         expires_at: ctx.auth.expiresAt ?? null,
+        ...capabilityEvidence,
       };
     }
     return {
@@ -3724,6 +3766,7 @@ const whoami: Operation = {
       token_name: ctx.auth.clientName ?? ctx.auth.clientId,
       scopes: ctx.auth.scopes,
       expires_at: null,
+      ...capabilityEvidence,
     };
   },
   cliHints: { name: 'whoami' },

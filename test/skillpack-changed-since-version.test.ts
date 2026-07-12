@@ -17,7 +17,7 @@ import { describe, expect, it, afterEach } from 'bun:test';
 import { execFileSync } from 'child_process';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { tmpdir } from 'os';
+import { devNull, tmpdir } from 'os';
 
 import { changedSlugsSinceVersion } from '../src/core/skillpack/bundle.ts';
 
@@ -43,6 +43,12 @@ function git(cwd: string, ...args: string[]): void {
       GIT_AUTHOR_EMAIL: 't@example.com',
       GIT_COMMITTER_NAME: 't',
       GIT_COMMITTER_EMAIL: 't@example.com',
+      // Fixture repositories must not inherit workstation-wide hooks or
+      // signing policy. A workstation commit guard may correctly block real
+      // skill commits, but it must not make disposable test repos non-hermetic.
+      GIT_CONFIG_GLOBAL: devNull,
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_TERMINAL_PROMPT: '0',
     },
   });
 }
