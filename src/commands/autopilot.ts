@@ -20,7 +20,7 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, utimesSync, unlinkSync } from 'fs';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import { join } from 'path';
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import type { BrainEngine } from '../core/engine.ts';
 import { loadPreferences } from '../core/preferences.ts';
 import { loadConfig, saveConfig, gbrainPath as gbrainHomePath } from '../core/config.ts';
@@ -35,9 +35,21 @@ import {
   resolveSelfUpgradeMode,
 } from '../core/self-upgrade.ts';
 import { logSelfUpgrade } from '../core/audit/self-upgrade-audit.ts';
-import { detectInstallMethod } from './upgrade.ts';
+import { detectInstallMethod, resolveUpgradeInvocation } from './upgrade.ts';
 import { evaluateQuietHours } from '../core/minions/quiet-hours.ts';
 import { inspectLock } from '../core/db-lock.ts';
+import { resolveUpgradeReleasePolicy } from '../core/upgrade-release-policy.ts';
+
+/** Exact current-release argv; never consults PATH for self-upgrade. */
+export function resolveAutopilotUpgradeInvocation(
+  targetVersion: string,
+  runtime?: Parameters<typeof resolveUpgradeInvocation>[1],
+): string[] {
+  return resolveUpgradeInvocation(
+    ['upgrade', '--swap-only', '--target', targetVersion],
+    runtime,
+  );
+}
 
 /**
  * v0.37.7.0 #1162 — classify autopilot reconnect-loop errors.
@@ -222,6 +234,7 @@ async function attemptAutopilotSelfUpgrade(
     const tz = qh?.tz || Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
     const verdict = evaluateQuietHours({ start: qh?.start ?? 23, end: qh?.end ?? 8, tz }, new Date());
     const installMethod = detectInstallMethod();
+    const releasePolicy = resolveUpgradeReleasePolicy(latestVersion);
 
     const decision = decideSelfUpgrade({
       mode: 'auto',
@@ -232,11 +245,12 @@ async function attemptAutopilotSelfUpgrade(
       idle,
       inQuietHours: verdict !== 'allow',
       canSelfUpdate: canSelfUpdate(installMethod),
+      releaseAllowsSilentUpgrade: releasePolicy.inlineAllowed,
       throttledByInterval: false, // cache TTL is the fetch throttle
     });
 
     if (decision.action !== 'apply') {
-      if (['unsupported_install', 'known_bad'].includes(decision.action)) {
+      if (['unsupported_install', 'known_bad', 'supervised_release'].includes(decision.action)) {
         logSelfUpgrade({
           channel: 'autopilot',
           action: decision.action,
@@ -245,6 +259,11 @@ async function attemptAutopilotSelfUpgrade(
           outcome: 'skipped',
           reason: decision.reason,
         });
+      }
+      if (decision.action === 'supervised_release') {
+        console.log(
+          `[autopilot] self-upgrade paused: ${latestVersion} requires supervised staged promotion.`,
+        );
       }
       return;
     }
@@ -256,7 +275,8 @@ async function attemptAutopilotSelfUpgrade(
     console.log(`[autopilot] self-upgrade: applying ${VERSION} -> ${latestVersion} (idle, quiet hours).`);
 
     try {
-      execSync('gbrain upgrade --swap-only', {
+      const invocation = resolveAutopilotUpgradeInvocation(latestVersion);
+      execFileSync(invocation[0]!, invocation.slice(1), {
         stdio: 'inherit',
         timeout: 300_000,
         env: { ...process.env, GBRAIN_SKIP_STARTUP_HOOKS: '1' },

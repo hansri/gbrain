@@ -82,6 +82,7 @@ export type RemoteUrlErrorCode =
   | 'invalid_url'
   | 'unsupported_scheme'
   | 'embedded_credentials'
+  | 'url_parameters'
   | 'path_traversal'
   | 'internal_target'
   | 'dns_resolution_failed';
@@ -107,7 +108,12 @@ export function canonicalRemoteUrl(remoteUrl: string): string {
   let parsed: URL;
   try { parsed = new URL(remoteUrl); }
   catch { throw new RemoteUrlError('invalid_url', `URL malformed: ${remoteUrl}`); }
-  parsed.hash = '';
+  if (parsed.search || parsed.hash) {
+    throw new RemoteUrlError(
+      'url_parameters',
+      'Git remote URLs must not contain query strings or fragments; pass credentials separately',
+    );
+  }
   if (parsed.protocol === 'file:') {
     if (process.env.GBRAIN_GIT_ALLOW_FILE_TRANSPORT !== '1' || (parsed.hostname && parsed.hostname !== 'localhost')) {
       throw new RemoteUrlError('unsupported_scheme', 'file transport is disabled');
@@ -314,6 +320,12 @@ export function parseRemoteUrl(s: string): ParsedRemoteUrl {
     throw new RemoteUrlError(
       'embedded_credentials',
       'URL must not contain embedded credentials (https://user:pass@host)',
+    );
+  }
+  if (url.search || url.hash) {
+    throw new RemoteUrlError(
+      'url_parameters',
+      'Git remote URLs must not contain query strings or fragments; pass credentials separately',
     );
   }
   if (s.includes('..')) {

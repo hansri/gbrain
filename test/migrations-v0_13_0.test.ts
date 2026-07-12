@@ -1,16 +1,16 @@
 /**
  * Tests for the v0.13.0 frontmatter relationship indexing migration.
  *
- * Iron rule (regression guard for Bug 1, v0.14.0 upgrade night): phase
- * handlers must shell out to the bare string `gbrain`, NOT to
- * `process.execPath`. On bun-installed trees execPath is the bun runtime;
- * `bun extract ...` gets interpreted as `bun run extract` and the upgrade
- * crashes mid-migration. The canonical shim on PATH is the right target.
+ * Iron rule: phase handlers pass structured subcommand argv to the shared
+ * wrapper. The wrapper binds Bun source runs as `bun <current cli entry>` and
+ * compiled runs to the current executable, so neither PATH's old shim nor a
+ * bare `bun extract` can cross release boundaries during staged upgrades.
  */
 
 import { describe, test, expect } from 'bun:test';
 import { readFileSync } from 'fs';
 import { join } from 'path';
+import { migrationTestOpts } from './helpers/migration-opts.ts';
 
 const SRC_PATH = join(__dirname, '..', 'src', 'commands', 'migrations', 'v0_13_0.ts');
 
@@ -33,7 +33,7 @@ describe('v0.13.0 — Frontmatter relationship indexing migration', () => {
 
   test('dry-run skips all side-effect phases', async () => {
     const { v0_13_0 } = await import('../src/commands/migrations/v0_13_0.ts');
-    const result = await v0_13_0.orchestrator({ yes: true, dryRun: true, noAutopilotInstall: true });
+    const result = await v0_13_0.orchestrator(migrationTestOpts({ yes: true, dryRun: true, noAutopilotInstall: true }));
     expect(result.version).toBe('0.13.0');
     for (const phase of result.phases) {
       expect(phase.status).toBe('skipped');
@@ -59,25 +59,22 @@ describe('v0.13.0 — Frontmatter relationship indexing migration', () => {
     expect(src).not.toMatch(/\$\{GBRAIN\}/);
   });
 
-  test('phases use in-process schema + bare `gbrain` subprocess (v0.41.37.0 #1605)', () => {
+  test('phases use in-process schema + structured same-release subprocess', () => {
     const src = readFileSync(SRC_PATH, 'utf-8');
     // Schema bring-up is now IN-PROCESS (was execSync('gbrain init
     // --migrate-only'), which died with getaddrinfo ENOTFOUND on Windows).
-    expect(src).toContain('runMigrateOnlyCore()');
+    expect(src).toContain('runSnapshotMigrateOnly(opts)');
     expect(src).not.toContain("execSync('gbrain init --migrate-only'");
-    // Backfill extract goes through the stderr-capturing wrapper (still bare
-    // `gbrain` so the canonical shim on PATH wins).
-    expect(src).toContain("runGbrainSubprocess('gbrain extract links --source db --include-frontmatter'");
-    // Stats readback still shells out (reads stdout); bare gbrain.
-    expect(src).toContain("execSync('gbrain call get_stats'");
+    // Backfill extract goes through the stderr-capturing wrapper as argv.
+    expect(src).toContain("runGbrainSubprocess(['extract', 'links', '--source', 'db', '--include-frontmatter']");
+    // Stats readback uses the same snapshot-pinned child wrapper.
+    expect(src).toContain("runGbrainSubprocess(['call', 'get_stats']");
   });
 
-  test('phase commands never reference `bun` or `.ts` paths (Bug 1 regression)', () => {
-    // Belt-and-suspenders: even if someone reintroduces a runtime-path
-    // helper, they must not produce `bun ...` or `<path>.ts` as the spawn
-    // target.
+  test('phase commands never embed a PATH shim or shell control syntax', () => {
     const src = readFileSync(SRC_PATH, 'utf-8');
-    expect(src).not.toMatch(/execSync\([^)]*\bbun\b/);
-    expect(src).not.toMatch(/execSync\([^)]*\.ts/);
+    expect(src).not.toContain("runGbrainSubprocess('gbrain ");
+    expect(src).not.toContain('2>/dev/null');
+    expect(src).not.toContain(' || gbrain ');
   });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withEnv } from './helpers/with-env.ts';
@@ -11,16 +11,20 @@ import {
   formatMarker,
   isCacheFresh,
   isSnoozeActive,
+  locksDir,
   parseMarker,
   readSnooze,
   readUpdateCache,
   reconcileBreadcrumb,
   resolveSelfUpgradeMode,
+  releaseRefreshLock,
   snoozeDurationMs,
   writeSnooze,
   writeUpdateCache,
+  tryAcquireRefreshLock,
   type DecideSelfUpgradeInputs,
 } from '../src/core/self-upgrade.ts';
+import { acquirePackLock } from '../src/core/schema-pack/pack-lock.ts';
 
 function baseInputs(over: Partial<DecideSelfUpgradeInputs> = {}): DecideSelfUpgradeInputs {
   return {
@@ -97,6 +101,7 @@ describe('decideSelfUpgrade — pure branches', () => {
           idle: true,
           inQuietHours: true,
           canSelfUpdate: true,
+          releaseAllowsSilentUpgrade: true,
           throttledByInterval: false,
           ...over,
         }),
@@ -116,6 +121,10 @@ describe('decideSelfUpgrade — pure branches', () => {
     });
     test('cannot self-update → unsupported_install', () => {
       expect(auto({ canSelfUpdate: false }).action).toBe('unsupported_install');
+    });
+    test('supervised/unknown target policy blocks silent apply', () => {
+      expect(auto({ releaseAllowsSilentUpgrade: false }).action).toBe('supervised_release');
+      expect(auto({ releaseAllowsSilentUpgrade: undefined }).action).toBe('supervised_release');
     });
     test('gate order: known_bad beats idle/quiet gates', () => {
       expect(auto({ failedVersions: ['0.43.0'], idle: false }).action).toBe('known_bad');
@@ -226,6 +235,44 @@ describe('cache', () => {
       mkdirSync(gbrainPath(), { recursive: true });
       writeFileSync(gbrainPath('last-update-check'), 'EVIL not a marker');
       expect(readUpdateCache()).toBeNull();
+    });
+  });
+});
+
+describe('refresh single-flight lock', () => {
+  test('returns an opaque owner-aware handle and exact release removes the lock', async () => {
+    await withTmpHome(() => {
+      const handle = tryAcquireRefreshLock();
+      expect(handle).not.toBeNull();
+      expect(typeof handle).toBe('object');
+      expect(typeof handle!.release).toBe('function');
+      const path = join(locksDir(), 'update-refresh.lock');
+      expect(existsSync(path)).toBe(true);
+      releaseRefreshLock(handle!);
+      expect(existsSync(path)).toBe(false);
+    });
+  });
+
+  test('a delayed refresh release cannot remove a replacement owner', async () => {
+    await withTmpHome(() => {
+      const oldHandle = tryAcquireRefreshLock();
+      expect(oldHandle).not.toBeNull();
+      const path = join(locksDir(), 'update-refresh.lock');
+      const oldSentinel = readdirSync(path)[0]!;
+
+      const replacement = acquirePackLock('update-refresh', {
+        lockDir: locksDir(),
+        ttlMs: 30_000,
+        isPidAlive: () => false,
+      });
+      const replacementSentinel = readdirSync(path)[0]!;
+      expect(replacementSentinel).not.toBe(oldSentinel);
+      expect(replacementSentinel).toContain(replacement.record.owner!);
+
+      expect(oldHandle!.refresh()).toBe(false);
+      releaseRefreshLock(oldHandle!);
+      expect(existsSync(join(path, replacementSentinel))).toBe(true);
+      expect(readdirSync(path)).toEqual([replacementSentinel]);
     });
   });
 });

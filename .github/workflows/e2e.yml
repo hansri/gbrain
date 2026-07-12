@@ -20,6 +20,60 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  durability-convergence:
+    # Release-blocking real-Postgres coverage for the multi-source ownership,
+    # writer-lease, and immutable object transitions added in v0.42.59. PGLite
+    # cannot prove the same lock/concurrency behavior, so this job must never
+    # silently skip when DATABASE_URL is absent.
+    name: Durability and convergence (real Postgres)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: pgvector/pgvector@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb  # pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: gbrain_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --pids-limit 256
+          --memory 1g
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.3.13
+      - run: bun install --frozen-lockfile
+      - name: Require DATABASE_URL (no silent skip)
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
+          GBRAIN_TEST_DB: '1'
+        run: test -n "$DATABASE_URL"
+      - name: Run durability and convergence gates
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
+          GBRAIN_TEST_DB: '1'
+        run: >-
+          bun test --max-concurrency=1
+          test/e2e/files-object-safety-postgres.test.ts
+          test/e2e/import-full-convergence-postgres.test.ts
+          test/e2e/source-writer-lease-postgres.test.ts
+          test/e2e/sync-unsyncable-convergence-postgres.test.ts
+          test/e2e/sync-delete-fallback-postgres.test.ts
+          test/e2e/extract-timeline-owner-postgres.test.ts
+          test/e2e/multimodal-postgres.test.ts
+
+  postgres-schema-authority:
+    # Shared with the tag-release workflow so the release-blocking topology and
+    # exact authority regressions cannot drift between validation and publish.
+    uses: ./.github/workflows/postgres-schema-authority.yml
+
   jsonb-parity:
     # Dedicated required guard for the JSONB double-encode bug-class (#2339).
     # PGLite parses a double-encoded jsonb string silently, so this assertion can
@@ -32,7 +86,7 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: pgvector/pgvector@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb  # pg16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -44,15 +98,18 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+          --pids-limit 256
+          --memory 1g
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: 1.3.13
-      - run: bun install
+      - run: bun install --frozen-lockfile
       - name: Require DATABASE_URL (no silent skip)
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
+          GBRAIN_TEST_DB: '1'
         run: |
           if [ -z "$DATABASE_URL" ]; then
             echo "::error::DATABASE_URL must be set for the jsonb-parity job — the #2339 guard would silently skip (the exact failure PGLite hides). Failing the job." >&2
@@ -61,6 +118,7 @@ jobs:
       - name: Run JSONB double-encode parity tests on real Postgres
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
+          GBRAIN_TEST_DB: '1'
         run: bun test test/e2e/op-checkpoint-jsonb-parity.test.ts test/e2e/jsonb-roundtrip.test.ts
 
   tier1:
@@ -69,7 +127,7 @@ jobs:
     timeout-minutes: 20
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: pgvector/pgvector@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb  # pg16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -81,16 +139,19 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+          --pids-limit 256
+          --memory 1g
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: 1.3.13
-      - run: bun install
+      - run: bun install --frozen-lockfile
       - name: Run Tier 1 E2E tests
         run: bun test test/e2e/mechanical.test.ts test/e2e/mcp.test.ts
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
+          GBRAIN_TEST_DB: '1'
 
   tier2:
     name: Tier 2 (LLM Skills)
@@ -103,7 +164,7 @@ jobs:
     timeout-minutes: 30
     services:
       postgres:
-        image: pgvector/pgvector:pg16
+        image: pgvector/pgvector@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb  # pg16
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -115,12 +176,14 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+          --pids-limit 256
+          --memory 1g
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
         with:
           bun-version: 1.3.13
-      - run: bun install
+      - run: bun install --frozen-lockfile
       - name: Install OpenClaw
         # Bound + retry the install: a transient npm/registry stall here used to
         # hang unbounded and (since the v0.42.50.0 job timeout) burn the entire
@@ -148,7 +211,8 @@ jobs:
                 "command": "bun",
                 "args": ["run", "src/cli.ts", "serve"],
                 "env": {
-                  "DATABASE_URL": "${{ env.DATABASE_URL }}"
+                  "DATABASE_URL": "postgresql://postgres:postgres@localhost:5432/gbrain_test",
+                  "GBRAIN_TEST_DB": "1"
                 }
               }
             }
@@ -158,6 +222,7 @@ jobs:
         run: bun test test/e2e/skills.test.ts test/e2e/zeroentropy-live.test.ts
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
+          GBRAIN_TEST_DB: '1'
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           # v0.33.3.0: ZE live API tests skip gracefully when this is unset,

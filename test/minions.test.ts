@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGlite } from '@electric-sql/pglite';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { MinionQueue } from '../src/core/minions/queue.ts';
+import { MinionQueue, MinionQueueBackpressureError } from '../src/core/minions/queue.ts';
 import { MinionWorker } from '../src/core/minions/worker.ts';
 import { calculateBackoff } from '../src/core/minions/backoff.ts';
 import { UnrecoverableError } from '../src/core/minions/types.ts';
@@ -1872,6 +1872,84 @@ describe('MinionQueue: v0.19.1 maxWaiting — cap correctness + race (D2/H2)', (
     const b = await queue.add('isolate', {}, { maxWaiting: 1, queue: 'shell' });
     expect(b.id).not.toBe(a.id);
     expect(b.queue).toBe('shell');
+  });
+
+  test('exact key partitions never coalesce, reject, or return a foreign producer job', async () => {
+    const sourceAKey = 'ingest:webhook:client-a:source-a:';
+    const sourceBKey = 'ingest:webhook:client-b:source-b:';
+    const sourceA = await queue.add(
+      'ingest_capture',
+      { sourceId: 'source-a', event: { source_id: 'source-a' } },
+      {
+        maxWaiting: 1,
+        maxWaitingKey: sourceAKey,
+        maxWaitingBehavior: 'reject',
+        idempotency_key: `${sourceAKey}hash-a-1`,
+      },
+    );
+
+    await expect(queue.add(
+      'ingest_capture',
+      { sourceId: 'source-a', event: { source_id: 'source-a' } },
+      {
+        maxWaiting: 1,
+        maxWaitingKey: sourceAKey,
+        maxWaitingBehavior: 'reject',
+        idempotency_key: `${sourceAKey}hash-a-2`,
+      },
+    )).rejects.toBeInstanceOf(MinionQueueBackpressureError);
+
+    // Source B has its own exact idempotency-key partition. A full source-A
+    // partition must not count against it or return source A's waiting row.
+    const sourceB = await queue.add(
+      'ingest_capture',
+      { sourceId: 'source-b', event: { source_id: 'source-b' } },
+      {
+        maxWaiting: 1,
+        maxWaitingKey: sourceBKey,
+        maxWaitingBehavior: 'reject',
+        idempotency_key: `${sourceBKey}hash-b-1`,
+      },
+    );
+    expect(sourceB.id).not.toBe(sourceA.id);
+    expect(sourceB.data.sourceId).toBe('source-b');
+
+    const rows = await engine.executeRaw<{ id: number; source_id: string }>(
+      `SELECT id, data->>'sourceId' AS source_id
+       FROM minion_jobs
+       WHERE name = 'ingest_capture'
+       ORDER BY id`,
+    );
+    expect(rows).toEqual([
+      { id: sourceA.id, source_id: 'source-a' },
+      { id: sourceB.id, source_id: 'source-b' },
+    ]);
+  });
+
+  test('same-content idempotency wins before reject-mode backpressure', async () => {
+    const key = 'ingest:webhook:client-a:source-a:';
+    const idempotencyKey = `${key}same-content-hash`;
+    const first = await queue.add('ingest_capture', { sourceId: 'source-a' }, {
+      maxWaiting: 1,
+      maxWaitingKey: key,
+      maxWaitingBehavior: 'reject',
+      idempotency_key: idempotencyKey,
+    });
+    const retry = await queue.add('ingest_capture', { sourceId: 'source-a' }, {
+      maxWaiting: 1,
+      maxWaitingKey: key,
+      maxWaitingBehavior: 'reject',
+      idempotency_key: idempotencyKey,
+    });
+    expect(retry.id).toBe(first.id);
+  });
+
+  test('scoped maxWaiting fails closed unless the key exactly prefixes idempotency_key', async () => {
+    await expect(queue.add('poll', {}, {
+      maxWaiting: 1,
+      maxWaitingKey: 'principal-a:',
+      idempotency_key: 'principal-b:event-1',
+    })).rejects.toThrow('maxWaitingKey must be a prefix of idempotency_key');
   });
 
   test('unset maxWaiting — normal submit path, no coalesce, no cap', async () => {

@@ -1,14 +1,21 @@
-// v0.40.6.0 — pack-lock.ts contract tests.
-//
-// Pins the atomic-acquire, stale-detection, refresh, and cleanup behavior
-// that the schema cathedral v3 mutation skeleton depends on.
+// v0.40.6.0 — owner-sentinel directory lock contract tests.
 
-import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
-import { existsSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  utimesSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   acquirePackLock,
+  holdPackLock,
   isLockStale,
   PackLockBusyError,
   withPackLock,
@@ -27,201 +34,306 @@ afterEach(() => {
 
 const liveAlways = (_pid: number): boolean => true;
 const deadAlways = (_pid: number): boolean => false;
+const OWNER_A = '11111111-1111-4111-8111-111111111111';
 
-describe('acquirePackLock — clean acquire', () => {
-  it('atomically creates the lockfile on first call', () => {
+function packLockPath(pack = 'foo'): string {
+  return join(lockDir, `${pack}.lock`);
+}
+
+function ownerPath(owner: string, pack = 'foo'): string {
+  return join(packLockPath(pack), `owner-${owner}.json`);
+}
+
+function readOwner(pack = 'foo'): { name: string; raw: string; record: LockFileRecord } {
+  const names = readdirSync(packLockPath(pack));
+  expect(names).toHaveLength(1);
+  const name = names[0]!;
+  const raw = readFileSync(join(packLockPath(pack), name), 'utf-8');
+  return { name, raw, record: JSON.parse(raw) as LockFileRecord };
+}
+
+function seedOwnedLock(overrides: Partial<LockFileRecord> = {}): LockFileRecord {
+  const record: LockFileRecord = {
+    owner: OWNER_A,
+    pid: 99_999,
+    hostname: 'test',
+    ts: Date.now(),
+    ttlMs: 60_000,
+    ...overrides,
+  };
+  mkdirSync(packLockPath());
+  writeFileSync(ownerPath(record.owner!), JSON.stringify(record), 'utf-8');
+  return record;
+}
+
+function setMtime(path: string, timestampMs: number): void {
+  const timestamp = new Date(timestampMs);
+  utimesSync(path, timestamp, timestamp);
+}
+
+describe('acquirePackLock — owner-sentinel directory protocol', () => {
+  it('atomically creates a lock directory with one unique owner sentinel', () => {
     const result = acquirePackLock('foo', { lockDir });
     expect(result.outcome).toBe('acquired');
-    expect(existsSync(join(lockDir, 'foo.lock'))).toBe(true);
+    expect(existsSync(packLockPath())).toBe(true);
+    const stored = readOwner();
+    expect(stored.record).toEqual(result.record);
+    expect(stored.name).toBe(`owner-${result.record.owner}.json`);
     expect(result.record.pid).toBe(process.pid);
-    expect(result.record.ttlMs).toBeGreaterThan(0);
-  });
-
-  it('writes valid JSON record with pid, ts, ttlMs, hostname', () => {
-    acquirePackLock('foo', { lockDir, ttlMs: 12345 });
-    const raw = readFileSync(join(lockDir, 'foo.lock'), 'utf-8');
-    const parsed = JSON.parse(raw) as LockFileRecord;
-    expect(parsed.pid).toBe(process.pid);
-    expect(parsed.ttlMs).toBe(12345);
-    expect(typeof parsed.ts).toBe('number');
-    expect(typeof parsed.hostname).toBe('string');
+    expect(result.record.owner).toMatch(/^[0-9a-f-]{36}$/);
   });
 
   it('auto-creates the parent directory on first acquire', () => {
     const deepDir = join(lockDir, 'a', 'b', 'c');
     const result = acquirePackLock('bar', { lockDir: deepDir });
     expect(result.outcome).toBe('acquired');
-    expect(existsSync(join(deepDir, 'bar.lock'))).toBe(true);
+    expect(existsSync(join(deepDir, 'bar.lock', `owner-${result.record.owner}.json`))).toBe(true);
+  });
+
+  it('uses a different owner token for every pack acquisition', () => {
+    const first = acquirePackLock('first', { lockDir });
+    const second = acquirePackLock('second', { lockDir });
+    expect(first.record.owner).not.toBe(second.record.owner);
+  });
+
+  it('rejects path traversal before creating anything outside lockDir', () => {
+    const escaped = join(lockDir, '..', 'escaped.lock');
+    expect(() => acquirePackLock('../escaped', { lockDir })).toThrow(/invalid pack lock name/);
+    expect(() => acquirePackLock('/tmp/escaped', { lockDir })).toThrow(/invalid pack lock name/);
+    expect(existsSync(escaped)).toBe(false);
   });
 });
 
-describe('acquirePackLock — contention', () => {
-  it('refuses when lock is held by live process with non-expired TTL', () => {
-    // Hand-craft a live, fresh lock.
-    const lockPath = join(lockDir, 'foo.lock');
-    const record: LockFileRecord = {
-      pid: 99999,
-      hostname: 'test',
-      ts: Date.now(),
-      ttlMs: 60_000,
-    };
-    writeFileSync(lockPath, JSON.stringify(record), 'utf-8');
-
-    expect(() =>
-      acquirePackLock('foo', { lockDir, isPidAlive: liveAlways }),
-    ).toThrow(PackLockBusyError);
+describe('acquirePackLock — contention and stale recovery', () => {
+  it('refuses a fresh live holder', () => {
+    seedOwnedLock();
+    expect(() => acquirePackLock('foo', { lockDir, isPidAlive: liveAlways }))
+      .toThrow(PackLockBusyError);
   });
 
-  it('steals lock when holder PID is dead', () => {
-    const lockPath = join(lockDir, 'foo.lock');
-    writeFileSync(lockPath, JSON.stringify({
-      pid: 99999, hostname: 'test', ts: Date.now(), ttlMs: 60_000,
-    }), 'utf-8');
-
+  it('recovers a holder whose PID is confirmed dead', () => {
+    seedOwnedLock();
     const result = acquirePackLock('foo', { lockDir, isPidAlive: deadAlways });
     expect(result.outcome).toBe('stolen_stale');
     expect(result.record.pid).toBe(process.pid);
+    expect(result.record.owner).not.toBe(OWNER_A);
+    expect(readOwner().record.owner).toBe(result.record.owner);
   });
 
-  it('steals lock when TTL is expired even if PID is alive', () => {
-    const lockPath = join(lockDir, 'foo.lock');
-    writeFileSync(lockPath, JSON.stringify({
-      pid: 99999, hostname: 'test', ts: Date.now() - 120_000, ttlMs: 60_000,
-    }), 'utf-8');
-
-    const result = acquirePackLock('foo', { lockDir, isPidAlive: liveAlways });
-    expect(result.outcome).toBe('stolen_stale');
+  it('never steals a TTL-expired live holder', () => {
+    seedOwnedLock({ ts: Date.now() - 120_000, ttlMs: 60_000 });
+    expect(() => acquirePackLock('foo', { lockDir, isPidAlive: liveAlways }))
+      .toThrow(PackLockBusyError);
+    expect(readOwner().record.owner).toBe(OWNER_A);
   });
 
-  it('steals lock with --force even when live + non-stale', () => {
-    const lockPath = join(lockDir, 'foo.lock');
-    writeFileSync(lockPath, JSON.stringify({
-      pid: 99999, hostname: 'test', ts: Date.now(), ttlMs: 60_000,
-    }), 'utf-8');
-
-    const result = acquirePackLock('foo', { lockDir, force: true, isPidAlive: liveAlways });
-    expect(result.outcome).toBe('forced');
-    expect(result.record.pid).toBe(process.pid);
+  it('force never steals a live holder, even after TTL expiry', () => {
+    seedOwnedLock({ ts: Date.now() - 120_000, ttlMs: 60_000 });
+    expect(() => acquirePackLock('foo', {
+      lockDir,
+      force: true,
+      isPidAlive: liveAlways,
+    })).toThrow(PackLockBusyError);
+    expect(readOwner().record.owner).toBe(OWNER_A);
   });
 
-  it('PackLockBusyError carries heldBy + ageMs + ttlMs', () => {
-    const lockPath = join(lockDir, 'foo.lock');
+  it('PackLockBusyError carries holder diagnostics', () => {
     const past = Date.now() - 1500;
-    writeFileSync(lockPath, JSON.stringify({
-      pid: 88888, hostname: 'test', ts: past, ttlMs: 60_000,
-    }), 'utf-8');
-
+    seedOwnedLock({ pid: 88_888, ts: past });
     try {
       acquirePackLock('foo', { lockDir, isPidAlive: liveAlways });
       throw new Error('expected throw');
     } catch (err) {
       expect(err).toBeInstanceOf(PackLockBusyError);
       const lockErr = err as PackLockBusyError;
-      expect(lockErr.heldBy).toBe(88888);
+      expect(lockErr.heldBy).toBe(88_888);
       expect(lockErr.ageMs).toBeGreaterThanOrEqual(1500);
       expect(lockErr.ttlMs).toBe(60_000);
     }
   });
 });
 
-describe('acquirePackLock — corruption recovery', () => {
-  it('steals when lockfile content is unparseable', () => {
-    const lockPath = join(lockDir, 'foo.lock');
-    writeFileSync(lockPath, 'not-valid-json{{{', 'utf-8');
-    const result = acquirePackLock('foo', { lockDir, isPidAlive: liveAlways });
-    expect(result.outcome).toBe('stolen_stale');
+describe('ambiguous and legacy state fails closed', () => {
+  it('quarantines a just-created empty directory as publishing', () => {
+    const now = 1_800_000_000_000;
+    mkdirSync(packLockPath());
+    setMtime(packLockPath(), now);
+    expect(() => acquirePackLock('foo', {
+      lockDir,
+      force: true,
+      now: () => now + 500,
+      isPidAlive: deadAlways,
+    })).toThrow(/still being published/);
+    expect(readdirSync(packLockPath())).toHaveLength(0);
   });
 
-  it('steals when lockfile is empty', () => {
-    const lockPath = join(lockDir, 'foo.lock');
-    writeFileSync(lockPath, '', 'utf-8');
-    const result = acquirePackLock('foo', { lockDir, isPidAlive: liveAlways });
-    expect(result.outcome).toBe('stolen_stale');
+  it('does not auto-remove an abandoned empty directory after grace', () => {
+    const now = 1_800_000_000_000;
+    mkdirSync(packLockPath());
+    setMtime(packLockPath(), now - 60_001);
+    expect(() => acquirePackLock('foo', {
+      lockDir,
+      force: true,
+      now: () => now,
+      isPidAlive: deadAlways,
+    })).toThrow(/no owner sentinel/);
+    expect(readdirSync(packLockPath())).toHaveLength(0);
   });
 
-  it('steals when lockfile shape is missing required fields', () => {
-    const lockPath = join(lockDir, 'foo.lock');
-    writeFileSync(lockPath, JSON.stringify({ pid: 'not-a-number' }), 'utf-8');
-    const result = acquirePackLock('foo', { lockDir, isPidAlive: liveAlways });
-    expect(result.outcome).toBe('stolen_stale');
+  it('does not auto-remove a malformed owner sentinel', () => {
+    mkdirSync(packLockPath());
+    writeFileSync(join(packLockPath(), 'owner-not-a-uuid.json'), 'not-json', 'utf-8');
+    expect(() => acquirePackLock('foo', {
+      lockDir,
+      force: true,
+      isPidAlive: deadAlways,
+    })).toThrow(/malformed or multiple/);
+    expect(existsSync(join(packLockPath(), 'owner-not-a-uuid.json'))).toBe(true);
+  });
+
+  it('does not auto-remove multiple owner sentinels', () => {
+    seedOwnedLock();
+    writeFileSync(join(packLockPath(), 'unexpected'), 'x');
+    expect(() => acquirePackLock('foo', {
+      lockDir,
+      force: true,
+      isPidAlive: deadAlways,
+    })).toThrow(/malformed or multiple/);
+    expect(readdirSync(packLockPath())).toHaveLength(2);
+  });
+
+  it('fails closed on an old file lock instead of inspect-then-unlink recovery', () => {
+    writeFileSync(packLockPath(), JSON.stringify({
+      owner: OWNER_A,
+      pid: 99_999,
+      hostname: 'test',
+      ts: Date.now() - 120_000,
+      ttlMs: 60_000,
+    }));
+    expect(() => acquirePackLock('foo', {
+      lockDir,
+      force: true,
+      isPidAlive: deadAlways,
+    })).toThrow(/legacy\/unsupported lock file/);
+    expect(readFileSync(packLockPath(), 'utf-8')).toContain(OWNER_A);
   });
 });
 
-describe('isLockStale — policy unit tests', () => {
-  it('returns live when ts is fresh and pid is alive', () => {
-    const rec: LockFileRecord = { pid: 1, hostname: 'h', ts: 1000, ttlMs: 60_000 };
+describe('isLockStale — live PID is the hard fence', () => {
+  it('returns live when fresh and alive', () => {
+    const rec: LockFileRecord = { owner: OWNER_A, pid: 1, hostname: 'h', ts: 1000, ttlMs: 60_000 };
     expect(isLockStale(rec, 30_000, liveAlways)).toEqual({ stale: false, reason: 'live' });
   });
 
-  it('returns ttl_expired when age > ttl, regardless of PID', () => {
-    const rec: LockFileRecord = { pid: 1, hostname: 'h', ts: 1000, ttlMs: 1000 };
-    expect(isLockStale(rec, 5000, liveAlways)).toEqual({ stale: true, reason: 'ttl_expired' });
+  it('returns live when TTL expired but PID remains alive', () => {
+    const rec: LockFileRecord = { owner: OWNER_A, pid: 1, hostname: 'h', ts: 1000, ttlMs: 1000 };
+    expect(isLockStale(rec, 5000, liveAlways)).toEqual({ stale: false, reason: 'live' });
   });
 
-  it('returns pid_dead when age <= ttl but PID is dead', () => {
-    const rec: LockFileRecord = { pid: 1, hostname: 'h', ts: 1000, ttlMs: 60_000 };
+  it('returns pid_dead for a fresh dead holder', () => {
+    const rec: LockFileRecord = { owner: OWNER_A, pid: 1, hostname: 'h', ts: 1000, ttlMs: 60_000 };
     expect(isLockStale(rec, 2000, deadAlways)).toEqual({ stale: true, reason: 'pid_dead' });
   });
 
-  it('checks ttl BEFORE pid (avoids unnecessary kill syscall)', () => {
-    const rec: LockFileRecord = { pid: 1, hostname: 'h', ts: 1000, ttlMs: 1000 };
-    let pidProbed = false;
-    const probe = (_pid: number) => { pidProbed = true; return true; };
-    isLockStale(rec, 5000, probe);
-    expect(pidProbed).toBe(false);
+  it('returns ttl_expired only when the expired holder is also dead', () => {
+    const rec: LockFileRecord = { owner: OWNER_A, pid: 1, hostname: 'h', ts: 1000, ttlMs: 1000 };
+    expect(isLockStale(rec, 5000, deadAlways)).toEqual({ stale: true, reason: 'ttl_expired' });
   });
 });
 
-describe('withPackLock — wrapper contract', () => {
-  it('runs the callback and releases lock on success', async () => {
-    let ran = false;
+describe('withPackLock — async-context ownership', () => {
+  it('runs the callback and releases its owner on success', async () => {
     await withPackLock('foo', { lockDir }, async () => {
-      ran = true;
-      expect(existsSync(join(lockDir, 'foo.lock'))).toBe(true);
+      expect(existsSync(packLockPath())).toBe(true);
     });
-    expect(ran).toBe(true);
-    expect(existsSync(join(lockDir, 'foo.lock'))).toBe(false);
+    expect(existsSync(packLockPath())).toBe(false);
   });
 
-  it('releases lock even when callback throws', async () => {
-    await expect(
-      withPackLock('foo', { lockDir }, async () => {
-        throw new Error('boom');
-      }),
-    ).rejects.toThrow('boom');
-    expect(existsSync(join(lockDir, 'foo.lock'))).toBe(false);
+  it('releases its owner even when the callback throws', async () => {
+    await expect(withPackLock('foo', { lockDir }, async () => {
+      throw new Error('boom');
+    })).rejects.toThrow('boom');
+    expect(existsSync(packLockPath())).toBe(false);
   });
 
   it('returns the callback value', async () => {
-    const result = await withPackLock('foo', { lockDir }, async () => 42);
-    expect(result).toBe(42);
+    expect(await withPackLock('foo', { lockDir }, async () => 42)).toBe(42);
   });
 
-  it('serializes two concurrent withPackLock calls (second throws BUSY)', async () => {
-    let firstReleased = false;
-    const first = withPackLock('foo', { lockDir }, async () => {
-      // Hold for 50ms.
-      await new Promise((r) => setTimeout(r, 50));
-      firstReleased = true;
+  it('reuses the exact owner/path for descendant nested calls, ignoring inner force', async () => {
+    await withPackLock('foo', { lockDir }, async () => {
+      const outer = readOwner();
+      await withPackLock('foo', {
+        lockDir: join(lockDir, '.'),
+        force: true,
+        isPidAlive: deadAlways,
+      }, async () => {
+        const inner = readOwner();
+        expect(inner.name).toBe(outer.name);
+        expect(inner.raw).toBe(outer.raw);
+      });
+      expect(readOwner().name).toBe(outer.name);
     });
-    // Give first a moment to acquire.
-    await new Promise((r) => setTimeout(r, 10));
-    await expect(
-      withPackLock('foo', { lockDir, isPidAlive: liveAlways }, async () => 'second'),
-    ).rejects.toThrow(PackLockBusyError);
+    expect(existsSync(packLockPath())).toBe(false);
+  });
+
+  it('gives an unrelated top-level context LOCK_BUSY, even with force', async () => {
+    let entered!: () => void;
+    const active = new Promise<void>((resolve) => { entered = resolve; });
+    let finish!: () => void;
+    const wait = new Promise<void>((resolve) => { finish = resolve; });
+    const first = withPackLock('foo', { lockDir }, async () => {
+      entered();
+      await wait;
+    });
+    await active;
+    await expect(withPackLock('foo', {
+      lockDir,
+      force: true,
+      isPidAlive: liveAlways,
+    }, async () => 'second')).rejects.toMatchObject({ code: 'LOCK_BUSY' });
+    finish();
     await first;
-    expect(firstReleased).toBe(true);
+  });
+});
+
+describe('owner-aware refresh and release fencing', () => {
+  it('a stale old handle cannot refresh or release a replacement owner', () => {
+    let now = 1_800_000_000_000;
+    const oldHolder = holdPackLock('foo', { lockDir, now: () => now });
+    const oldOwner = readOwner().record.owner;
+
+    now += 1;
+    const newer = acquirePackLock('foo', {
+      lockDir,
+      now: () => now,
+      isPidAlive: deadAlways,
+    });
+    const newerSnapshot = readOwner();
+    expect(newer.record.owner).not.toBe(oldOwner);
+
+    now += 10_000;
+    expect(oldHolder.refresh()).toBe(false);
+    expect(readOwner()).toEqual(newerSnapshot);
+
+    oldHolder.release();
+    expect(readOwner()).toEqual(newerSnapshot);
+  });
+
+  it('an exact owner handle releases idempotently', () => {
+    const holder = holdPackLock('foo', { lockDir });
+    expect(existsSync(packLockPath())).toBe(true);
+    holder.release();
+    holder.release();
+    expect(existsSync(packLockPath())).toBe(false);
   });
 });
 
 describe('cleanup invariants', () => {
-  it('does not leak file descriptors across many acquire/release cycles', async () => {
-    // Smoke test — 100 cycles. If we leaked fds, EMFILE would eventually fire.
+  it('does not leak lock directories across many acquire/release cycles', async () => {
     for (let i = 0; i < 100; i++) {
-      await withPackLock('foo', { lockDir }, async () => {
-        return i;
-      });
+      await withPackLock('foo', { lockDir }, async () => i);
     }
-    expect(existsSync(join(lockDir, 'foo.lock'))).toBe(false);
+    expect(existsSync(packLockPath())).toBe(false);
   });
 });

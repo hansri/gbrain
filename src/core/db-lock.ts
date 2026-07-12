@@ -401,7 +401,7 @@ export async function tryAcquireDbLock(
   try {
     const snap = await inspectLock(engine, lockId);
     if (snap && !snap.ttl_expired && isHolderDeadLocally(snap.holder_pid, snap.holder_host, snap.age_ms)) {
-      const { deleted } = await deleteLockRow(engine, lockId, snap.holder_pid);
+      const { deleted } = await deleteLockRow(engine, lockId, snap.holder_pid, snap.holder_token);
       if (deleted) {
         const second = await acquireOnce();
         if (second) return second;
@@ -430,6 +430,8 @@ export interface LockSnapshot {
   id: string;
   holder_pid: number;
   holder_host: string;
+  /** Opaque acquisition identity; PID/host alone can be reused. */
+  holder_token: string;
   acquired_at: Date;
   ttl_expires_at: Date;
   age_ms: number;
@@ -457,13 +459,14 @@ interface RawLockRow {
   id?: string;
   holder_pid?: number;
   holder_host?: string;
+  holder_token?: string;
   acquired_at?: Date | string;
   ttl_expires_at?: Date | string;
   last_refreshed_at?: Date | string | null;
 }
 
 /** Canonical column list for every lock SELECT — keep in lockstep with `RawLockRow`. */
-const LOCK_SELECT_COLS = 'id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at';
+const LOCK_SELECT_COLS = 'id, holder_pid, holder_host, holder_token, acquired_at, ttl_expires_at, last_refreshed_at';
 
 /**
  * Row → `LockSnapshot` mapper. Coerces postgres.js Date|string columns to Date
@@ -472,7 +475,7 @@ const LOCK_SELECT_COLS = 'id, holder_pid, holder_host, acquired_at, ttl_expires_
  * ttl). v0.41.13.0: last_refreshed_at may be NULL on pre-v98 brains.
  */
 function rowToLockSnapshot(row: RawLockRow, now: number): LockSnapshot | null {
-  if (row.holder_pid === undefined || !row.acquired_at || !row.ttl_expires_at) return null;
+  if (row.holder_pid === undefined || !row.holder_token || !row.acquired_at || !row.ttl_expires_at) return null;
   const acquired = row.acquired_at instanceof Date ? row.acquired_at : new Date(row.acquired_at);
   const ttlExpires = row.ttl_expires_at instanceof Date ? row.ttl_expires_at : new Date(row.ttl_expires_at);
   const lastRefreshed = row.last_refreshed_at == null
@@ -482,6 +485,7 @@ function rowToLockSnapshot(row: RawLockRow, now: number): LockSnapshot | null {
     id: String(row.id ?? ''),
     holder_pid: Number(row.holder_pid),
     holder_host: String(row.holder_host ?? ''),
+    holder_token: String(row.holder_token),
     acquired_at: acquired,
     ttl_expires_at: ttlExpires,
     age_ms: now - acquired.getTime(),
@@ -515,11 +519,11 @@ async function selectLockRows(engine: BrainEngine, opts: SelectLockRowsOpts = {}
   if (engine.kind === 'postgres' && maybePG.sql) {
     const sql = maybePG.sql as any;
     if (opts.lockId !== undefined) {
-      rows = await sql`SELECT id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at FROM gbrain_cycle_locks WHERE id = ${opts.lockId}`;
+      rows = await sql`SELECT id, holder_pid, holder_host, holder_token, acquired_at, ttl_expires_at, last_refreshed_at FROM gbrain_cycle_locks WHERE id = ${opts.lockId}`;
     } else if (opts.staleOnly) {
-      rows = await sql`SELECT id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at FROM gbrain_cycle_locks WHERE ttl_expires_at < NOW() ORDER BY acquired_at`;
+      rows = await sql`SELECT id, holder_pid, holder_host, holder_token, acquired_at, ttl_expires_at, last_refreshed_at FROM gbrain_cycle_locks WHERE ttl_expires_at < NOW() ORDER BY acquired_at`;
     } else {
-      rows = await sql`SELECT id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at FROM gbrain_cycle_locks ORDER BY acquired_at`;
+      rows = await sql`SELECT id, holder_pid, holder_host, holder_token, acquired_at, ttl_expires_at, last_refreshed_at FROM gbrain_cycle_locks ORDER BY acquired_at`;
     }
   } else if (engine.kind === 'pglite' && maybePGLite.db) {
     if (opts.lockId !== undefined) {
@@ -557,7 +561,7 @@ export async function listStaleLocks(engine: BrainEngine): Promise<LockSnapshot[
 /**
  * v0.41.6.0 D3: atomic verify-and-delete for `gbrain sync --break-lock`.
  *
- * Runs `DELETE ... WHERE id = $1 AND holder_pid = $2 RETURNING id`.
+ * Runs `DELETE ... WHERE id = $1 AND holder_pid = $2 AND holder_token = $3 RETURNING id`.
  * RETURNING shape:
  *   - row returned  → we cleared the lock atomically.
  *   - empty array   → row was already cleared by another process (idempotent;
@@ -571,6 +575,7 @@ export async function deleteLockRow(
   engine: BrainEngine,
   lockId: string,
   holderPid: number,
+  holderToken: string,
 ): Promise<{ deleted: boolean }> {
   const maybePG = engine as unknown as { sql?: (...args: unknown[]) => Promise<unknown> };
   const maybePGLite = engine as unknown as {
@@ -581,7 +586,9 @@ export async function deleteLockRow(
     const sql = maybePG.sql as any;
     const rows: Array<{ id: string }> = await sql`
       DELETE FROM gbrain_cycle_locks
-       WHERE id = ${lockId} AND holder_pid = ${holderPid}
+       WHERE id = ${lockId}
+         AND holder_pid = ${holderPid}
+         AND holder_token = ${holderToken}
       RETURNING id
     `;
     return { deleted: rows.length > 0 };
@@ -589,9 +596,9 @@ export async function deleteLockRow(
   if (engine.kind === 'pglite' && maybePGLite.db) {
     const { rows } = await maybePGLite.db.query(
       `DELETE FROM gbrain_cycle_locks
-        WHERE id = $1 AND holder_pid = $2
+        WHERE id = $1 AND holder_pid = $2 AND holder_token = $3
        RETURNING id`,
-      [lockId, holderPid],
+      [lockId, holderPid, holderToken],
     );
     return { deleted: rows.length > 0 };
   }
@@ -606,12 +613,13 @@ export async function deleteLockRow(
  *   DELETE FROM gbrain_cycle_locks
  *    WHERE id = $1
  *      AND holder_pid = $2
- *      AND last_refreshed_at < NOW() - $3 * INTERVAL '1 second'
+ *      AND holder_token = $3
+ *      AND last_refreshed_at < NOW() - $4 * INTERVAL '1 second'
  *   RETURNING id, last_refreshed_at
  *
- * Three matching conditions in one SQL statement (no TOCTOU window):
+ * Four matching conditions in one SQL statement (no TOCTOU window):
  *   - id matches the per-source lock key
- *   - holder_pid matches the inspected snapshot (defeats PID-reuse races)
+ *   - holder_pid and holder_token match the exact inspected acquisition
  *   - last_refreshed_at is older than maxAgeSeconds ago — the "wedged but
  *     alive" signal. A healthy holder using withRefreshingLock refreshes
  *     every (ttl/6) ms (~5 min for default 30-min TTL), so
@@ -619,7 +627,7 @@ export async function deleteLockRow(
  *     stopped firing (Postgres query timeout, event-loop wedge, etc.)
  *     show a stale value.
  *
- * Why $3 * INTERVAL '1 second' instead of $3::interval: Postgres does NOT
+ * Why $4 * INTERVAL '1 second' instead of $4::interval: Postgres does NOT
  * cast a bare integer to interval via ::interval (that's a string-only
  * cast). The multiplicative form is the canonical idiom and works on both
  * Postgres + PGLite.
@@ -640,6 +648,7 @@ export async function deleteLockRowIfStale(
   engine: BrainEngine,
   lockId: string,
   holderPid: number,
+  holderToken: string,
   maxAgeSeconds: number,
 ): Promise<{ deleted: boolean; lastRefreshedAt: Date | null }> {
   const maybePG = engine as unknown as { sql?: (...args: unknown[]) => Promise<unknown> };
@@ -653,6 +662,7 @@ export async function deleteLockRowIfStale(
       DELETE FROM gbrain_cycle_locks
        WHERE id = ${lockId}
          AND holder_pid = ${holderPid}
+         AND holder_token = ${holderToken}
          AND last_refreshed_at IS NOT NULL
          AND last_refreshed_at < NOW() - ${maxAgeSeconds} * INTERVAL '1 second'
       RETURNING id, last_refreshed_at
@@ -667,10 +677,11 @@ export async function deleteLockRowIfStale(
       `DELETE FROM gbrain_cycle_locks
         WHERE id = $1
           AND holder_pid = $2
+          AND holder_token = $3
           AND last_refreshed_at IS NOT NULL
-          AND last_refreshed_at < NOW() - $3 * INTERVAL '1 second'
+          AND last_refreshed_at < NOW() - $4 * INTERVAL '1 second'
        RETURNING id, last_refreshed_at`,
-      [lockId, holderPid, maxAgeSeconds],
+      [lockId, holderPid, holderToken, maxAgeSeconds],
     );
     if (rows.length === 0) return { deleted: false, lastRefreshedAt: null };
     const r = rows[0] as { id: string; last_refreshed_at: Date | string | null };
@@ -684,8 +695,8 @@ export async function deleteLockRowIfStale(
 /**
  * #1972 — snapshot-matched verify-and-delete for the background reaper.
  *
- * Unlike `deleteLockRow` (id + holder_pid only), this ALSO pins the observed
- * `acquired_at`, closing the TOCTOU window the reaper opens by reading rows
+ * Pins the observed holder token and `acquired_at`, closing the TOCTOU window
+ * the reaper opens by reading rows
  * before deleting them: between the SELECT and the DELETE, the dead holder's
  * row could be replaced by a NEW holder that reused the same numeric PID
  * (PID-space wraps). That new row carries a newer `acquired_at`, so the match
@@ -704,6 +715,7 @@ export async function deleteLockRowExact(
   engine: BrainEngine,
   lockId: string,
   holderPid: number,
+  holderToken: string,
   acquiredAt: Date,
 ): Promise<{ deleted: boolean }> {
   const maybePG = engine as unknown as { sql?: (...args: unknown[]) => Promise<unknown> };
@@ -717,6 +729,7 @@ export async function deleteLockRowExact(
       DELETE FROM gbrain_cycle_locks
        WHERE id = ${lockId}
          AND holder_pid = ${holderPid}
+         AND holder_token = ${holderToken}
          AND date_trunc('milliseconds', acquired_at) = ${acquiredAt}
       RETURNING id
     `;
@@ -727,9 +740,10 @@ export async function deleteLockRowExact(
       `DELETE FROM gbrain_cycle_locks
         WHERE id = $1
           AND holder_pid = $2
-          AND date_trunc('milliseconds', acquired_at) = $3
+          AND holder_token = $3
+          AND date_trunc('milliseconds', acquired_at) = $4
        RETURNING id`,
-      [lockId, holderPid, acquiredAt],
+      [lockId, holderPid, holderToken, acquiredAt],
     );
     return { deleted: rows.length > 0 };
   }
@@ -756,7 +770,7 @@ export async function deleteLockRowExact(
  *     ├─ holder_host != thisHost ──────────────→ KEEP (cross_host; can't probe)
  *     ├─ kill(pid,0) == alive / EPERM ─────────→ KEEP (live or not-ours)
  *     ├─ ESRCH && age < 60s grace ─────────────→ KEEP (PID-reuse defense)
- *     └─ ESRCH && age ≥ 60s grace ─────────────→ deleteLockRowExact(id, pid, acquired_at)
+ *     └─ ESRCH && age ≥ 60s grace ─────────────→ deleteLockRowExact(id, pid, token, acquired_at)
  *                                                  (snapshot-matched: reused-PID
  *                                                   fresh row has newer acquired_at → no-op)
  */
@@ -779,7 +793,9 @@ export async function reapDeadHolderLocks(
     // isHolderDeadLocally combines same-host + ESRCH + the 60s reuse grace,
     // so pure-PID-liveness (which PID-space wrap defeats) is never used alone.
     if (!isHolderDeadLocally(s.holder_pid, s.holder_host, s.age_ms, opts)) continue;
-    const { deleted } = await deleteLockRowExact(engine, s.id, s.holder_pid, s.acquired_at);
+    const { deleted } = await deleteLockRowExact(
+      engine, s.id, s.holder_pid, s.holder_token, s.acquired_at,
+    );
     if (deleted) reapedIds.push(s.id);
   }
   return { reaped: reapedIds.length, reapedIds };

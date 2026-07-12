@@ -337,8 +337,8 @@ CREATE INDEX IF NOT EXISTS idx_raw_data_page ON raw_data(page_id);
 -- ============================================================
 -- files: binary asset metadata (v0.27.1 — PGLite parity for multimodal)
 -- Image bytes never enter the DB; storage_path references a path in the
--- brain repo. Identity is (source_id, storage_path); upserts replace metadata
--- in place without colliding with another source that uses the same path.
+-- brain repo. The composite identity is present, while the legacy global
+-- constraint remains during the canary for previous-binary rollback.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS files (
   id           SERIAL PRIMARY KEY,
@@ -352,7 +352,8 @@ CREATE TABLE IF NOT EXISTS files (
   size_bytes   BIGINT,
   content_hash TEXT   NOT NULL,
   metadata     JSONB  NOT NULL DEFAULT '{}',
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT files_storage_path_key UNIQUE(storage_path)
 );
 
 CREATE INDEX IF NOT EXISTS idx_files_page ON files(page_slug);

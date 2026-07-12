@@ -7,28 +7,22 @@
  *     present + correct; localOnly ops are filtered out of the canonical
  *     mcpOperations list; hasScope semantics work for the standard tiers.
  *
- *   - Handler-invocation cases for ops that are NOT localOnly but DO
- *     enforce remote/scope at the handler layer (defense-in-depth where
- *     it actually fires in production):
+ *   - Handler-invocation cases for sensitive handlers that retain a
+ *     defense-in-depth remote check even when transport filtering should make
+ *     the path unreachable:
  *
- *       * submit_job   — name='shell' + ctx.remote=true MUST reject
- *                        (the HTTP MCP shell-job RCE class, F7b)
+ *       * submit_job   — every name + ctx.remote=true MUST reject
+ *                        (generic maintenance submission is host-local)
  *       * search_by_image — image_path + ctx.remote=true MUST reject
  *                        (D18 P0 source-isolation leak class)
  *
- *     `file_upload` and `sync_brain` are intentionally NOT in the
- *     handler-invocation set — both are localOnly, so the canonical
- *     filter removes them from mcpOperations and the HTTP path never
- *     reaches their handlers. Calling their handlers with remote=true
- *     tests an impossible production path (codex CMT-3). The defense-
- *     in-depth strict-mode checks inside those handlers still exist;
- *     they're proven by the localOnly-filtered-out contract here.
+ *     The other local-only operations are covered by the structural filter
+ *     contract; submit_job gets an additional direct-handler regression
+ *     because caller-controlled queue payloads are especially sensitive.
  *
  * Criterion for the curated sensitive-ops list:
  *   ops whose HANDLER (not transport) has been broken historically.
- *   Add an op here when a real exploit class is fixed at the handler
- *   level; remove only when the handler-level defense becomes
- *   structurally unreachable (e.g., the op becomes localOnly).
+ *   Add an op here when a real exploit class is fixed at the handler level.
  *
  * Companion guard at scripts/check-operations-filter-bypass.sh enforces
  * the canonical filter site so a future HTTP route can't bypass it.
@@ -153,6 +147,7 @@ describe('mcpOperations filter — localOnly ops are excluded from the HTTP-expo
       'purge_deleted_pages',
       'get_recent_transcripts',
       'code_traversal_cache_clear',
+      'submit_job',
     ];
     const lookup = new Map(operations.map(op => [op.name, op] as const));
     for (const name of KNOWN_LOCAL_ONLY) {
@@ -208,31 +203,25 @@ describe('hasScope — read-only token cannot satisfy write or admin scopes', ()
   });
 });
 
-describe('handler invocation — historically-broken trust-boundary classes', () => {
-  // The two non-localOnly ops whose handler-level defense fires in
-  // production and has been broken historically (F7b HTTP MCP shell-job
-  // RCE; D18 P0 image_path remote-leak). file_upload and sync_brain are
-  // omitted because they're localOnly (codex CMT-3 — testing their
-  // handlers with remote=true tests an impossible production path).
+describe('handler invocation — sensitive trust-boundary classes', () => {
+  // submit_job is localOnly and also rejects direct remote invocation as
+  // defense in depth. search_by_image remains remotely callable, but never
+  // accepts a server-local image path from an untrusted caller.
 
-  test('submit_job rejects shell with ctx.remote=true (HTTP MCP shell-job RCE class)', async () => {
+  test('submit_job rejects every job type with ctx.remote=true', async () => {
     const submitJob = operations.find(op => op.name === 'submit_job');
     expect(submitJob).toBeDefined();
-    const ctx = makeContext({ remote: true });
-
-    let threw = false;
-    let message = '';
-    try {
-      await submitJob!.handler(ctx, { name: 'shell', data: { cmd: 'echo hi' } });
-    } catch (e) {
-      threw = true;
-      message = e instanceof Error ? e.message : String(e);
+    expect(submitJob!.localOnly).toBe(true);
+    for (const [name, data] of [
+      ['shell', { cmd: 'echo hi' }],
+      ['import', { dir: '/etc' }],
+      ['reindex', { repoPath: '/srv/private' }],
+      ['ingest_capture', { remote: false, event: { untrusted_payload: false } }],
+    ] as const) {
+      await expect(
+        submitJob!.handler(makeContext({ remote: true }), { name, data }),
+      ).rejects.toMatchObject({ code: 'permission_denied' });
     }
-    expect(threw, 'submit_job(shell) with remote=true MUST reject').toBe(true);
-    // Should mention the protected status — "permission_denied" is the
-    // canonical OperationError code, plus the user-facing string names
-    // the rejected name.
-    expect(message.toLowerCase()).toContain('shell');
   });
 
   test('submit_job allows shell when ctx.remote=false (local CLI is trusted)', async () => {
@@ -247,14 +236,14 @@ describe('handler invocation — historically-broken trust-boundary classes', ()
     expect(result).toMatchObject({ dry_run: true, action: 'submit_job', name: 'shell' });
   });
 
-  test('submit_job overwrites caller sourceId with authenticated ctx.sourceId', async () => {
+  test('local submit_job overwrites caller sourceId with ctx.sourceId', async () => {
     // resetPgliteState preserves the base schema marker (v1), while the
     // minion queue intentionally refuses to run below its migration gate.
     // The fixture schema already contains minion_jobs, so advance only to the
     // queue's minimum supported version for this handler-level contract test.
     await engine.setConfig('version', '7');
     const submitJob = operations.find(op => op.name === 'submit_job')!;
-    const ctx = makeContext({ remote: true, sourceId: 'trusted-source' });
+    const ctx = makeContext({ remote: false, sourceId: 'trusted-source' });
     const result = await submitJob.handler(ctx, {
       name: 'import',
       data: { dir: '/tmp/fixture', sourceId: 'spoofed-source', noEmbed: true },

@@ -143,7 +143,10 @@ describe('find_trajectory MCP op — visibility filter (R6 / D-CDX-1)', () => {
     const local  = await op.handler(mkCtx({ remote: false }), { entity_slug: 'optraj-vis' }) as any;
     expect(local.points.length).toBe(2);
 
-    const remote = await op.handler(mkCtx({ remote: true  }), { entity_slug: 'optraj-vis' }) as any;
+    const remote = await op.handler(
+      mkCtx({ remote: true, sourceId: 'default' }),
+      { entity_slug: 'optraj-vis' },
+    ) as any;
     expect(remote.points.length).toBe(1);
     expect(remote.points[0].value).toBe(99999);
   });

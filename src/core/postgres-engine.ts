@@ -26,9 +26,8 @@ import { executeRawJsonb } from './sql-query.ts';
 import { databaseIdentity } from './database-identity.ts';
 import { sanitizeForJsonb, buildLinkRows, buildTimelineRows, buildTakeRows } from './batch-rows.ts';
 import { runMigrations } from './migrate.ts';
-import { SCHEMA_SQL } from './schema-embedded.ts';
 import { verifySchema } from './schema-verify.ts';
-import { applyChunkEmbeddingIndexPolicy, dropZombieIndexes } from './vector-index.ts';
+import { dropZombieIndexes } from './vector-index.ts';
 import {
   normalizeEngineColumn,
   buildVectorCastFragment,
@@ -65,30 +64,14 @@ import { logConnectionEvent } from './connection-audit.ts';
 import { validateSlug, contentHash, rowToPage, rowToStalePage, rowToChunk, rowToSearchResult, parseEmbedding, tryParseEmbedding, takeRowToTake, isUndefinedTableError, warnOncePerProcess } from './utils.ts';
 import { resolveBoostMap, resolveHardExcludes } from './search/source-boost.ts';
 import { buildSourceFactorCase, buildHardExcludeClause, buildVisibilityClause, buildRecencyComponentSql, buildBestPerPagePoolCte } from './search/sql-ranking.ts';
-import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
+import { DEFAULT_EMBEDDING_MODEL } from './ai/defaults.ts';
+import { getConfiguredPostgresSchema } from './postgres-schema.ts';
+export { getPostgresSchema } from './postgres-schema.ts';
+import { getOrCreateDatabaseInstanceId } from './database-instance-id.ts';
 import { DELETE_BATCH_SIZE } from './engine-constants.ts';
-
-function escapeSqlStringLiteral(value: string): string {
-  return value.replace(/'/g, "''");
-}
 
 function embeddingModelForChunkWrite(): string {
   return process.env.GBRAIN_EMBEDDING_MODEL?.trim() || DEFAULT_EMBEDDING_MODEL;
-}
-
-export function getPostgresSchema(
-  dims: number = DEFAULT_EMBEDDING_DIMENSIONS,
-  model: string = DEFAULT_EMBEDDING_MODEL,
-): string {
-  const parsedDims = Number(dims);
-  if (!Number.isInteger(parsedDims) || parsedDims <= 0) {
-    throw new Error(`Invalid embedding dimensions: ${dims}`);
-  }
-  const sanitizedModel = escapeSqlStringLiteral(String(model));
-  return applyChunkEmbeddingIndexPolicy(SCHEMA_SQL, parsedDims)
-    .replace(/vector\(1536\)/g, `vector(${parsedDims})`)
-    .replace(/'text-embedding-3-large'/g, `'${sanitizedModel}'`)
-    .replace(/\('embedding_dimensions', '1536'\)/g, `('embedding_dimensions', '${parsedDims}')`);
 }
 
 // CONNECTION_ERROR_PATTERNS / isConnectionError were used by the per-call
@@ -314,6 +297,37 @@ export class PostgresEngine implements BrainEngine {
     // else: nothing to disconnect (already done or never connected)
   }
 
+  /**
+   * Bind every schema-phase engine call to one already-validated DDL pool.
+   * Migration handlers call the full BrainEngine surface (transactions,
+   * config, verification helpers), so passing the ordinary engine would let
+   * them drift back to the read/pooler connection after bootstrap. The scoped
+   * engine deliberately has no ConnectionManager route and fails closed on a
+   * reconnect request; the caller retries initSchema from a fresh authority.
+   */
+  private schemaAuthorityFor(conn: ReturnType<typeof postgres>): PostgresEngine {
+    const authority = Object.create(this) as PostgresEngine;
+    Object.defineProperty(authority, 'sql', { get: () => conn });
+    Object.defineProperty(authority, '_sql', {
+      value: conn,
+      writable: false,
+      configurable: false,
+    });
+    Object.defineProperty(authority, 'connectionManager', {
+      value: null,
+      writable: false,
+      configurable: false,
+    });
+    Object.defineProperty(authority, 'reconnect', {
+      value: async () => {
+        throw new Error('Schema authority connection changed; retry initSchema from preflight');
+      },
+      writable: false,
+      configurable: false,
+    });
+    return authority;
+  }
+
   async initSchema(): Promise<void> {
     // v0.30.1 (X1): route DDL through the direct pool when ConnectionManager
     // is in dual-pool mode. The pooler's 2-min statement_timeout truncates
@@ -321,78 +335,107 @@ export class PostgresEngine implements BrainEngine {
     // 30min. Lane B replaces the lock primitive with a TTL+heartbeat table
     // lock; Lane A does the routing and keeps pg_advisory_lock(42) on the
     // SAME connection so the lock is correct.
+    const workConn = this.sql;
     const conn = this.connectionManager
-      ? await this.connectionManager.ddl()
-      : this.sql;
+      ? await this.connectionManager.schemaDdl()
+      : workConn;
+    const schemaAuthority = this.schemaAuthorityFor(conn);
+    const databaseUrl = this._savedConfig?.database_url;
+    if (!databaseUrl) {
+      throw new GBrainError(
+        'No database URL',
+        'initSchema() was called before a database authority was saved',
+        'Reconnect the engine before running schema migrations.',
+      );
+    }
 
-    // Resolve the embedding dim/model from the gateway. v0.37 fix wave:
-    // fallbacks track the canonical defaults in `ai/defaults.ts` instead of
-    // stale v0.13 OpenAI literals, AND we store the full `provider:model`
-    // string in the DB config table — consumers like ze-switch and doctor
-    // expect the provider prefix. (Round-1 CDX-4 + A.8.)
-    let dims: number = DEFAULT_EMBEDDING_DIMENSIONS;
-    let model: string = DEFAULT_EMBEDDING_MODEL;
-    try {
-      const gw = await import('./ai/gateway.ts');
-      dims = gw.getEmbeddingDimensions();
-      model = gw.getEmbeddingModel() || model;
-    } catch { /* gateway not yet configured — use defaults */ }
+    const sqlText = await getConfiguredPostgresSchema();
 
-    const sqlText = getPostgresSchema(dims, model);
-
-    // Advisory lock prevents concurrent initSchema() calls from deadlocking
-    // on DDL statements (DROP TRIGGER + CREATE TRIGGER acquire AccessExclusiveLock).
-    //
-    // v0.30.1 honest limitation: pg_advisory_lock(42) is session-scoped to
-    // `conn`. When dual-pool routing is active, conn is a direct-pool reserved
-    // backend, so the lock is held for the duration of initSchema. Lane B
-    // replaces this with a TTL+heartbeat table lock that survives pooler-side
-    // session resets.
+    // Serialize concurrent schema replay on a dedicated direct/session-mode
+    // lock connection. `conn` is a pool, not a fixed backend: the former
+    // session-level lock/unlock calls could run on different sessions and leak
+    // key 42 forever. The separate lock client also leaves a one-connection
+    // work pool available to execute the migration body.
     const t0 = Date.now();
     logConnectionEvent({
       pool: this.connectionManager?.isDualPoolActive() ? 'ddl' : 'read',
       op: 'acquire',
       caller: 'PostgresEngine.initSchema',
     });
-    await conn`SELECT pg_advisory_lock(42)`;
     try {
-      // Pre-schema bootstrap: add forward-referenced state the embedded schema
-      // blob requires but that older brains don't have yet (issues #366/#375/
-      // #378/#396 + #266/#357). Idempotent on fresh installs and modern brains.
-      // Threads the DDL connection (same one holding the advisory lock above)
-      // so bootstrap probes run on the locked connection — without this, the
-      // probes ran through `this.sql` (the pooler/instance pool) outside the
-      // lock, opening a concurrent-bootstrap race for Supabase users on the
-      // transaction pooler. Codex P1 finding from v0.36 dreamy-thompson wave.
-      await this.applyForwardReferenceBootstrap(conn);
-
-      await conn.unsafe(sqlText);
-
-      // Run any pending migrations automatically
-      const { applied } = await runMigrations(this);
-      if (applied > 0) {
-        process.stderr.write(`  ${applied} migration(s) applied\n`);
-      }
-
-      // Post-migration schema verification: catches columns that migrations
-      // defined but PgBouncer transaction-mode silently failed to create.
-      // Self-heals missing columns via ALTER TABLE ADD COLUMN IF NOT EXISTS.
-      const verify = await verifySchema(this);
-      if (verify.healed.length > 0) {
-        process.stderr.write(`  Schema verify: self-healed ${verify.healed.length} missing column(s)\n`);
-      }
-
-      // v0.30.1 (Fix 5): sweep zombie HNSW indexes (indisvalid=false) from
-      // crashed CREATE INDEX CONCURRENTLY calls. Best-effort; errors logged
-      // to stderr but never block engine.connect.
-      try {
-        const result = await dropZombieIndexes(this);
-        if (result.dropped.length > 0) {
-          process.stderr.write(`  HNSW sweep: dropped ${result.dropped.length} zombie index(es)\n`);
+      const schemaLockUrl = db.resolveDatabaseSessionLockUrl(
+        databaseUrl,
+        this.connectionManager?.isKillSwitchActive()
+          ? null
+          : this.connectionManager?.resolveDirectUrl(),
+      );
+      await db.withSchemaMigrationLock(schemaLockUrl, async lock => {
+        // Before any config/schema DDL, prove both the configured work route
+        // and the chosen DDL route are public-compatible and reach the exact
+        // database holding the reserved session. A URL pathname comparison is
+        // insufficient: separate clusters may host same-named databases.
+        await db.assertPublicSchemaAuthority(workConn, 'configured work database');
+        await lock.assertSameDatabase(workConn);
+        if (conn !== workConn) {
+          await db.assertPublicSchemaAuthority(conn, 'DDL database');
+          await lock.assertSameDatabase(conn);
         }
-      } catch { /* best-effort */ }
+
+        // Existing brains already own a durable UUID. Prove that the reserved
+        // direct/session lock is on that same brain before any DDL runs; a
+        // stale GBRAIN_DIRECT_DATABASE_URL must not serialize DB B while the
+        // work pool mutates DB A. Fresh brains are covered by the advisory
+        // challenge above and establish their durable UUID after schema replay.
+        const configTable = await schemaAuthority.executeRaw<{ present: string | null }>(
+          "SELECT to_regclass('public.config')::text AS present",
+        );
+        if (configTable[0]?.present) {
+          const expectedBrainId = await getOrCreateDatabaseInstanceId(schemaAuthority);
+          await lock.assertDatabaseIdentity(expectedBrainId);
+        }
+        // Pre-schema bootstrap: add forward-referenced state the embedded schema
+        // blob requires but that older brains don't have yet (issues #366/#375/
+        // #378/#396 + #266/#357). Idempotent on fresh installs and modern brains.
+        // The DDL pool remains under the database-wide migration lock for the
+        // entire bootstrap → schema → migration → verification sequence.
+        await schemaAuthority.transaction(async tx => {
+          await tx.runMigration(0, `SET LOCAL search_path = public`);
+          await (tx as PostgresEngine).applyForwardReferenceBootstrap();
+        });
+
+        await conn.unsafe(`${db.PUBLIC_SCHEMA_SEARCH_PATH_SQL};\n${sqlText}`);
+
+        // Fresh installs gain the same database-owned identity before any
+        // versioned migration runs; existing installs re-assert it on the
+        // identical DDL-backed authority.
+        const expectedBrainId = await getOrCreateDatabaseInstanceId(schemaAuthority);
+        await lock.assertDatabaseIdentity(expectedBrainId);
+
+        // Run any pending migrations automatically
+        const { applied } = await runMigrations(schemaAuthority);
+        if (applied > 0) {
+          process.stderr.write(`  ${applied} migration(s) applied\n`);
+        }
+
+        // Post-migration schema verification: catches columns that migrations
+        // defined but PgBouncer transaction-mode silently failed to create.
+        // Self-heals missing columns via ALTER TABLE ADD COLUMN IF NOT EXISTS.
+        const verify = await verifySchema(schemaAuthority);
+        if (verify.healed.length > 0) {
+          process.stderr.write(`  Schema verify: self-healed ${verify.healed.length} missing column(s)\n`);
+        }
+
+        // v0.30.1 (Fix 5): sweep zombie HNSW indexes (indisvalid=false) from
+        // crashed CREATE INDEX CONCURRENTLY calls. Best-effort; errors logged
+        // to stderr but never block engine.connect.
+        try {
+          const result = await dropZombieIndexes(schemaAuthority);
+          if (result.dropped.length > 0) {
+            process.stderr.write(`  HNSW sweep: dropped ${result.dropped.length} zombie index(es)\n`);
+          }
+        } catch { /* best-effort */ }
+      });
     } finally {
-      await conn`SELECT pg_advisory_unlock(42)`;
       logConnectionEvent({
         pool: this.connectionManager?.isDualPoolActive() ? 'ddl' : 'read',
         op: 'release',
@@ -3885,10 +3928,11 @@ export class PostgresEngine implements BrainEngine {
   // different content_hash overwrites in place.
   async upsertFile(spec: FileSpec): Promise<{ id: number; created: boolean }> {
     const sql = this.sql;
+    const sourceId = spec.source_id ?? 'default';
     const metadata = (spec.metadata ?? {}) as Parameters<typeof sql.json>[0];
     const rows = await sql<Array<{ id: number; created: boolean }>>`
       INSERT INTO files (source_id, page_slug, page_id, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
-      VALUES (${spec.source_id}, ${spec.page_slug ?? null}, ${spec.page_id ?? null}, ${spec.filename}, ${spec.storage_path}, ${spec.mime_type ?? null}, ${spec.size_bytes ?? null}, ${spec.content_hash}, ${sql.json(metadata)})
+      VALUES (${sourceId}, ${spec.page_slug ?? null}, ${spec.page_id ?? null}, ${spec.filename}, ${spec.storage_path}, ${spec.mime_type ?? null}, ${spec.size_bytes ?? null}, ${spec.content_hash}, ${sql.json(metadata)})
       ON CONFLICT (source_id, storage_path) DO UPDATE SET
         page_slug = EXCLUDED.page_slug,
         page_id = EXCLUDED.page_id,
@@ -5436,7 +5480,7 @@ export class PostgresEngine implements BrainEngine {
     const opts = this.getBulkRetryOpts();
     return withRetry(
       async () => {
-        const rows = await this.sql`SELECT value FROM config WHERE key = ${key}`;
+        const rows = await this.sql`SELECT value FROM public.config WHERE key = ${key}`;
         return rows.length > 0 ? (rows[0].value as string) : null;
       },
       {
@@ -5452,14 +5496,14 @@ export class PostgresEngine implements BrainEngine {
   async setConfig(key: string, value: string): Promise<void> {
     const sql = this.sql;
     await sql`
-      INSERT INTO config (key, value) VALUES (${key}, ${value})
+      INSERT INTO public.config (key, value) VALUES (${key}, ${value})
       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
     `;
   }
 
   async unsetConfig(key: string): Promise<number> {
     const sql = this.sql;
-    const result = await sql`DELETE FROM config WHERE key = ${key}` as unknown as { count: number };
+    const result = await sql`DELETE FROM public.config WHERE key = ${key}` as unknown as { count: number };
     return result.count ?? 0;
   }
 
@@ -5469,7 +5513,7 @@ export class PostgresEngine implements BrainEngine {
     const escaped = prefix.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
     const pattern = `${escaped}%`;
     const rows = await sql<{ key: string }[]>`
-      SELECT key FROM config WHERE key LIKE ${pattern} ESCAPE '\\' ORDER BY key
+      SELECT key FROM public.config WHERE key LIKE ${pattern} ESCAPE '\\' ORDER BY key
     `;
     return rows.map(r => r.key);
   }
@@ -5477,7 +5521,26 @@ export class PostgresEngine implements BrainEngine {
   // Migration support
   async runMigration(_version: number, sqlStr: string): Promise<void> {
     const conn = this.sql;
-    await conn.unsafe(sqlStr);
+    if ((this as unknown as Record<symbol, boolean>)[TRANSACTION_SCOPED_ENGINE]) {
+      // The transaction already owns one backend. Reassert the schema target
+      // immediately before every handler-issued statement; this also covers
+      // migration handlers that open their own transaction outside the common
+      // runMigrationSQL wrapper.
+      await conn.unsafe('SET LOCAL search_path = public');
+      await conn.unsafe(sqlStr);
+      return;
+    }
+
+    // Non-transactional migrations include CREATE INDEX CONCURRENTLY, so SET
+    // and DDL must be separate statements on one reserved direct/session-mode
+    // backend (a multi-statement query would create an implicit transaction).
+    const reserved = await conn.reserve();
+    try {
+      await reserved.unsafe(db.PUBLIC_SCHEMA_SEARCH_PATH_SQL);
+      await reserved.unsafe(sqlStr);
+    } finally {
+      reserved.release();
+    }
   }
 
   async getChunksWithEmbeddings(slug: string, opts?: { sourceId?: string }): Promise<Chunk[]> {

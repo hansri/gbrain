@@ -13,7 +13,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { hasDatabase } from './helpers.ts';
+import { hasDatabase, setupDB, teardownDB } from './helpers.ts';
 
 const skip = !hasDatabase();
 const describeE2E = skip ? describe.skip : describe;
@@ -24,17 +24,23 @@ if (skip) {
 
 const PORT = 19131; // Avoid collision with production 3131
 const BASE = `http://localhost:${PORT}`;
+const ADMIN_BOOTSTRAP_TOKEN = 'e2e-admin-bootstrap-token-000000000000000000000000';
 
 describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
   let serverProcess: ReturnType<typeof import('child_process').spawn> | null = null;
+  let serverStderr = '';
   let clientId: string | undefined;
   let clientSecret: string | undefined;
-  // DCR-registered clients accumulate here so afterAll can revoke them too
-  // (one per test that posts to /register).
+  // Additional manually registered clients accumulate here for cleanup.
   const dcrClientIds: string[] = [];
 
   beforeAll(async () => {
     const { execSync, spawn } = await import('child_process');
+
+    // Per-file E2E isolation intentionally starts from an empty schema. Keep
+    // this HTTP contract self-contained instead of relying on a prior file to
+    // create oauth_clients and the rest of the canonical migration surface.
+    await setupDB();
 
     // Register a test OAuth client via CLI.
     // env: { ...process.env } is required: bun's execSync does NOT inherit
@@ -62,22 +68,20 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
     clientId = idMatch[1];
     clientSecret = secretMatch[1];
 
-    // Start the HTTP server. v0.26.2 adds --enable-dcr so the /register
-    // endpoint is reachable for the DCR response-shape test.
+    // Start the HTTP server. Network registration stays disabled; this suite
+    // uses the trusted local CLI registration above.
     serverProcess = spawn('bun', [
       'run', 'src/cli.ts', 'serve', '--http',
       '--port', String(PORT),
       '--public-url', `http://localhost:${PORT}`,
-      '--enable-dcr',
     ], {
       cwd: process.cwd(),
-      env: process.env,
+      env: { ...process.env, GBRAIN_ADMIN_BOOTSTRAP_TOKEN: ADMIN_BOOTSTRAP_TOKEN },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
     // Collect stderr for debugging failures
-    let stderr = '';
-    serverProcess.stderr?.on('data', (d: Buffer) => { stderr += d.toString(); });
+    serverProcess.stderr?.on('data', (d: Buffer) => { serverStderr += d.toString(); });
 
     // Wait for server to be ready (up to 15s)
     let ready = false;
@@ -88,7 +92,7 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
       } catch {}
       await new Promise(r => setTimeout(r, 500));
     }
-    if (!ready) throw new Error('Server failed to start within 15s.\nstderr: ' + stderr.slice(-500));
+    if (!ready) throw new Error('Server failed to start within 15s.\nstderr: ' + serverStderr.slice(-500));
   }, 30_000);
 
   afterAll(async () => {
@@ -114,6 +118,7 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
         console.error(`[afterAll] revoke-client cleanup failed for ${id}: ${e.message}`);
       }
     }
+    await teardownDB();
   }, 30_000);
 
   // Helper: mint a token with given scopes
@@ -210,13 +215,14 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
   // Fix 2: OAuth metadata includes client_credentials
   // =========================================================================
 
-  test('OAuth AS metadata includes all three grant types', async () => {
+  test('OAuth AS metadata advertises only reachable token grants', async () => {
     const res = await fetch(`${BASE}/.well-known/oauth-authorization-server`);
     expect(res.ok).toBe(true);
     const meta = await res.json() as any;
-    expect(meta.grant_types_supported).toContain('authorization_code');
     expect(meta.grant_types_supported).toContain('refresh_token');
     expect(meta.grant_types_supported).toContain('client_credentials');
+    expect(meta.grant_types_supported).not.toContain('authorization_code');
+    expect(meta.registration_endpoint).toBeUndefined();
   });
 
   test('OAuth metadata issuer matches public URL', async () => {
@@ -228,6 +234,46 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
     expect(meta.scopes_supported).toContain('write');
     expect(meta.scopes_supported).toContain('admin');
   });
+
+  test('public non-interactive startup never writes the admin credential to stderr', () => {
+    expect(serverStderr).not.toContain(ADMIN_BOOTSTRAP_TOKEN);
+    expect(serverStderr).toContain('Admin Token: from $GBRAIN_ADMIN_BOOTSTRAP_TOKEN');
+  });
+
+  test('generated admin credential is also hidden on a public non-interactive start', async () => {
+    const { spawn } = await import('child_process');
+    const generatedPort = PORT + 1;
+    const env = { ...process.env };
+    delete env.GBRAIN_ADMIN_BOOTSTRAP_TOKEN;
+    const child = spawn('bun', [
+      'run', 'src/cli.ts', 'serve', '--http',
+      '--port', String(generatedPort),
+      '--public-url', `http://localhost:${generatedPort}`,
+    ], {
+      cwd: process.cwd(),
+      env,
+      stdio: ['ignore', 'ignore', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr?.on('data', (d: Buffer) => { stderr += d.toString(); });
+    try {
+      let ready = false;
+      for (let i = 0; i < 30; i++) {
+        try {
+          const response = await fetch(`http://localhost:${generatedPort}/health`);
+          if (response.ok) { ready = true; break; }
+        } catch { /* not ready */ }
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      expect(ready).toBe(true);
+      expect(stderr).toContain('Admin Token: generated but not printed');
+      expect(stderr).not.toContain('Admin Token (paste into /admin login)');
+    } finally {
+      child.kill('SIGTERM');
+      await new Promise(resolve => setTimeout(resolve, 250));
+      if (!child.killed) child.kill('SIGKILL');
+    }
+  }, 15_000);
 
   // T2 (eng-review): scopes_supported advertises the full ALLOWED_SCOPES_LIST
   // so MCP clients (Claude Desktop, ChatGPT, Perplexity) can discover the
@@ -386,20 +432,9 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
   });
 
   test('v0.28.10: /admin/api/full-stats with valid admin cookie returns getStats() body', async () => {
-    // Same magic-link cookie dance the existing single-use test uses.
-    // Skip gracefully if the bootstrap token isn't extractable — the 401
-    // case above pins the auth gate; this test pins the happy path.
-    const stderrBuf = (serverProcess as any)?._stderrBuffer || '';
-    const tokenMatch = String(stderrBuf).match(/Admin Token[\s\S]*?([a-f0-9]{32,64})/);
-    if (!tokenMatch) {
-      console.warn('[e2e] skipped /admin/api/full-stats happy path: could not extract bootstrap token');
-      return;
-    }
-    const bootstrapToken = tokenMatch[1];
-
     const issueRes = await fetch(`${BASE}/admin/api/issue-magic-link`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bootstrapToken}` },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ADMIN_BOOTSTRAP_TOKEN}` },
       body: '{}',
     });
     expect(issueRes.ok).toBe(true);
@@ -450,21 +485,42 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
     });
     expect(res.ok).toBe(false);
     const data = await res.json() as any;
-    expect(data.error).toBe('invalid_grant');
+    expect(data.error).toBe('invalid_client');
+    expect(data.error_description).toBe('Client authentication failed.');
+  });
+
+  test('missing-secret token requests do not reveal whether a client exists', async () => {
+    const request = async (candidateClientId: string) => {
+      const res = await fetch(`${BASE}/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'authorization_code',
+          client_id: candidateClientId,
+          code: 'not-a-code',
+          code_verifier: 'not-a-verifier',
+        }),
+      });
+      return { status: res.status, body: await res.json() };
+    };
+
+    const known = await request(clientId!);
+    const unknown = await request('gbrain_cl_unknown_client_probe');
+    expect(known).toEqual(unknown);
+    expect(known).toEqual({
+      status: 401,
+      body: {
+        error: 'invalid_client',
+        error_description: 'Client authentication failed.',
+      },
+    });
   });
 
   // =========================================================================
-  // v0.26.2: DCR /register response shape (RFC 7591 §3.2.1 number contract)
+  // Network registration + unattended authorization trust boundary
   // =========================================================================
-  //
-  // The user-visible bug v0.26.2 protects against: postgres.js with
-  // `prepare: false` returns BIGINT columns as strings, and an RFC-strict
-  // DCR client (Claude Code, Cursor) parses the /register response as JSON
-  // and rejects timestamps that aren't numbers. This is the HTTP-level test;
-  // the internal-store shape test in test/oauth.test.ts is not enough on its
-  // own (Codex flagged it as the wrong seam).
 
-  test('DCR /register returns numeric client_id_issued_at (RFC 7591 §3.2.1)', async () => {
+  test('network /register is unavailable and mints no client', async () => {
     const res = await fetch(`${BASE}/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -476,26 +532,24 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
         scope: 'read',
       }),
     });
-    expect(res.ok).toBe(true);
+    expect(res.status).toBe(404);
     const body = await res.json() as any;
+    expect(body.error).toBe('not_found');
+    expect(body.client_id).toBeUndefined();
+    expect(body.client_secret).toBeUndefined();
+  });
 
-    // Track for cleanup before any assertion that could throw.
-    if (body.client_id) dcrClientIds.push(body.client_id);
-
-    // The contract: client_id_issued_at is REQUIRED to be a JSON number per
-    // RFC 7591. Pre-v0.26.2 with prepare:false returned this as a string
-    // (e.g., "1735689600") and strict clients rejected the registration.
-    expect(typeof body.client_id_issued_at).toBe('number');
-    expect(Number.isFinite(body.client_id_issued_at)).toBe(true);
-    expect(body.client_id_issued_at).toBeGreaterThan(0);
-
-    // client_secret_expires_at is OPTIONAL. If present, it must also be a
-    // number. Undefined/missing means "does not expire" per the spec.
-    if (body.client_secret_expires_at !== undefined) {
-      expect(typeof body.client_secret_expires_at).toBe('number');
-      expect(Number.isFinite(body.client_secret_expires_at)).toBe(true);
-    }
-  }, 15_000);
+  test('no-consent /authorize fails closed and returns no code redirect', async () => {
+    const res = await fetch(
+      `${BASE}/authorize?client_id=${encodeURIComponent(clientId!)}&response_type=code` +
+        '&redirect_uri=https%3A%2F%2Fexample.test%2Fcb&code_challenge=x&code_challenge_method=S256',
+      { redirect: 'manual' },
+    );
+    expect(res.status).toBe(403);
+    expect(res.headers.get('location')).toBeNull();
+    const body = await res.json() as any;
+    expect(body.error).toBe('access_denied');
+  });
 
   // =========================================================================
   // v0.26.2: revoke-client CLI subprocess test
@@ -771,32 +825,10 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
   });
 
   test('v0.26.3: magic-link nonce is single-use (second click fails)', async () => {
-    // Get a real bootstrap token from the spawned server's environment.
-    // The server prints it to stderr at startup but commit 16 removed our
-    // regex extractor. Use the issue-magic-link endpoint directly with the
-    // bootstrap token from process env — except that env var doesn't exist
-    // in the test fixture. The portable approach: extract from the server
-    // process's stderr.
-
-    // Pull the bootstrap token from server stderr by re-reading the
-    // spawn handle. The spawn already started so stderr has flushed.
-    // Skip if we can't extract — the test is best-effort coverage of the
-    // single-use semantic; the styled-401 test above covers the negative path.
-    const stderrBuf = (serverProcess as any)?._stderrBuffer || '';
-    const tokenMatch = String(stderrBuf).match(/Admin Token[\s\S]*?([a-f0-9]{32,64})/);
-    if (!tokenMatch) {
-      // No way to get the bootstrap token in this test fixture — skip gracefully.
-      // The unit-level coverage for nonce single-use is in oauth.test.ts and
-      // the styled-401 test above pins the consumed-nonce path.
-      console.warn('[e2e] skipped magic-link single-use: could not extract bootstrap token');
-      return;
-    }
-    const bootstrapToken = tokenMatch[1];
-
     // Mint a one-time nonce.
     const issueRes = await fetch(`${BASE}/admin/api/issue-magic-link`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bootstrapToken}` },
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ADMIN_BOOTSTRAP_TOKEN}` },
       body: '{}',
     });
     expect(issueRes.ok).toBe(true);
@@ -872,66 +904,36 @@ describeE2E('serve-http OAuth 2.1 E2E (v0.26.1 + v0.26.2 + v0.26.3)', () => {
   });
 
   // =========================================================================
-  // F7 + F7b: HTTP MCP shell-job RCE regression
+  // F7 + F7b: generic job submission is host-local
   // =========================================================================
   //
-  // The headline trust-boundary fix. Pre-fix, the inlined OperationContext
-  // literal in serve-http.ts forgot to set `remote: true`, which meant
-  // operations.ts:1391's protected-job-name guard (`if (ctx.remote && ...)`)
-  // saw a falsy undefined and skipped. An HTTP MCP caller with a write-scoped
-  // token could then submit `{name: "shell", params: {cmd: "id"}}` over /mcp
-  // and execute arbitrary commands on the gbrain host.
-  //
-  // The fix is two-layered:
-  //   1) F7  — serve-http.ts sets `remote: true` explicitly.
-  //   2) F7b — operations.ts:1391 + :1400 use `ctx.remote !== false` /
-  //            `ctx.remote === false` so undefined fails closed even if a
-  //            future transport bypasses the type via cast.
-  //
-  // Together they close the path even if either layer regresses alone.
+  // Generic submit_job can select maintenance handlers and server-local paths,
+  // so it is localOnly rather than remotely available behind a broad admin
+  // scope. Pin both discovery and call behavior: it must not be advertised,
+  // and a guessed tools/call must return an MCP error rather than a job id.
 
-  test('F7: HTTP MCP cannot submit shell jobs (RCE regression)', async () => {
-    // v0.28.10: must mint admin scope. submit_job's required scope is
-    // 'admin'; without it, hasScope() rejects with insufficient_scope BEFORE
-    // the F7 protected-name guard at operations.ts:1527 fires. To validate
-    // the actual RCE protection (the protected-name guard), the token has
-    // to clear the scope check first.
+  test('F7: HTTP MCP neither discovers nor calls submit_job for shell', async () => {
     const { access_token } = await mintToken('admin');
-    const res = await mcpCall(access_token, 'tools/call', {
+    const listed = await mcpJson(access_token, 'tools/list');
+    expect(listed.result.tools.map((tool: { name: string }) => tool.name)).not.toContain('submit_job');
+
+    const denied = await mcpJson(access_token, 'tools/call', {
       name: 'submit_job',
       arguments: { name: 'shell', data: { cmd: 'id' } },
     });
-
-    const body = await res.text();
-    // Must reject. Either HTTP 4xx, or a JSON-RPC envelope carrying an
-    // OperationError with code permission_denied. The exact wire shape
-    // depends on SDK error mapping — assert the negative invariant
-    // (no command executed) and the positive invariant (rejection signal).
-    const rejected =
-      res.status >= 400 ||
-      body.includes('permission_denied') ||
-      body.includes('cannot be submitted over MCP');
-    expect(rejected).toBe(true);
-
-    // Negative: response must NOT contain a successful submit_job result
-    // (which would surface a job_id field). If a job ID came back the
-    // privesc landed.
-    expect(body).not.toMatch(/"job_id"\s*:\s*"?\d+/);
+    expect(denied.result?.isError === true || denied.error !== undefined).toBe(true);
+    expect(JSON.stringify(denied)).toMatch(/unknown_operation|Unknown tool|Method not found|permission_denied/i);
+    expect(JSON.stringify(denied)).not.toMatch(/"job_id"\s*:\s*"?\d+/);
   }, 15_000);
 
-  test('F7: HTTP MCP cannot submit subagent jobs (protected name)', async () => {
-    // Same admin-scope requirement as the shell-job sibling test above.
+  test('F7: HTTP MCP guessed submit_job call cannot submit subagent jobs', async () => {
     const { access_token } = await mintToken('admin');
-    const res = await mcpCall(access_token, 'tools/call', {
+    const denied = await mcpJson(access_token, 'tools/call', {
       name: 'submit_job',
       arguments: { name: 'subagent', data: { prompt: 'noop' } },
     });
-    const body = await res.text();
-    const rejected =
-      res.status >= 400 ||
-      body.includes('permission_denied') ||
-      body.includes('cannot be submitted over MCP');
-    expect(rejected).toBe(true);
-    expect(body).not.toMatch(/"job_id"\s*:\s*"?\d+/);
+    expect(denied.result?.isError === true || denied.error !== undefined).toBe(true);
+    expect(JSON.stringify(denied)).toMatch(/unknown_operation|Unknown tool|Method not found|permission_denied/i);
+    expect(JSON.stringify(denied)).not.toMatch(/"job_id"\s*:\s*"?\d+/);
   }, 15_000);
 });

@@ -92,6 +92,7 @@ function makeCtx(overrides: Partial<OperationContext> = {}): OperationContext {
     logger: console,
     dryRun: false,
     remote: true,
+    sourceId: 'default',
     ...overrides,
   } as OperationContext;
 }
@@ -175,9 +176,10 @@ describe('op-layer capture — query', () => {
     expect(rows).toHaveLength(0);
   });
 
-  test('explicit source_id overrides ctx.sourceId for query retrieval', async () => {
+  test('explicit source_id selects a source inside the caller federated grant', async () => {
     const ctx = makeCtx({
       sourceId: 'default',
+      auth: { allowedSources: ['default', 'testsrc'] } as OperationContext['auth'],
       config: makeConfig({ capture: false }),
     });
 

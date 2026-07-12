@@ -20,7 +20,6 @@ import { tmpdir } from 'os';
 import { hasDatabase, setupDB, teardownDB, getEngine } from './helpers.ts';
 import { withEnv } from '../helpers/with-env.ts';
 import { runExtractFacts } from '../../src/core/cycle/extract-facts.ts';
-import { DEFAULT_EMBEDDING_DIMENSIONS } from '../../src/core/ai/defaults.ts';
 // v0.40: per-source lock id replaces the legacy bare SYNC_LOCK_ID constant.
 // Tests below hand-craft the lock row via SQL to simulate contention.
 
@@ -206,12 +205,21 @@ describeMaybe('phantom-redirect E2E (Postgres)', () => {
       const engine = getEngine();
       // Seed a phantom fact in DB with an embedding (must round-trip
       // through postgres-js's text representation per round 12).
-      // Build the canonical fresh-schema vector shape with small values so
-      // we can verify the postgres-js text parse does not mangle it. Import
-      // the default instead of pinning a historical provider width.
+      // Build the vector to the actual facts column width. The committed
+      // Postgres bootstrap schema remains 1536-d while configurable/runtime
+      // defaults can differ, so the database is the authority for this E2E.
+      const dimRows = await engine.executeRaw<{ format_type: string }>(
+        `SELECT format_type(atttypid, atttypmod) AS format_type
+         FROM pg_attribute
+         WHERE attrelid = 'public.facts'::regclass
+           AND attname = 'embedding'`,
+      );
+      const dimensionMatch = dimRows[0]?.format_type.match(/\((\d+)\)/);
+      expect(dimensionMatch).not.toBeNull();
+      const embeddingDimensions = Number(dimensionMatch![1]);
       const vec = Array.from(
-        { length: DEFAULT_EMBEDDING_DIMENSIONS },
-        (_, i) => (i / DEFAULT_EMBEDDING_DIMENSIONS).toFixed(6),
+        { length: embeddingDimensions },
+        (_, i) => (i / embeddingDimensions).toFixed(6),
       ).join(',');
       await engine.executeRaw(
         `INSERT INTO facts (

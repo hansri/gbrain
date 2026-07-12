@@ -23,6 +23,7 @@ import { discoverOAuth, mintClientCredentialsToken } from '../../src/core/remote
 const PORT = 19735; // avoid the production 3131 + the oauth E2E's 19131
 const BASE = `http://127.0.0.1:${PORT}`;
 const MCP_URL = `${BASE}/mcp`;
+const ADMIN_BOOTSTRAP = 'e2e_admin_bootstrap_token_0123456789abcdef';
 
 describe('connect bearer probe E2E (PGLite + real serve --http)', () => {
   let home: string;
@@ -39,6 +40,7 @@ describe('connect bearer probe E2E (PGLite + real serve --http)', () => {
     // DATABASE_URL set leaks it into the subprocess and the brain comes up on
     // Postgres, breaking the `engine: pglite` assertion.
     const env: Record<string, string | undefined> = { ...process.env, GBRAIN_HOME: home };
+    env.GBRAIN_ADMIN_BOOTSTRAP_TOKEN = ADMIN_BOOTSTRAP;
     delete env.DATABASE_URL;
     delete env.GBRAIN_DATABASE_URL;
 
@@ -109,6 +111,130 @@ describe('connect bearer probe E2E (PGLite + real serve --http)', () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(['unreachable', 'timeout']).toContain(r.reason);
   }, 15_000);
+
+  test('HTTP surface suppresses Express fingerprinting and returns a safe JSON 404', async () => {
+    const health = await fetch(`${BASE}/health`);
+    expect(health.headers.get('x-powered-by')).toBeNull();
+    expect(health.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(health.headers.get('x-frame-options')).toBe('DENY');
+    expect(health.headers.get('content-security-policy')).toContain("default-src 'none'");
+    expect(health.headers.get('strict-transport-security')).toBeNull();
+
+    const missing = await fetch(`${BASE}/definitely-not-a-route`);
+    expect(missing.status).toBe(404);
+    expect(missing.headers.get('content-type')).toContain('application/json');
+    expect(await missing.json()).toEqual({ error: 'not_found' });
+  });
+
+  test('served admin SPA assets are compatible with the enforced CSP', async () => {
+    const admin = await fetch(`${BASE}/admin/`);
+    expect(admin.ok).toBe(true);
+    const csp = admin.headers.get('content-security-policy') ?? '';
+    const html = await admin.text();
+
+    // Vite's executable and stylesheet assets are same-origin; React's
+    // existing inline style attributes remain allowed. The only external
+    // resources in the committed shell are the two explicit Google Fonts
+    // origins, both named in the policy.
+    expect(html).toMatch(/<script[^>]+src="\/admin\/assets\//);
+    expect(html).toMatch(/<link[^>]+href="\/admin\/assets\//);
+    expect(html).not.toMatch(/<script(?![^>]*\bsrc=)[^>]*>/i);
+    expect(html).toContain('https://fonts.googleapis.com');
+    expect(html).toContain('https://fonts.gstatic.com');
+    expect(csp).toContain("script-src 'self'");
+    expect(csp).toContain("style-src 'self' 'unsafe-inline' https://fonts.googleapis.com");
+    expect(csp).toContain("font-src 'self' https://fonts.gstatic.com");
+    expect(csp).toContain("connect-src 'self' https://fonts.googleapis.com https://fonts.gstatic.com");
+  });
+
+  test('unlisted browser Origin is rejected before the SDK OAuth CORS middleware', async () => {
+    const denied = await fetch(`${BASE}/token`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Origin': 'https://evil.example',
+      },
+      body: new URLSearchParams({
+        // No client_secret: both custom confidential handlers fall through,
+        // so without the hard gate this request reaches the SDK token router
+        // and its nested permissive cors() middleware.
+        grant_type: 'authorization_code',
+        client_id: 'untrusted-browser-probe',
+        code: 'not-a-code',
+        code_verifier: 'not-a-verifier',
+      }),
+    });
+    expect(denied.status).toBe(403);
+    expect(denied.headers.get('access-control-allow-origin')).toBeNull();
+    expect(await denied.json()).toEqual({ error: 'cors_origin_denied' });
+
+    // Same-origin browser POSTs remain compatible even when no extra CORS
+    // allow-list is configured.
+    const allowed = await fetch(`${BASE}/token`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Origin': BASE,
+      },
+      body: new URLSearchParams({
+        grant_type: 'client_credentials',
+        client_id: oauthClientId,
+        client_secret: oauthClientSecret,
+        scope: 'read',
+      }),
+    });
+    expect(allowed.ok).toBe(true);
+  });
+
+  test('cookie-authenticated admin mutations reject CSRF and preserve same-origin writes', async () => {
+    const login = await fetch(`${BASE}/admin/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Origin': BASE },
+      body: JSON.stringify({ token: ADMIN_BOOTSTRAP }),
+    });
+    expect(login.ok).toBe(true);
+    const cookie = (login.headers.get('set-cookie') ?? '').split(';', 1)[0];
+    expect(cookie).toStartWith('gbrain_admin=');
+
+    const denied = await fetch(`${BASE}/admin/api/sign-out-everywhere`, {
+      method: 'POST',
+      headers: {
+        'Cookie': cookie,
+        'Origin': 'https://evil.example',
+        'Sec-Fetch-Site': 'cross-site',
+      },
+    });
+    expect(denied.status).toBe(403);
+    expect(await denied.json()).toEqual({ error: 'csrf_origin_denied' });
+
+    const allowed = await fetch(`${BASE}/admin/api/sign-out-everywhere`, {
+      method: 'POST',
+      headers: {
+        'Cookie': cookie,
+        'Origin': BASE,
+        'Sec-Fetch-Site': 'same-origin',
+      },
+    });
+    expect(allowed.ok).toBe(true);
+  });
+
+  test('admin parser rejects malformed and oversized JSON with generic envelopes', async () => {
+    const malformed = await fetch(`${BASE}/admin/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{not-json',
+    });
+    expect(malformed.status).toBe(400);
+    expect(await malformed.json()).toEqual({ error: 'invalid_request_body' });
+
+    const oversized = await fetch(`${BASE}/admin/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: 'x'.repeat(40 * 1024) }),
+    });
+    expect(oversized.status).toBe(413);
+    expect(await oversized.json()).toEqual({ error: 'payload_too_large' });
+  });
 
   // -------------------------------------------------------------------------
   // Real-CLI coverage: drive the actual `claude` / `codex` binaries through

@@ -540,8 +540,9 @@ CREATE TABLE IF NOT EXISTS timeline_entries (
   source   TEXT    NOT NULL DEFAULT '',
   summary  TEXT    NOT NULL,
   detail   TEXT    NOT NULL DEFAULT '',
-  -- Explicit extractor ownership. NULL means manual/legacy/unowned and is
-  -- never eligible for managed reconciliation based on free-text \`source\`.
+  -- Explicit extractor ownership. NULL means manual/unowned. The reserved
+  -- legacy \`gbrain-markdown\` source namespace is adopted by migration/runtime
+  -- reconciliation; non-reserved free-text provenance is never authority.
   managed_by TEXT,
   -- v0.42.x (Life Chronicle #2390): when this row is the date-index projection
   -- of a \`type:event\` page, event_page_id points at that event page; page_id
@@ -795,7 +796,8 @@ CREATE TABLE IF NOT EXISTS files (
   size_bytes   BIGINT,
   content_hash TEXT   NOT NULL,
   metadata     JSONB  NOT NULL DEFAULT '{}',
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT files_storage_path_key UNIQUE(storage_path)
 );
 
 -- Migration: drop storage_url if it exists (renamed to storage_path only)

@@ -11,13 +11,16 @@ import {
 import { createHash } from 'node:crypto';
 import {
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -26,6 +29,8 @@ import {
   replaceLocalWithRedirectDurable,
   promoteRestoredFileAtomic,
   readRedirectOriginalSnapshot,
+  readRedirectOriginalSnapshotWithinRoot,
+  recoverInterruptedCleanJournals,
   retireRedirectAfterRestoredPromotion,
   retireOwnedRedirectPointer,
   runFiles,
@@ -105,6 +110,115 @@ describe('files object-storage crash safety', () => {
 
     const rows = await engine.executeRaw<{ count: number }>('SELECT COUNT(*)::int AS count FROM files');
     expect(rows[0]?.count).toBe(0);
+  });
+
+  test('no-follow upload snapshot refuses a final-component symlink', () => {
+    const dir = tempDir('gbrain-files-upload-symlink-');
+    const target = join(dir, 'target.pdf');
+    const alias = join(dir, 'alias.pdf');
+    writeFileSync(target, 'private target bytes');
+    symlinkSync(target, alias);
+
+    expect(() => readRedirectOriginalSnapshot(alias)).toThrow();
+  });
+
+  test('stable-root read rejects an actual parent-directory symlink swap before leaf open', () => {
+    const root = realpathSync(tempDir('gbrain-files-parent-swap-root-'));
+    const outside = tempDir('gbrain-files-parent-swap-outside-');
+    const nested = join(root, 'nested');
+    const preserved = join(root, '.nested-preserved');
+    mkdirSync(nested);
+    writeFileSync(join(nested, 'report.pdf'), 'approved local bytes');
+    writeFileSync(join(outside, 'report.pdf'), 'outside secret bytes');
+
+    expect(() => readRedirectOriginalSnapshotWithinRoot(
+      root,
+      'nested/report.pdf',
+      {
+        beforeLeafOpen: () => {
+          renameSync(nested, preserved);
+          symlinkSync(outside, nested, 'dir');
+        },
+      },
+    )).toThrow(/ancestor changed|changed before it was opened|symlink/i);
+
+    // The outside file was never returned or changed, and the original inode
+    // remains preserved under its raced rename.
+    expect(readFileSync(join(outside, 'report.pdf'), 'utf8')).toBe('outside secret bytes');
+    expect(readFileSync(join(preserved, 'report.pdf'), 'utf8')).toBe('approved local bytes');
+  });
+
+  test('stable-root read rejects a symlink swap in an ancestor above the root', () => {
+    const container = realpathSync(tempDir('gbrain-files-root-ancestor-swap-'));
+    const base = join(container, 'base');
+    const preservedBase = join(container, '.base-preserved');
+    const root = join(base, 'root');
+    const outsideBase = join(container, 'outside-base');
+    const outsideRoot = join(outsideBase, 'root');
+    mkdirSync(root, { recursive: true });
+    mkdirSync(outsideRoot, { recursive: true });
+    writeFileSync(join(root, 'report.pdf'), 'approved local bytes');
+    writeFileSync(join(outsideRoot, 'report.pdf'), 'outside secret bytes');
+
+    expect(() => readRedirectOriginalSnapshotWithinRoot(
+      root,
+      'report.pdf',
+      {
+        beforeRootOpen: () => {
+          renameSync(base, preservedBase);
+          symlinkSync(outsideBase, base, 'dir');
+        },
+      },
+    )).toThrow(/symlink or non-directory ancestor|changed while it was being opened/i);
+
+    expect(readFileSync(join(outsideRoot, 'report.pdf'), 'utf8')).toBe('outside secret bytes');
+    expect(readFileSync(join(preservedBase, 'root', 'report.pdf'), 'utf8'))
+      .toBe('approved local bytes');
+  });
+
+  test('stable-root read rejects a pre-existing symlink ancestor', () => {
+    const root = realpathSync(tempDir('gbrain-files-parent-link-root-'));
+    const outside = tempDir('gbrain-files-parent-link-outside-');
+    writeFileSync(join(outside, 'report.pdf'), 'outside secret bytes');
+    symlinkSync(outside, join(root, 'nested'), 'dir');
+
+    expect(() => readRedirectOriginalSnapshotWithinRoot(
+      root,
+      'nested/report.pdf',
+    )).toThrow(/symlink or non-directory ancestor/i);
+  });
+
+  test('every upload and mirror byte-read uses the no-follow snapshot boundary', () => {
+    const filesSource = readFileSync(
+      join(import.meta.dir, '../src/commands/files.ts'),
+      'utf8',
+    );
+    for (const functionName of ['uploadFile', 'uploadRaw']) {
+      const start = filesSource.indexOf(`function ${functionName}`);
+      const next = filesSource.indexOf('\nasync function ', start + 1);
+      const body = filesSource.slice(start, next === -1 ? undefined : next);
+      expect(start).toBeGreaterThanOrEqual(0);
+      expect(body).toContain('readRedirectOriginalSnapshot(');
+      expect(body).not.toMatch(/readFileSync\((?:filePath|file)\)/);
+    }
+    for (const functionName of ['syncFiles', 'mirrorFiles']) {
+      const start = filesSource.indexOf(`function ${functionName}`);
+      const next = filesSource.indexOf('\nasync function ', start + 1);
+      const body = filesSource.slice(start, next === -1 ? undefined : next);
+      expect(start).toBeGreaterThanOrEqual(0);
+      expect(body).toContain('readRedirectOriginalSnapshotWithinRoot(');
+      expect(body).not.toMatch(/readFileSync\((?:filePath|file)\)/);
+    }
+
+    const operationsSource = readFileSync(
+      join(import.meta.dir, '../src/core/operations.ts'),
+      'utf8',
+    );
+    const start = operationsSource.indexOf("const file_upload: Operation = {");
+    const end = operationsSource.indexOf("const file_url: Operation = {", start);
+    const body = operationsSource.slice(start, end);
+    expect(body).toContain('readRedirectOriginalSnapshotWithinRoot(');
+    expect(body).not.toContain('readFileSync(filePath)');
   });
 
   test('changed content uploads an immutable revision before one DB pointer switch', async () => {
@@ -258,6 +372,207 @@ describe('files object-storage crash safety', () => {
     expect(existsSync(`${filePath}.redirect.yaml`)).toBe(false);
   });
 
+  test('nested mirror -> redirect -> clean stays resolvable and keeps the last marker', async () => {
+    const dir = tempDir('gbrain-files-nested-clean-');
+    const storageRoot = tempDir('gbrain-files-nested-clean-store-');
+    const home = tempDir('gbrain-files-nested-clean-home-');
+    writeConfig(home, storageRoot);
+    const nestedDir = join(dir, 'archive', '2026');
+    mkdirSync(nestedDir, { recursive: true });
+    const original = join(nestedDir, 'meeting.bin');
+    const bytes = Buffer.from('nested durable meeting bytes');
+    writeFileSync(original, bytes);
+    const storage = new LocalStorage(storageRoot);
+
+    await withEnv({ GBRAIN_HOME: home }, async () => {
+      await runFiles(engine, ['mirror', dir]);
+      await runFiles(engine, ['redirect', dir]);
+      await runFiles(engine, ['clean', dir, '--yes']);
+    });
+
+    const pointer = `${original}.redirect.yaml`;
+    expect(existsSync(original)).toBe(false);
+    expect(existsSync(pointer)).toBe(false);
+    expect((await storage.download('default/archive/2026/meeting.bin')).equals(bytes)).toBe(true);
+    // A fresh clone retains the root marker but may not materialize empty
+    // descendant directories. Resolution must still derive the nested key.
+    rmSync(join(dir, 'archive'), { recursive: true, force: true });
+    const resolved = await resolveFile('archive/2026/meeting.bin', dir, storage, 'default');
+    expect(resolved.source).toBe('storage');
+    expect(resolved.data.equals(bytes)).toBe(true);
+
+    await withEnv({ GBRAIN_HOME: home }, async () => {
+      await expect(runFiles(engine, ['unmirror', dir]))
+        .rejects.toThrow(/last live locator/);
+    });
+    expect(existsSync(join(dir, '.supabase'))).toBe(true);
+
+    // Emulate a power loss after the pointer move but before the final journal
+    // state flip. Restart recovery must recreate the exact live pointer.
+    const runName = readdirSync(dir).find(name => name.startsWith('.gbrain-pointer-quarantine-'));
+    expect(runName).toBeTruthy();
+    const manifestPath = join(dir, runName!, 'MANIFEST.json');
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    expect(manifest.state).toBe('complete');
+    manifest.state = 'prepared';
+    delete manifest.completed_at;
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+    await withEnv({ GBRAIN_HOME: home }, async () => {
+      await runFiles(engine, ['mirror', dir, '--dry-run']);
+      await runFiles(engine, ['redirect', dir, '--dry-run']);
+    });
+    expect(existsSync(pointer)).toBe(false);
+    expect(JSON.parse(readFileSync(manifestPath, 'utf8')).state).toBe('prepared');
+
+    mkdirSync(nestedDir, { recursive: true });
+    expect(recoverInterruptedCleanJournals(dir, 'default')).toBe(1);
+    expect(existsSync(pointer)).toBe(true);
+    expect(JSON.parse(readFileSync(manifestPath, 'utf8')).state).toBe('rolled_back');
+  });
+
+  test('clean rejects a repo-controlled quarantine symlink with zero side effects', async () => {
+    const dir = tempDir('gbrain-files-clean-symlink-');
+    const storageRoot = tempDir('gbrain-files-clean-symlink-store-');
+    const outside = tempDir('gbrain-files-clean-symlink-outside-');
+    const home = tempDir('gbrain-files-clean-symlink-home-');
+    writeConfig(home, storageRoot);
+    const bytes = Buffer.from('source-bound object');
+    const hash = createHash('sha256').update(bytes).digest('hex');
+    const pointer = join(dir, 'asset.bin.redirect.yaml');
+    writeFileSync(join(dir, '.supabase'), [
+      'bucket: test',
+      'source_id: default',
+      'prefix: default/',
+      'file_count: 1',
+      '',
+    ].join('\n'));
+    writeFileSync(pointer, [
+      'target: supabase://test/default/asset.bin',
+      'bucket: test',
+      'storage_path: default/asset.bin',
+      'source_id: default',
+      `size: ${bytes.byteLength}`,
+      `hash: sha256:${hash}`,
+      '',
+    ].join('\n'));
+    const storage = new LocalStorage(storageRoot);
+    await storage.upload('default/asset.bin', bytes);
+    const sentinel = join(outside, 'sentinel.txt');
+    writeFileSync(sentinel, 'unchanged');
+    symlinkSync(outside, join(dir, '.gbrain-pointer-quarantine'));
+
+    await withEnv({ GBRAIN_HOME: home }, async () => {
+      await expect(runFiles(engine, ['clean', dir, '--yes']))
+        .rejects.toThrow(/unsafe clean quarantine path/);
+    });
+    expect(readFileSync(sentinel, 'utf8')).toBe('unchanged');
+    expect(readdirSync(outside)).toEqual(['sentinel.txt']);
+    expect(existsSync(pointer)).toBe(true);
+  });
+
+  test('clean recovery completes the owned two-link power-loss state', () => {
+    const dir = tempDir('gbrain-files-clean-two-link-');
+    const runRoot = join(dir, '.gbrain-pointer-quarantine-power-loss');
+    const livePointer = join(dir, 'nested', 'asset.bin.redirect.yaml');
+    const quarantinePointer = join(runRoot, 'nested', 'asset.bin.redirect.yaml');
+    mkdirSync(join(dir, 'nested'), { recursive: true });
+    mkdirSync(join(runRoot, 'nested'), { recursive: true, mode: 0o700 });
+
+    const pointerBytes = Buffer.from([
+      'storage_path: default/nested/asset.bin',
+      'source_id: default',
+      'size: 6',
+      `hash: sha256:${'a'.repeat(64)}`,
+      '',
+    ].join('\n'));
+    writeFileSync(quarantinePointer, pointerBytes);
+    // This is the durable state after recovery linked the live name and power
+    // failed before it could unlink the quarantine name.
+    linkSync(quarantinePointer, livePointer);
+    expect(lstatSync(quarantinePointer).nlink).toBe(2);
+    expect(lstatSync(livePointer).nlink).toBe(2);
+
+    const pointerHash = createHash('sha256').update(pointerBytes).digest('hex');
+    const manifestPath = join(runRoot, 'MANIFEST.json');
+    writeFileSync(manifestPath, `${JSON.stringify({
+      schema_version: 1,
+      state: 'prepared',
+      source_id: 'default',
+      prepared_at: '2026-07-12T00:00:00.000Z',
+      pointers: [{
+        original_path: 'nested/asset.bin.redirect.yaml',
+        quarantine_path: 'nested/asset.bin.redirect.yaml',
+        pointer_sha256: pointerHash,
+        storage_path: 'default/nested/asset.bin',
+        expected_sha256: 'a'.repeat(64),
+        expected_size: 6,
+      }],
+    }, null, 2)}\n`);
+
+    expect(recoverInterruptedCleanJournals(dir, 'default')).toBe(1);
+    expect(existsSync(livePointer)).toBe(true);
+    expect(existsSync(quarantinePointer)).toBe(false);
+    expect(lstatSync(livePointer).nlink).toBe(1);
+    expect(readFileSync(livePointer).equals(pointerBytes)).toBe(true);
+    expect(JSON.parse(readFileSync(manifestPath, 'utf8')).state).toBe('rolled_back');
+  });
+
+  test('unmirror refuses a count-only marker even when the live file count matches', async () => {
+    const dir = tempDir('gbrain-files-unmirror-count-only-');
+    const marker = join(dir, '.supabase');
+    writeFileSync(join(dir, 'only.bin'), 'live bytes do not prove the historical path ledger');
+    writeFileSync(marker, [
+      'bucket: test',
+      'source_id: default',
+      'prefix: default/',
+      'file_count: 1',
+      '',
+    ].join('\n'));
+
+    await expect(runFiles(engine, ['unmirror', dir]))
+      .rejects.toThrow(/count-only marker has no exact paths ledger/);
+    expect(existsSync(marker)).toBe(true);
+  });
+
+  test('count-only markers are never auto-adopted from equal observed pointer counts', async () => {
+    const dir = tempDir('gbrain-files-count-only-no-adopt-');
+    const storageRoot = tempDir('gbrain-files-count-only-no-adopt-store-');
+    const home = tempDir('gbrain-files-count-only-no-adopt-home-');
+    writeConfig(home, storageRoot);
+    const marker = join(dir, '.supabase');
+    const pointer = join(dir, 'replacement.bin.redirect.yaml');
+    const markerBytes = [
+      'bucket: test',
+      'source_id: default',
+      'prefix: default/',
+      'file_count: 1',
+      '',
+    ].join('\n');
+    const pointerBytes = [
+      'target: supabase://test/default/replacement.bin',
+      'bucket: test',
+      'storage_path: default/replacement.bin',
+      'source_id: default',
+      'size: 11',
+      `hash: sha256:${'b'.repeat(64)}`,
+      '',
+    ].join('\n');
+    writeFileSync(marker, markerBytes);
+    writeFileSync(pointer, pointerBytes);
+
+    await withEnv({ GBRAIN_HOME: home }, async () => {
+      await expect(runFiles(engine, ['mirror', dir]))
+        .rejects.toThrow(/cannot prove exact historical paths/);
+      await expect(runFiles(engine, ['clean', dir, '--yes']))
+        .rejects.toThrow(/cannot prove exact historical paths/);
+    });
+
+    expect(readFileSync(marker, 'utf8')).toBe(markerBytes);
+    expect(readFileSync(pointer, 'utf8')).toBe(pointerBytes);
+    expect(readFileSync(marker, 'utf8')).not.toContain('paths_json');
+  });
+
   test('redirect replacement fsyncs pointer before unlink and fsyncs unlink after', () => {
     const dir = tempDir('gbrain-files-redirect-order-');
     const originalPath = join(dir, 'ordered.bin');
@@ -399,6 +714,7 @@ describe('files object-storage crash safety', () => {
       `target: supabase://test/${storagePath}`,
       'bucket: test',
       `storage_path: ${storagePath}`,
+      'source_id: default',
       `size: ${stored.byteLength}`,
       `hash: sha256:${hash}`,
       'mime: application/octet-stream',
@@ -431,6 +747,7 @@ describe('files object-storage crash safety', () => {
       `target: supabase://test/${storagePath}`,
       'bucket: test',
       `storage_path: ${storagePath}`,
+      'source_id: default',
       `size: ${stored.byteLength}`,
       `hash: sha256:${hash}`,
       'mime: application/octet-stream',
@@ -443,6 +760,34 @@ describe('files object-storage crash safety', () => {
     });
     expect(readFileSync(filePath).equals(stored)).toBe(true);
     expect(existsSync(`${filePath}.redirect.yaml`)).toBe(false);
+  });
+
+  test('restore preserves source-qualified legacy YAML pointers without source_id', async () => {
+    const dir = tempDir('gbrain-files-restore-legacy-yaml-');
+    const storageRoot = tempDir('gbrain-files-restore-legacy-yaml-store-');
+    const home = tempDir('gbrain-files-restore-legacy-yaml-home-');
+    writeConfig(home, storageRoot);
+    const original = join(dir, 'legacy-cloud-only.bin');
+    const pointer = `${original}.redirect.yaml`;
+    const stored = Buffer.from('legacy source-qualified cloud bytes');
+    const storagePath = 'default/legacy-cloud-only.bin';
+    const hash = createHash('sha256').update(stored).digest('hex');
+    const storage = new LocalStorage(storageRoot);
+    await storage.upload(storagePath, stored);
+    writeFileSync(pointer, [
+      `target: supabase://test/${storagePath}`,
+      'bucket: test',
+      `storage_path: ${storagePath}`,
+      `size: ${stored.byteLength}`,
+      `hash: sha256:${hash}`,
+      '',
+    ].join('\n'));
+
+    await withEnv({ GBRAIN_HOME: home }, async () => {
+      await runFiles(engine, ['restore', dir]);
+    });
+    expect(readFileSync(original).equals(stored)).toBe(true);
+    expect(existsSync(pointer)).toBe(false);
   });
 
   test('restore keeps partial local state and pointer when downloaded bytes are corrupt', async () => {
@@ -462,6 +807,7 @@ describe('files object-storage crash safety', () => {
       `target: supabase://test/${storagePath}`,
       'bucket: test',
       `storage_path: ${storagePath}`,
+      'source_id: default',
       `size: ${expected.byteLength}`,
       `hash: sha256:${hash}`,
       'mime: application/octet-stream',
@@ -588,6 +934,7 @@ describe('files object-storage crash safety', () => {
       `target: supabase://test/${storagePath}`,
       'bucket: test',
       `storage_path: ${storagePath}`,
+      'source_id: default',
       `size: ${stored.byteLength}`,
       `hash: sha256:${hash}`,
       'mime: application/octet-stream',

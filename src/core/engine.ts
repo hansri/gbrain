@@ -87,7 +87,12 @@ export interface FileRow {
  * row in place (image was replaced); same content_hash is a no-op.
  */
 export interface FileSpec {
-  /** Required tenancy axis; callers must never rely on an implicit default. */
+  /**
+   * Tenancy axis. Required for every typed caller so new multi-source code
+   * cannot silently write into `default`. Engine implementations still
+   * normalize a runtime `undefined` from old JavaScript binaries to `default`
+   * for wire/backwards compatibility.
+   */
   source_id: string;
   page_slug?: string | null;
   page_id?: number | null;

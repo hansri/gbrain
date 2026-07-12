@@ -10,6 +10,7 @@ import { saveConfig, loadConfig, loadConfigFileOnly, toEngineConfig, gbrainPath,
 import { createEngine } from '../core/engine-factory.ts';
 import { discoverOAuth, mintClientCredentialsToken, smokeTestMcp } from '../core/remote-mcp-probe.ts';
 import { runInitEmbedCheck } from '../core/init-embed-check.ts';
+import { getOrCreateDatabaseInstanceId } from '../core/database-instance-id.ts';
 
 export async function runInit(args: string[]) {
   // Help guard: cli.ts only routes --help to printOpHelp() for shared-op
@@ -711,7 +712,7 @@ async function initRemoteMcp(opts: {
     console.log('Next steps:');
     console.log(`  1. Configure your agent's MCP client to point at ${config.remote_mcp!.mcp_url} (Claude Desktop / Hermes / openclaw).`);
     console.log('  2. Run `gbrain doctor` to re-verify connectivity at any time.');
-    console.log('  3. Run `gbrain remote ping` after writing markdown if you want the host to re-index immediately (Tier B).');
+    console.log('  3. Re-indexing is host-side; generic remote job submission is intentionally unavailable.');
   }
 }
 
@@ -911,6 +912,11 @@ async function initPGLite(opts: {
     }
 
     await engine.initSchema();
+    // Every newly initialized brain gets one database-owned UUID before init
+    // can report success. Migration receipts bind to this value instead of a
+    // route/path hash, so changing credentials, poolers, or release homes does
+    // not create a second migration authority for the same brain.
+    await getOrCreateDatabaseInstanceId(engine);
 
     // v0.37.10.0 T6 (D11): post-initSchema invariant assertion. After preflight
     // + always-configureGateway, this is structurally guaranteed to pass —
@@ -1169,6 +1175,7 @@ async function initPostgres(opts: {
 
     console.log('Running schema migration...');
     await engine.initSchema();
+    await getOrCreateDatabaseInstanceId(engine);
 
     // v0.37.10.0 T6 (D11): post-initSchema invariant assertion guardrail.
     if (resolvedDim) {

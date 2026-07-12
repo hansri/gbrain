@@ -13,6 +13,7 @@
 import { describe, test, expect } from 'bun:test';
 import { migrations, getMigration } from '../src/commands/migrations/index.ts';
 import { __testing } from '../src/commands/migrations/v0_16_0.ts';
+import { migrationTestOpts } from './helpers/migration-opts.ts';
 
 describe('v0.16.0 migration', () => {
   test('is registered in the migrations registry', () => {
@@ -56,20 +57,20 @@ describe('v0.16.0 migration', () => {
 
   test('phaseASchema skips on dry-run', async () => {
     // v0.41.37.0 #1605: phaseASchema is now async (in-process runMigrateOnlyCore).
-    const r = await __testing.phaseASchema({ dryRun: true, yes: true, noAutopilotInstall: true });
+    const r = await __testing.phaseASchema(migrationTestOpts({ dryRun: true }));
     expect(r.status).toBe('skipped');
     expect(r.detail).toBe('dry-run');
   });
 
   test('phaseBVerify skips on dry-run', async () => {
-    const r = await __testing.phaseBVerify({ dryRun: true, yes: true, noAutopilotInstall: true });
+    const r = await __testing.phaseBVerify(migrationTestOpts({ dryRun: true }));
     expect(r.status).toBe('skipped');
     expect(r.detail).toBe('dry-run');
   });
 
   test('orchestrator in dry-run returns complete with both phases skipped', async () => {
     const m = getMigration('0.16.0');
-    const result = await m!.orchestrator({ dryRun: true, yes: true, noAutopilotInstall: true });
+    const result = await m!.orchestrator(migrationTestOpts({ dryRun: true }));
     expect(result.version).toBe('0.16.0');
     expect(result.phases.length).toBe(2);
     expect(result.phases.every(p => p.status === 'skipped')).toBe(true);

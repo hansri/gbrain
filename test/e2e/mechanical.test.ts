@@ -19,10 +19,6 @@ import {
 import { operationsByName, operations } from '../../src/core/operations.ts';
 import type { OperationContext } from '../../src/core/operations.ts';
 import { importFromContent } from '../../src/core/import-file.ts';
-import {
-  DEFAULT_EMBEDDING_DIMENSIONS,
-  DEFAULT_EMBEDDING_MODEL,
-} from '../../src/core/ai/defaults.ts';
 
 // Skip all E2E tests if no database is configured
 const skip = !hasDatabase();
@@ -734,19 +730,21 @@ describeE2E('E2E: Setup Journey', () => {
   const cliEnv = () => ({ ...process.env, DATABASE_URL: process.env.DATABASE_URL! });
 
   test('gbrain init --non-interactive connects and initializes', () => {
-    // Tier-1 CI runs without embedding-provider credentials, so pass the
-    // canonical defaults explicitly to exercise offline schema setup without
-    // triggering the intentional no-key choice gate. Importing both values
-    // keeps the fixture aligned when the zero-config provider changes.
+    // Tier-1 CI runs without embedding-provider credentials. Defer embedding
+    // explicitly so this remains an offline Postgres schema/setup test and
+    // cannot drift when the zero-config PGLite model or dimensions change.
     const result = Bun.spawnSync({
       cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!,
-            '--embedding-model', DEFAULT_EMBEDDING_MODEL,
-            '--embedding-dimensions', String(DEFAULT_EMBEDDING_DIMENSIONS)],
+            '--no-embedding'],
       cwd: cliCwd,
       env: cliEnv(),
       timeout: 15_000,
     });
     const stdout = new TextDecoder().decode(result.stdout);
+    const stderr = new TextDecoder().decode(result.stderr);
+    if (result.exitCode !== 0) {
+      throw new Error(`gbrain init failed with exit ${result.exitCode}:\n${(stderr + stdout).slice(-4_000)}`);
+    }
     expect(result.exitCode).toBe(0);
     expect(stdout).toContain('Brain ready');
   }, 30_000);
@@ -1000,7 +998,7 @@ describeE2E('E2E: RLS Verification', () => {
       // doctor's existing rls check must still flag it. The new
       // rls_event_trigger check warns separately about the missing trigger.
       Bun.spawnSync({
-        cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
+        cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!, '--no-embedding'],
         cwd: cliCwd, env: cliEnv(), timeout: 15_000,
       });
 
@@ -1043,7 +1041,7 @@ describeE2E('E2E: RLS Verification', () => {
       await conn.unsafe(`COMMENT ON TABLE public.${tbl} IS 'GBRAIN:RLS_EXEMPT reason=e2e test fixture, anon-readable ok'`);
 
       Bun.spawnSync({
-        cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
+        cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!, '--no-embedding'],
         cwd: cliCwd, env: cliEnv(), timeout: 15_000,
       });
       const result = Bun.spawnSync({
@@ -1071,7 +1069,7 @@ describeE2E('E2E: RLS Verification', () => {
       await conn.unsafe(`COMMENT ON TABLE public.${tbl} IS 'GBRAIN:RLS_EXEMPT'`);
 
       Bun.spawnSync({
-        cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
+        cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!, '--no-embedding'],
         cwd: cliCwd, env: cliEnv(), timeout: 15_000,
       });
       const result = Bun.spawnSync({
@@ -1098,7 +1096,7 @@ describeE2E('E2E: RLS Verification', () => {
       await conn.unsafe(`COMMENT ON TABLE public.${tbl} IS 'Regular docs comment, not an exemption'`);
 
       Bun.spawnSync({
-        cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
+        cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!, '--no-embedding'],
         cwd: cliCwd, env: cliEnv(), timeout: 15_000,
       });
       const result = Bun.spawnSync({
@@ -1150,13 +1148,16 @@ describeE2E('E2E: RLS Verification', () => {
       // apply v24 cleanly and advance version to 24. Without the guard,
       // this would error out with 42P01 and leave version at 23.
       const result = Bun.spawnSync({
-        cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
+        cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!, '--no-embedding'],
         cwd: cliCwd, env: cliEnv(), timeout: 30_000,
       });
       const stdout = new TextDecoder().decode(result.stdout);
       const stderr = new TextDecoder().decode(result.stderr);
 
       // Must succeed — no 42P01, no transaction rollback.
+      if (result.exitCode !== 0) {
+        throw new Error(`v24 self-heal init failed with exit ${result.exitCode}:\n${(stderr + stdout).slice(-4_000)}`);
+      }
       expect(result.exitCode).toBe(0);
       expect(stderr + stdout).not.toMatch(/42P01|does not exist.*budget/i);
 
@@ -1267,14 +1268,12 @@ describeE2E('E2E: Doctor Command', () => {
   });
 
   test('gbrain doctor exits 0 on healthy DB', () => {
-    // Init first so config exists for CLI. Pin the imported canonical model
-    // and width together; this preserves the no-key Tier-1 path without
-    // letting a historical provider fixture drift from fresh-schema defaults.
+    // Init first so config exists for CLI. Embedding is explicitly deferred:
+    // this block tests doctor behavior, not provider readiness.
     Bun.spawnSync({
       cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive',
             '--url', process.env.DATABASE_URL!,
-            '--embedding-model', DEFAULT_EMBEDDING_MODEL,
-            '--embedding-dimensions', String(DEFAULT_EMBEDDING_DIMENSIONS)],
+            '--no-embedding'],
       cwd: cliCwd, env: cliEnv(), timeout: 15_000,
     });
     const result = Bun.spawnSync({
@@ -1324,7 +1323,7 @@ describeE2E('E2E: Parallel Import', () => {
 
   function initCli() {
     Bun.spawnSync({
-      cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
+      cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!, '--no-embedding'],
       cwd: cliCwd, env: cliEnv(), timeout: 15_000,
     });
   }

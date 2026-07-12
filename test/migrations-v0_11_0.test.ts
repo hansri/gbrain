@@ -16,6 +16,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 
 import { __testing, type PendingHostWorkEntry } from '../src/commands/migrations/v0_11_0.ts';
+import { migrationTestOpts } from './helpers/migration-opts.ts';
 
 const {
   injectAgentsMdMarker,
@@ -25,20 +26,28 @@ const {
   BUILTIN_HANDLERS,
   AGENTS_MD_MARKER,
   loadPendingHostWork,
+  loadOutstandingPendingHostWork,
+  deriveMigrationStatus,
+  phaseEHost,
 } = __testing;
 
 let tmp: string;
 let origHome: string | undefined;
+let origGbrainHome: string | undefined;
 
 beforeEach(() => {
   origHome = process.env.HOME;
+  origGbrainHome = process.env.GBRAIN_HOME;
   tmp = mkdtempSync(join(tmpdir(), 'gbrain-v0_11_0-test-'));
   process.env.HOME = tmp;
+  process.env.GBRAIN_HOME = tmp;
 });
 
 afterEach(() => {
   if (origHome === undefined) delete process.env.HOME;
   else process.env.HOME = origHome;
+  if (origGbrainHome === undefined) delete process.env.GBRAIN_HOME;
+  else process.env.GBRAIN_HOME = origGbrainHome;
   try { rmSync(tmp, { recursive: true, force: true }); } catch { /* best-effort */ }
 });
 
@@ -58,13 +67,87 @@ function writeCronJson(dir: string, jobs: unknown[]) {
 // Re-export dirname so writeCronJson can use it without another import
 const dirname = (p: string) => p.substring(0, p.lastIndexOf('/'));
 
-const DEFAULT_OPTS = {
+const DEFAULT_OPTS = migrationTestOpts({
   yes: true,
   mode: undefined,
   dryRun: false,
   hostDir: undefined,
   noAutopilotInstall: true,
-};
+});
+
+describe('orchestrator status derivation', () => {
+  test('a failed critical phase can never be reported as complete', () => {
+    expect(deriveMigrationStatus([
+      { name: 'schema', status: 'complete' },
+      { name: 'install', status: 'failed', detail: 'install unavailable' },
+    ], 0)).toBe('failed');
+  });
+
+  test('host work remains partial only when every executed phase is healthy', () => {
+    expect(deriveMigrationStatus([{ name: 'install', status: 'complete' }], 1)).toBe('partial');
+    expect(deriveMigrationStatus([{ name: 'install', status: 'complete' }], 0)).toBe('complete');
+  });
+
+  test('an unchanged second host scan remains partial while durable work is pending', async () => {
+    const dir = join(tmp, '.claude');
+    writeCronJson(dir, [
+      { schedule: '*/30 * * * *', kind: 'agentTurn', skill: 'ea-inbox-sweep' },
+    ]);
+
+    const first = await phaseEHost(DEFAULT_OPTS);
+    const second = await phaseEHost(DEFAULT_OPTS);
+
+    expect(first.pending_host_work).toBe(1);
+    expect(second.pending_host_work).toBe(1);
+    expect(deriveMigrationStatus([second.phase], second.pending_host_work)).toBe('partial');
+    expect(loadPendingHostWork()).toHaveLength(1);
+  });
+
+  test('append-only completion receipts clear the matching durable pending item', () => {
+    const pending: PendingHostWorkEntry = {
+      type: 'cron-handler-needs-host-registration',
+      status: 'pending',
+      handler: 'ea-inbox-sweep',
+      manifest_path: join(tmp, '.claude', 'cron', 'jobs.json'),
+      detected_at: new Date().toISOString(),
+      recommendation: 'register handler',
+    };
+    __testing.appendPendingHostWork(pending);
+    __testing.appendPendingHostWork({ ...pending, status: 'complete' });
+
+    expect(loadOutstandingPendingHostWork()).toEqual([]);
+  });
+
+  test('a skipped host rewrite fails closed instead of reporting complete', async () => {
+    const cronDir = join(tmp, '.claude', 'cron');
+    mkdirSync(cronDir, { recursive: true });
+    writeFileSync(join(cronDir, 'jobs.json'), '{ malformed json');
+
+    const result = await phaseEHost(DEFAULT_OPTS);
+
+    expect(result.phase.status).toBe('failed');
+    expect(deriveMigrationStatus([result.phase], result.pending_host_work)).toBe('failed');
+  });
+
+  test('durable migration state honors GBRAIN_HOME independently of HOME', () => {
+    const stateRoot = join(tmp, 'isolated-state');
+    process.env.GBRAIN_HOME = stateRoot;
+    const entry: PendingHostWorkEntry = {
+      type: 'cron-handler-needs-host-registration',
+      status: 'pending',
+      handler: 'ea-inbox-sweep',
+      manifest_path: '/tmp/jobs.json',
+      detected_at: new Date().toISOString(),
+      recommendation: 'register handler',
+    };
+
+    __testing.appendPendingHostWork(entry);
+
+    expect(__testing.pendingHostWorkPath()).toBe(join(stateRoot, '.gbrain', 'migrations', 'pending-host-work.jsonl'));
+    expect(existsSync(__testing.pendingHostWorkPath())).toBe(true);
+    expect(existsSync(join(tmp, '.gbrain', 'migrations', 'pending-host-work.jsonl'))).toBe(false);
+  });
+});
 
 describe('AGENTS.md marker injection', () => {
   test('injects the subagent-routing marker + ## section', () => {

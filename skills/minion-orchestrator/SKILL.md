@@ -30,7 +30,6 @@ triggers:
   - "fan out"
   - "do these in parallel"
 tools:
-  - submit_job
   - get_job
   - list_jobs
   - cancel_job
@@ -98,12 +97,11 @@ tasks where no LLM reasoning loop is needed.
   - **PGLite + --follow:** `gbrain jobs submit ... --follow` runs inline.
     The daemon mode is not available on PGLite (exclusive file lock). See
     `docs/guides/minions-shell-jobs.md`.
-- **MCP boundary:** shell-job submission is CLI-only. `submit_job name="shell"`
-  over MCP throws an `OperationError` with code `permission_denied` ("'shell'
-  jobs cannot be submitted over MCP") because `shell` is in `PROTECTED_JOB_NAMES`.
-  Agents CAN observe shell jobs via `get_job` / `list_jobs` / `get_job_progress`
-  (not protected), but cannot submit them. Operator or autopilot submits;
-  agent observes.
+- **MCP boundary:** generic job submission is host-local. `submit_job` is not
+  discoverable over remote MCP, and its handler rejects every context that is
+  not explicitly local. Agents may observe or manage jobs only when their
+  principal has the exact lifecycle tools; the operator, autopilot, or another
+  trusted host process submits the work.
 - **Verify setup:** after configuration, run `gbrain jobs stats` (CLI) to
   confirm the worker is registered and consuming the queue.
 
@@ -290,7 +288,7 @@ Total tokens so far: 4.3k
 
 ## Tools Used
 
-- Submit a background job — `submit_job` (MCP, non-protected names only; shell jobs are CLI-only, subagent jobs via `gbrain agent run`)
+- Submit a background job — `gbrain jobs submit` or `gbrain agent run` on the trusted host; generic remote MCP submission is unavailable
 - Get job details — `get_job` (MCP)
 - List jobs with filters — `list_jobs` (MCP)
 - Cancel a job — `cancel_job` (MCP)

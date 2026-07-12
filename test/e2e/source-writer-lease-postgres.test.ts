@@ -8,8 +8,9 @@ import {
   assertSourceWriterLeaseAtCommit,
   withSourceWriterLease,
 } from '../../src/core/source-writer-lease.ts';
+import { getPostgresTestUrl } from '../helpers/postgres-test-authority.ts';
 
-const DATABASE_URL = process.env.DATABASE_URL;
+const DATABASE_URL = getPostgresTestUrl();
 
 describe.skipIf(!DATABASE_URL)('Postgres source-writer commit fencing', () => {
   let engine: PostgresEngine;

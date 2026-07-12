@@ -8,6 +8,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
+import { migrationTestOpts } from './helpers/migration-opts.ts';
 
 describe('v0.21.0 orchestrator — Cathedral II migration', () => {
   test('registered in the TS migration registry', async () => {
@@ -38,11 +39,11 @@ describe('v0.21.0 orchestrator — Cathedral II migration', () => {
 
   test('dry-run skips all side-effect phases', async () => {
     const { v0_21_0 } = await import('../src/commands/migrations/v0_21_0.ts');
-    const result = await v0_21_0.orchestrator({
+    const result = await v0_21_0.orchestrator(migrationTestOpts({
       yes: true,
       dryRun: true,
       noAutopilotInstall: true,
-    });
+    }));
     expect(result.version).toBe('0.21.0');
     expect(result.phases.length).toBeGreaterThanOrEqual(3);
     const skippedCount = result.phases.filter(p => p.status === 'skipped').length;

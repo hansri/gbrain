@@ -5,6 +5,7 @@ import type { BrainEngine } from '../src/core/engine.ts';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { readFileSync } from 'fs';
 import { resolve } from 'path';
+import { withEnv } from './helpers/with-env.ts';
 
 describe('migrate', () => {
   test('LATEST_VERSION is a number >= 1', () => {
@@ -18,6 +19,54 @@ describe('migrate', () => {
 
   // Integration tests for actual migration execution require DATABASE_URL
   // and are covered in the E2E suite (test/e2e/mechanical.test.ts)
+});
+
+describe('critical ownership indexes are verified even at schema head', () => {
+  test('a legitimate file-only v123 state resumes through v124 to schema head', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      await engine.executeRaw('DROP INDEX pages_source_path_owner_uniq');
+      await engine.setConfig('version', '123');
+
+      const result = await runMigrations(engine);
+      expect(result.current).toBe(LATEST_VERSION);
+      expect(result.applied).toBeGreaterThanOrEqual(1);
+      expect(await engine.getConfig('version')).toBe(String(LATEST_VERSION));
+    } finally {
+      await engine.disconnect();
+    }
+  }, 60_000);
+
+  test('dropped page ownership index makes a no-op migration pass fail closed', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      const versionBefore = await engine.getConfig('version');
+      await engine.executeRaw('DROP INDEX pages_source_path_owner_uniq');
+
+      await expect(runMigrations(engine)).rejects.toThrow(/pages_source_path_owner_uniq/);
+      expect(await engine.getConfig('version')).toBe(versionBefore);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 60_000);
+
+  test('wrong same-name ownership index is rejected at schema head', async () => {
+    const engine = new PGLiteEngine();
+    await engine.connect({});
+    try {
+      await engine.initSchema();
+      await engine.executeRaw('DROP INDEX pages_source_path_owner_uniq');
+      await engine.executeRaw('CREATE INDEX pages_source_path_owner_uniq ON pages(slug)');
+
+      await expect(runMigrations(engine)).rejects.toThrow(/pages_source_path_owner_uniq/);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 60_000);
 });
 
 describe('migration v126 — explicit managed timeline ownership', () => {
@@ -61,16 +110,18 @@ describe('hasPendingMigrations', () => {
   }, 30000);
 
   test('returns true when version config is missing entirely (defensive default)', async () => {
-    const engine = new PGLiteEngine();
-    await engine.connect({});
-    try {
-      // Don't call initSchema. Probe against an empty PGlite — getConfig should
-      // either return null (treated as version=1) or throw on missing config
-      // table; either way the probe must say "yes pending."
-      expect(await hasPendingMigrations(engine)).toBe(true);
-    } finally {
-      await engine.disconnect();
-    }
+    await withEnv({ GBRAIN_PGLITE_SNAPSHOT: undefined }, async () => {
+      const engine = new PGLiteEngine();
+      await engine.connect({});
+      try {
+        // Don't call initSchema. Probe against an empty PGLite — getConfig should
+        // either return null (treated as version=1) or throw on missing config
+        // table; either way the probe must say "yes pending."
+        expect(await hasPendingMigrations(engine)).toBe(true);
+      } finally {
+        await engine.disconnect();
+      }
+    });
   }, 30000);
 });
 
@@ -2253,6 +2304,19 @@ describe('v117 — context_volunteer_events_table', () => {
     );
     expect(left.map(r => r.slug)).toEqual(['people/alice-example']);
   });
+});
+
+describe('v123 — rollback-compatible multi-source file identity', () => {
+  const migration = MIGRATIONS.find(m => m.version === 123);
+
+  test('establishes composite ownership while preserving the previous-binary file constraint', () => {
+    expect(migration?.name).toBe('files_source_storage_path_identity');
+    const sql = migration?.sql ?? '';
+    expect(sql).toContain('CREATE UNIQUE INDEX IF NOT EXISTS idx_files_source_storage_path');
+    expect(sql).not.toContain('pages_source_path_owner_uniq');
+    expect(sql).not.toContain('DROP CONSTRAINT IF EXISTS files_storage_path_key');
+  });
+
 });
 
 describe('v124 — pages_source_path_single_owner', () => {

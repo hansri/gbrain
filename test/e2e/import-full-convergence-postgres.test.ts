@@ -5,8 +5,9 @@ import {
   type ImportConvergenceReceipt,
 } from '../../src/commands/import.ts';
 import { withSourceWriterLease } from '../../src/core/source-writer-lease.ts';
+import { getPostgresTestUrl } from '../helpers/postgres-test-authority.ts';
 
-const DATABASE_URL = process.env.DATABASE_URL;
+const DATABASE_URL = getPostgresTestUrl();
 
 describe.skipIf(!DATABASE_URL)('Postgres full-import convergence transaction', () => {
   let engine: PostgresEngine;

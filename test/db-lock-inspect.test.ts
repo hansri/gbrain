@@ -57,6 +57,7 @@ describe('inspectLock', () => {
     expect(snap!.holder_pid).toBe(process.pid);
     expect(typeof snap!.holder_host).toBe('string');
     expect(snap!.holder_host.length).toBeGreaterThan(0);
+    expect(snap!.holder_token).toBe(handle!.owner.holderToken);
     expect(snap!.acquired_at).toBeInstanceOf(Date);
     expect(snap!.ttl_expires_at).toBeInstanceOf(Date);
     expect(snap!.age_ms).toBeGreaterThanOrEqual(0);
@@ -130,10 +131,12 @@ describe('listStaleLocks', () => {
 });
 
 describe('deleteLockRow', () => {
-  test('deletes the row + RETURNING returns it when (id, pid) matches', async () => {
+  test('deletes the row + RETURNING returns it when (id, pid, token) matches', async () => {
     const handle = await tryAcquireDbLock(engine, 'gbrain-sync:to-delete');
     expect(handle).not.toBeNull();
-    const result = await deleteLockRow(engine, 'gbrain-sync:to-delete', process.pid);
+    const result = await deleteLockRow(
+      engine, 'gbrain-sync:to-delete', process.pid, handle!.owner.holderToken,
+    );
     expect(result.deleted).toBe(true);
     // Row should be gone.
     const snap = await inspectLock(engine, 'gbrain-sync:to-delete');
@@ -154,7 +157,7 @@ describe('deleteLockRow', () => {
       `DELETE FROM gbrain_cycle_locks WHERE id = $1`,
       ['gbrain-sync:race-target'],
     );
-    const result = await deleteLockRow(engine, 'gbrain-sync:race-target', 11111);
+    const result = await deleteLockRow(engine, 'gbrain-sync:race-target', 11111, 'legacy-unfenced');
     expect(result.deleted).toBe(false);
   });
 
@@ -164,12 +167,28 @@ describe('deleteLockRow', () => {
        VALUES ($1, $2, $3, NOW(), NOW() + INTERVAL '30 minutes')`,
       ['gbrain-sync:wrong-pid', 11111, 'h1'],
     );
-    const result = await deleteLockRow(engine, 'gbrain-sync:wrong-pid', 22222);
+    const result = await deleteLockRow(engine, 'gbrain-sync:wrong-pid', 22222, 'legacy-unfenced');
     expect(result.deleted).toBe(false);
     // Row should still exist.
     const snap = await inspectLock(engine, 'gbrain-sync:wrong-pid');
     expect(snap).not.toBeNull();
     expect(snap!.holder_pid).toBe(11111);
+  });
+
+  test('refuses to delete a successor acquisition with the same pid but a new token', async () => {
+    const handle = await tryAcquireDbLock(engine, 'gbrain-sync:successor');
+    expect(handle).not.toBeNull();
+    await engine.executeRaw(
+      `UPDATE gbrain_cycle_locks SET holder_token = 'successor-token'
+        WHERE id = 'gbrain-sync:successor'`,
+    );
+
+    const result = await deleteLockRow(
+      engine, 'gbrain-sync:successor', process.pid, handle!.owner.holderToken,
+    );
+    expect(result.deleted).toBe(false);
+    expect((await inspectLock(engine, 'gbrain-sync:successor'))?.holder_token).toBe('successor-token');
+    await expect(handle!.release()).rejects.toBeInstanceOf(LockOwnershipLostError);
   });
 
   test('atomic shape: single round trip (RETURNING in same statement)', async () => {
@@ -179,10 +198,14 @@ describe('deleteLockRow', () => {
     // DELETE...RETURNING into a SELECT-check + DELETE later.
     const handle = await tryAcquireDbLock(engine, 'gbrain-sync:atomic-test');
     expect(handle).not.toBeNull();
-    const r = await deleteLockRow(engine, 'gbrain-sync:atomic-test', process.pid);
+    const r = await deleteLockRow(
+      engine, 'gbrain-sync:atomic-test', process.pid, handle!.owner.holderToken,
+    );
     expect(r.deleted).toBe(true);
     // Calling again is a no-op (idempotent).
-    const r2 = await deleteLockRow(engine, 'gbrain-sync:atomic-test', process.pid);
+    const r2 = await deleteLockRow(
+      engine, 'gbrain-sync:atomic-test', process.pid, handle!.owner.holderToken,
+    );
     expect(r2.deleted).toBe(false);
     await expect(handle!.release()).rejects.toBeInstanceOf(LockOwnershipLostError);
   });

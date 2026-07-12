@@ -26,14 +26,14 @@
  */
 
 import type { Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult } from './types.ts';
+import { runSnapshotMigrateOnly } from './snapshot.ts';
 
 // ── Phase A — Schema ────────────────────────────────────────
 
 async function phaseASchema(opts: OrchestratorOpts): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) return { name: 'schema', status: 'skipped', detail: 'dry-run' };
   try {
-    const { runMigrateOnlyCore } = await import('./in-process.ts');
-    await runMigrateOnlyCore();
+    await runSnapshotMigrateOnly(opts);
     return { name: 'schema', status: 'complete' };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

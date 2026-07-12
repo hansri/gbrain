@@ -27,11 +27,14 @@ bun install -g github:garrytan/gbrain
 Verify: `gbrain --version` should print a version number. If `gbrain` is not found,
 restart the shell or add the PATH export to the shell profile.
 
-> **If `bun install -g` aborts or `gbrain doctor` reports `schema_version: 0`** (Bun
-> occasionally blocks the top-level postinstall hook on global installs, so schema
-> migrations don't run automatically), the CLI prints a recovery hint pointing at
-> [#218](https://github.com/garrytan/gbrain/issues/218). Run `gbrain apply-migrations --yes`
-> to recover. If that doesn't work, fall back to the deterministic install path:
+> **Package postinstall is deliberately non-mutating.** It installs
+> the CLI and prints the explicit next step; it does not open or migrate any
+> configured brain. Run `gbrain doctor`, take the release-required backup,
+> follow any release-specific `upgrade-preflight` guide, then run `gbrain
+> apply-migrations --yes` through the exact staged/current-release binary.
+> There is no environment-variable opt-in and postinstall never selects a
+> `gbrain` executable from `PATH`. If install itself fails, fall back to the
+> deterministic install path:
 >
 > ```bash
 > git clone https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain
@@ -258,6 +261,14 @@ Read `docs/GBRAIN_VERIFY.md` and run all 7 verification checks. Check #4 (live s
 actually works) is the most important.
 
 ## Upgrade
+
+Before any upgrade, read each skipped version's migration guide. A guide that
+requires a supervised staged release overrides the normal shortcuts below. For
+the first hop into v0.42.59.0, stop services and writers, back up the database
+plus canonical/legacy GBrain state, stage the new binary, and use that **new**
+binary for `upgrade-preflight`, `apply-migrations`, and `doctor` before
+promotion. Do not ask an old binary that lacks the preflight command to certify
+that transition.
 
 If you installed via `bun install -g`:
 

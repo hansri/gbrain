@@ -1,8 +1,21 @@
 import { VERSION } from '../version.ts';
 import { isMinorOrMajorBump, isValidVersionString } from '../core/semver.ts';
 import { fetchChangelog, fetchLatestRelease } from './check-update.ts';
-import { detectInstallMethod, runUpgrade } from './upgrade.ts';
+import {
+  assertInlineUpgradeTargetAllowed,
+  detectInstallMethod,
+  runUpgrade,
+} from './upgrade.ts';
 import { writeUpdateCache } from '../core/self-upgrade.ts';
+
+export function assertInlineSelfUpgradeReleaseAllowed(target: string | null): asserts target is string {
+  if (!target || !isValidVersionString(target)) {
+    throw new Error(
+      'Self-upgrade could not determine an exact valid release target; inline replacement is denied.',
+    );
+  }
+  assertInlineUpgradeTargetAllowed(target, VERSION);
+}
 
 /**
  * `gbrain self-upgrade [--check-only] [--force] [--json]`
@@ -10,8 +23,9 @@ import { writeUpdateCache } from '../core/self-upgrade.ts';
  * The universal substrate every agent ecosystem (Codex / Claude Code / Hermes /
  * OpenClaw / Perplexity-server) can call to stay current. The CLI startup hook
  * emits a marker; the agent skill / autopilot daemon act on it by running THIS
- * command. The action is always the hardcoded `gbrain upgrade` — never
- * parameterized by any marker content (forged-marker guard).
+ * command. The action is always the hardcoded `gbrain upgrade --target X`,
+ * where X came from validated release metadata and passed the local compiled
+ * release policy; free-form marker content is never executed.
  *
  *   --check-only  Report whether an upgrade is available; never apply.
  *   --force       Apply even if not behind (re-run the install-method swap).
@@ -97,6 +111,13 @@ export async function runSelfUpgrade(args: string[]): Promise<void> {
     return;
   }
 
-  // Apply: delegate to the hardcoded upgrade path (full swap + post-upgrade).
-  await runUpgrade([]);
+  // The exact target must be approved by policy compiled into this running
+  // binary before any inline swap. Remote release metadata can identify a
+  // target, but it cannot grant itself permission to bypass a supervised
+  // staged release. `--force` deliberately does not weaken this boundary.
+  assertInlineSelfUpgradeReleaseAllowed(latest);
+
+  // Carry the exact locally approved target into the updater. The upgrade
+  // command pins and re-verifies this version; it never re-resolves latest.
+  await runUpgrade(['--target', latest]);
 }

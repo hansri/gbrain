@@ -4,10 +4,10 @@
 # runner that bind-mounts the repo. Used by `bun run ci:local` and
 # `bun run ci:local:diff` (see scripts/ci-local.sh).
 #
-# All services are pulled as `image:` (no build) so `docker compose pull`
-# refreshes everything. The bun version floats with `oven/bun:1` to track CI's
-# `bun-version: latest`. Named volumes isolate the Linux container's deps from
-# the host's darwin-arm64 deps and keep bun + postgres data warm across runs.
+# All services are pulled as digest-pinned `image:` references (no build), so
+# local verification uses the same immutable Bun/Postgres inputs as CI. Named
+# volumes isolate the Linux container's deps from the host's darwin-arm64 deps
+# and keep bun + postgres data warm across runs.
 #
 # Why 4 postgres services: bun's E2E suite shares one DB across 36 files and
 # uses TRUNCATE CASCADE in setupDB(). Running files in parallel against ONE DB
@@ -22,13 +22,15 @@
 
 services:
   postgres-1:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb  # pg16
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: gbrain_test
     ports:
-      - "${GBRAIN_CI_PG_PORT:-5434}:5432"
+      - "127.0.0.1:${GBRAIN_CI_PG_PORT:-5434}:5432"
+    pids_limit: 256
+    mem_limit: 1g
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d gbrain_test"]
       interval: 10s
@@ -38,13 +40,15 @@ services:
       - gbrain-ci-pg-data-1:/var/lib/postgresql/data
 
   postgres-2:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb  # pg16
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: gbrain_test
     ports:
-      - "${GBRAIN_CI_PG_PORT_2:-5435}:5432"
+      - "127.0.0.1:${GBRAIN_CI_PG_PORT_2:-5435}:5432"
+    pids_limit: 256
+    mem_limit: 1g
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d gbrain_test"]
       interval: 10s
@@ -54,13 +58,15 @@ services:
       - gbrain-ci-pg-data-2:/var/lib/postgresql/data
 
   postgres-3:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb  # pg16
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: gbrain_test
     ports:
-      - "${GBRAIN_CI_PG_PORT_3:-5436}:5432"
+      - "127.0.0.1:${GBRAIN_CI_PG_PORT_3:-5436}:5432"
+    pids_limit: 256
+    mem_limit: 1g
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d gbrain_test"]
       interval: 10s
@@ -70,13 +76,15 @@ services:
       - gbrain-ci-pg-data-3:/var/lib/postgresql/data
 
   postgres-4:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb  # pg16
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: gbrain_test
     ports:
-      - "${GBRAIN_CI_PG_PORT_4:-5437}:5432"
+      - "127.0.0.1:${GBRAIN_CI_PG_PORT_4:-5437}:5432"
+    pids_limit: 256
+    mem_limit: 1g
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d gbrain_test"]
       interval: 10s
@@ -94,7 +102,7 @@ services:
   # TRUNCATE-based fixtures; pgbouncer's wildcard [databases] section
   # forwards any dbname to DB_HOST.
   pgbouncer:
-    image: edoburu/pgbouncer:latest
+    image: edoburu/pgbouncer@sha256:4c1ca296ef525f108f5d3552cc337c0c09587cf8dae7f0067fd93349e47dc1cd
     environment:
       DB_HOST: postgres-1
       DB_PORT: "5432"
@@ -114,13 +122,17 @@ services:
       # before the teardown path is even reached.
       IGNORE_STARTUP_PARAMETERS: extra_float_digits,statement_timeout,idle_in_transaction_session_timeout,search_path
     ports:
-      - "${GBRAIN_CI_PGBOUNCER_PORT:-6543}:5432"
+      - "127.0.0.1:${GBRAIN_CI_PGBOUNCER_PORT:-6543}:5432"
+    pids_limit: 64
+    mem_limit: 256m
     depends_on:
       postgres-1:
         condition: service_healthy
 
   runner:
-    image: oven/bun:1
+    image: oven/bun@sha256:87416c977a612a204eb54ab9f3927023c2a3c971f4f345a01da08ea6262ae30e  # 1.3.13
+    pids_limit: 512
+    mem_limit: 4g
     working_dir: /app
     depends_on:
       postgres-1:

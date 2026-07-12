@@ -1,115 +1,367 @@
 import { execSync, execFileSync } from 'child_process';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, realpathSync } from 'fs';
+import { randomUUID } from 'node:crypto';
+import {
+  existsSync, readFileSync, realpathSync,
+} from 'fs';
 import { basename, join, dirname, resolve } from 'path';
+import { homedir } from 'node:os';
 import { VERSION } from '../version.ts';
+import type { UpgradeChildTransition } from '../core/upgrade-child-capability.ts';
+import { gbrainPath } from '../core/config.ts';
+import {
+  getOrCreateDatabaseInstanceId,
+  readDatabaseInstanceId,
+} from '../core/database-instance-id.ts';
+import { redactPgUrl } from '../core/url-redact.ts';
+import {
+  appendOwnedStateFile,
+  readOwnedStateFile,
+  withOwnedStateReadPolicy,
+  writeOwnedStateFileAtomic,
+} from '../core/owned-state-file.ts';
+import {
+  resolveCurrentGbrainInvocation,
+  type CurrentReleaseRuntime,
+} from './migrations/in-process.ts';
+import { resolveUpgradeReleasePolicy } from '../core/upgrade-release-policy.ts';
 
 const GBRAIN_GITHUB_REPO = 'garrytan/gbrain';
+const MAX_UPGRADE_EVIDENCE_ERROR_CHARS = 4_096;
+const MAX_UPGRADE_ERROR_LOG_BYTES = 4 * 1024 * 1024;
+const MAX_UPGRADE_STATE_BYTES = 1 * 1024 * 1024;
+const UPGRADE_STATE_LOCK_NAME = 'upgrade-state-transition';
+const UPGRADE_STATE_LOCK_TTL_MS = 2 * 60 * 60 * 1000;
+const UNVERIFIED_UPGRADE_TARGET = '<unverified-replacement>';
+const UPGRADE_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const UPGRADE_BRAIN_ID_RE = /^db:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export interface UpgradeTransitionContext {
+  transitionId: string;
+  /** Null means the upgrade deliberately started without a local brain. */
+  brainId: string | null;
+}
+
+export function resolveUpgradeInvocation(
+  args: readonly string[],
+  runtime?: CurrentReleaseRuntime,
+): string[] {
+  return resolveCurrentGbrainInvocation(args, runtime);
+}
+
+export interface ParsedUpgradeInvocation {
+  swapOnly: boolean;
+  target: string | null;
+}
+
+export function parseUpgradeInvocation(args: readonly string[]): ParsedUpgradeInvocation {
+  let swapOnly = false;
+  let target: string | null = null;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--swap-only') {
+      if (swapOnly) throw new Error('Duplicate --swap-only flag.');
+      swapOnly = true;
+      continue;
+    }
+    if (arg === '--target') {
+      if (target !== null) throw new Error('Duplicate --target flag.');
+      const value = args[++i];
+      if (!value || value.startsWith('-')) {
+        throw new Error('--target requires one exact release version.');
+      }
+      target = normalizedVersion(value);
+      continue;
+    }
+    throw new Error(`Unknown upgrade option: ${arg}`);
+  }
+  return { swapOnly, target };
+}
+
+export function assertInlineUpgradeTargetAllowed(
+  target: string,
+  currentVersion: string = VERSION,
+): string {
+  const normalizedTarget = normalizedVersion(target);
+  if (!parseSupportedUpgradeVersion(normalizedTarget)) {
+    throw new Error(`Upgrade target ${JSON.stringify(target)} is not an exact supported release version.`);
+  }
+  if (!isStrictUpgrade(currentVersion, normalizedTarget)) {
+    throw new Error(
+      `Upgrade target must be one exact forward release: ` +
+      `${normalizedVersion(currentVersion)} -> ${normalizedTarget}.`,
+    );
+  }
+  const policy = resolveUpgradeReleasePolicy(normalizedTarget);
+  if (!policy.inlineAllowed) {
+    throw new Error(
+      `Inline upgrade to v${normalizedTarget} is denied: ${policy.reason}. ` +
+      'Use a supervised staged promotion with matched database and file-state rollback.',
+    );
+  }
+  return normalizedTarget;
+}
+
+async function resolveExactUpgradeTarget(
+  requestedTarget: string | null,
+  currentVersion: string,
+): Promise<string> {
+  let target = requestedTarget;
+  if (target === null) {
+    const { fetchLatestRelease } = await import('./check-update.ts');
+    const release = await fetchLatestRelease();
+    target = release?.tag ? normalizedVersion(release.tag) : null;
+  }
+  if (!target) {
+    throw new Error('Upgrade could not resolve one exact release target before mutation.');
+  }
+  return assertInlineUpgradeTargetAllowed(target, currentVersion);
+}
+
+async function withUpgradeStateLock<T>(
+  run: () => Promise<T> | T,
+  lockDir: string = gbrainPath('locks'),
+): Promise<T> {
+  const { withPackLock } = await import('../core/schema-pack/pack-lock.ts');
+  return withPackLock(
+    UPGRADE_STATE_LOCK_NAME,
+    { lockDir, ttlMs: UPGRADE_STATE_LOCK_TTL_MS },
+    run,
+  );
+}
+
+async function configuredUpgradeBrainId(createIfMissing: boolean): Promise<string | null> {
+  const { loadConfig, toEngineConfig, isThinClient } = await import('../core/config.ts');
+  const config = loadConfig();
+  if (!config || isThinClient(config)) return null;
+  const engineConfig = toEngineConfig(config);
+  const {
+    assertExistingPgliteDataDirForReadOnlyOpen,
+    createEngine,
+  } = await import('../core/engine-factory.ts');
+  let pgliteReadOnlyAuthority;
+  if (!createIfMissing) {
+    // Resolve child-side authority without letting PGLite turn a stale/moved
+    // configured path into a fresh empty store.
+    pgliteReadOnlyAuthority = assertExistingPgliteDataDirForReadOnlyOpen(engineConfig);
+  }
+  const engine = await createEngine(engineConfig, { pgliteReadOnlyAuthority });
+  try {
+    await engine.connect(engineConfig);
+    return createIfMissing
+      ? await getOrCreateDatabaseInstanceId(engine)
+      : await readDatabaseInstanceId(engine);
+  } finally {
+    try { await engine.disconnect(); } catch { /* best-effort */ }
+  }
+}
+
+/** Parent-side authority establishment before a binary swap. */
+export async function establishConfiguredUpgradeBrainId(): Promise<string | null> {
+  return configuredUpgradeBrainId(true);
+}
+
+/** Child-side read-only authority resolution before touching a bound brain. */
+export async function resolveConfiguredUpgradeBrainId(): Promise<string | null> {
+  return configuredUpgradeBrainId(false);
+}
+
+function redactLocalUpgradePaths(value: string): string {
+  const prefixes = new Map<string, string>();
+  try { prefixes.set(gbrainPath(), '<gbrain-home>'); } catch { /* invalid override is sanitized below */ }
+  const configuredParent = process.env.GBRAIN_HOME?.trim();
+  if (configuredParent && configuredParent.length > 1) {
+    prefixes.set(configuredParent, '<gbrain-home-parent>');
+  }
+  const home = process.env.HOME?.trim();
+  if (home && home.length > 1) prefixes.set(home, '<home>');
+
+  let redacted = value;
+  for (const [prefix, replacement] of [...prefixes.entries()].sort((a, b) => b[0].length - a[0].length)) {
+    redacted = redacted.split(prefix).join(replacement);
+  }
+  return redacted;
+}
+
+export function sanitizeUpgradeEvidenceError(error: unknown): string {
+  let text = redactLocalUpgradePaths(String(error ?? 'unknown upgrade error'))
+    .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]+/gu, ' ')
+    .replace(/postgres(?:ql)?:\/\/[^\s"'<>]+/gi, value => redactPgUrl(value))
+    .replace(/\b(password|passwd|token|secret|api[_-]?key)\s*[:=]\s*[^\s,;]+/gi, '$1=<redacted>')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!text) text = 'unknown upgrade error';
+  return text.slice(0, MAX_UPGRADE_EVIDENCE_ERROR_CHARS);
+}
 
 export async function runUpgrade(args: string[]) {
   if (args.includes('--help') || args.includes('-h')) {
-    console.log('Usage: gbrain upgrade [--swap-only]\n\nSelf-update the CLI.\n\nDetects install method (bun, binary, clawhub) and runs the appropriate update.\nAfter upgrading, shows what\'s new and offers to set up new features.\n\n--swap-only  Perform ONLY the binary/source swap and skip post-upgrade\n             (migrations run on the next launch). Used by the autopilot\n             silent self-upgrade channel so the daemon can swap + relaunch\n             without a 30-min blocking post-upgrade inside its tick.');
+    console.log('Usage: gbrain upgrade [--target <version>] [--swap-only]\n\nSelf-update the CLI to one exact approved release.\n\nDetects install method, pins the requested package/tag/asset, and verifies the\ninstalled version exactly. Without --target, resolves GitHub latest before any\nmutation.\n\n--target     Exact release version approved before the swap.\n--swap-only  Perform ONLY the binary/source swap and skip post-upgrade\n             (migrations run on the next launch). Used by the autopilot\n             silent self-upgrade channel so the daemon can swap + relaunch\n             without a 30-min blocking post-upgrade inside its tick.');
     return;
   }
 
-  // --swap-only: do the swap, skip the (potentially 30-min) post-upgrade. The
-  // relaunched binary runs migrations on boot (split-brain guard). v0.42.
-  const swapOnly = args.includes('--swap-only');
+  const invocation = parseUpgradeInvocation(args);
 
-  // Capture old version BEFORE upgrading (Codex finding: old binary runs this code)
-  const oldVersion = VERSION;
-  const method = detectInstallMethod();
+  // Parent-side mutation (binary swap + durable handoff publication) is one
+  // locked transition. The lock is deliberately released before spawning the
+  // NEW binary: `gbrain post-upgrade` acquires the same lock in its own process.
+  const handoff = await withUpgradeStateLock(async () => {
+    assertNoUnresolvedUpgradeTransition();
 
-  console.log(`Detected install method: ${method}`);
+    // --swap-only: do the swap, skip the (potentially 30-min) post-upgrade. The
+    // relaunched binary runs migrations on boot (split-brain guard). v0.42.
+    const swapOnly = invocation.swapOnly;
+    const oldVersion = VERSION;
+    const targetVersion = await resolveExactUpgradeTarget(invocation.target, oldVersion);
+    const method = detectInstallMethod();
+    const linkInfo = method === 'bun-link' ? detectBunLink() : null;
 
-  let upgraded = false;
-  switch (method) {
-    case 'bun-link': {
-      const linkInfo = detectBunLink();
-      if (!linkInfo) {
-        console.error('bun-link detected but could not resolve repo root.');
-        break;
-      }
-      console.log(`Upgrading bun-link source clone at ${linkInfo.repoRoot}...`);
-      try {
-        execFileSync('git', ['-C', linkInfo.repoRoot, 'pull', '--ff-only'], { stdio: 'inherit', timeout: 120_000 });
-        execFileSync('bun', ['install'], { cwd: linkInfo.repoRoot, stdio: 'inherit', timeout: 120_000 });
-        upgraded = true;
-      } catch {
-        console.error('Auto-upgrade failed. Try manually:');
-        console.error(`  cd ${linkInfo.repoRoot} && git pull && bun install`);
-      }
-      break;
-    }
-
-    case 'bun': {
-      console.log('Upgrading via bun...');
-      const bunGlobalRoot = resolveBunGlobalRoot();
-      try {
-        execFileSync('bun', ['update', 'gbrain'], { cwd: bunGlobalRoot, stdio: 'inherit', timeout: 120_000 });
-        upgraded = true;
-      } catch {
-        console.error('Upgrade failed. Try running manually:');
-        console.error(`  cd ${bunGlobalRoot} && bun update gbrain`);
-      }
-      break;
-    }
-
-    case 'binary': {
-      // v0.42: real atomic self-update on the published targets
-      // (darwin-arm64, linux-x64). Other platforms have no asset → notify.
-      const { runBinarySelfUpdate } = await import('../core/binary-self-update.ts');
-      console.log('Updating gbrain binary (atomic download + replace)...');
-      const result = await runBinarySelfUpdate();
-      if (result.ok) {
-        upgraded = true;
-      } else if (result.reason === 'unsupported_platform' || result.reason === 'no_asset') {
-        console.log('No published binary for this platform/arch.');
-        console.log('Download the latest binary from GitHub Releases:');
-        console.log('  https://github.com/garrytan/gbrain/releases');
-      } else {
-        console.error(`Binary self-update failed (${result.reason}${result.error ? `: ${result.error}` : ''}).`);
-        console.error('Your existing binary is unchanged. Download manually if needed:');
-        console.error('  https://github.com/garrytan/gbrain/releases');
-        recordUpgradeError({
-          phase: 'binary-self-update',
-          fromVersion: oldVersion,
-          toVersion: '',
-          error: `${result.reason}${result.error ? `: ${result.error}` : ''}`,
-          hint: 'Download from https://github.com/garrytan/gbrain/releases',
-        });
-      }
-      break;
-    }
-
-    case 'clawhub':
-      console.log('Upgrading via ClawHub...');
-      try {
-        execSync('clawhub update gbrain', { stdio: 'inherit', timeout: 120_000 });
-        upgraded = true;
-      } catch {
-        console.error('ClawHub upgrade failed. Try: clawhub update gbrain');
-      }
-      break;
-
-    default:
+    console.log(`Detected install method: ${method}`);
+    if (method === 'unknown') {
       console.error('Could not detect installation method.');
       console.log('Try one of:');
       console.log('  bun update gbrain');
       console.log('  clawhub update gbrain');
       console.log('  Download from https://github.com/garrytan/gbrain/releases');
-  }
+      return null;
+    }
+    if (method === 'clawhub') {
+      throw new Error(
+        `ClawHub cannot prove an exact ${targetVersion} install. ` +
+        'Use a supervised exact-version install, then run `gbrain post-upgrade`.',
+      );
+    }
+    if (method === 'bun-link' && !linkInfo) {
+      console.error('bun-link detected but could not resolve repo root.');
+      return null;
+    }
 
-  if (upgraded) {
-    const newVersion = verifyUpgrade();
-    // Save old version for post-upgrade migration detection
-    saveUpgradeState(oldVersion, newVersion);
+    const transitionContext: UpgradeTransitionContext = {
+      transitionId: randomUUID(),
+      brainId: await establishConfiguredUpgradeBrainId(),
+    };
+    publishUpgradeSwapWriteAhead(oldVersion, transitionContext);
 
-    // Self-upgrade breadcrumb + cache reset (covers both the full and
-    // --swap-only paths, so the autopilot silent channel benefits too):
-    //   - write just-upgraded-from so the next invocation's startup hook prints
-    //     the one-time JUST_UPGRADED confirmation;
-    //   - clear the update-check cache + snooze so a now-stale "upgrade
-    //     available" marker doesn't keep nudging after we've already applied it.
+    let upgraded = false;
+    let failureIsKnownNoSwap = false;
+    switch (method) {
+      case 'bun-link': {
+        if (!linkInfo) throw new Error('bun-link install authority disappeared before swap');
+        console.log(`Upgrading bun-link source clone to exact v${targetVersion} at ${linkInfo.repoRoot}...`);
+        try {
+          const tagRef = `refs/tags/v${targetVersion}`;
+          execFileSync(
+            'git',
+            ['-C', linkInfo.repoRoot, 'fetch', '--force', 'origin', `${tagRef}:${tagRef}`],
+            { stdio: 'inherit', timeout: 120_000 },
+          );
+          execFileSync(
+            'git',
+            ['-C', linkInfo.repoRoot, 'checkout', '--detach', tagRef],
+            { stdio: 'inherit', timeout: 120_000 },
+          );
+          execFileSync(
+            'bun', ['install', '--frozen-lockfile'],
+            { cwd: linkInfo.repoRoot, stdio: 'inherit', timeout: 120_000 },
+          );
+          upgraded = true;
+        } catch {
+          console.error(`Exact source upgrade to v${targetVersion} failed.`);
+          console.error('Verify the checked-out tag and reinstall before running `gbrain post-upgrade`.');
+        }
+        break;
+      }
+
+      case 'bun': {
+        console.log(`Upgrading via bun to exact ${targetVersion}...`);
+        const bunGlobalRoot = resolveBunGlobalRoot();
+        try {
+          execFileSync(
+            // The unscoped npm `gbrain` name is an unrelated package. Keep the
+            // install authority on the reviewed upstream repository and bind
+            // it to the exact release tag before the post-swap verification.
+            'bun', ['add', '--exact', `github:${GBRAIN_GITHUB_REPO}#v${targetVersion}`],
+            { cwd: bunGlobalRoot, stdio: 'inherit', timeout: 120_000 },
+          );
+          upgraded = true;
+        } catch {
+          console.error(`Exact bun upgrade to ${targetVersion} failed.`);
+        }
+        break;
+      }
+
+      case 'binary': {
+        const { runBinarySelfUpdate } = await import('../core/binary-self-update.ts');
+        console.log(`Updating gbrain binary to exact ${targetVersion} (atomic download + replace)...`);
+        const result = await runBinarySelfUpdate(process.execPath, {
+          expectedVersion: targetVersion,
+        });
+        if (result.ok) {
+          upgraded = true;
+        } else if (result.reason === 'unsupported_platform' || result.reason === 'no_asset') {
+          failureIsKnownNoSwap = true;
+          console.log('No published binary for this platform/arch.');
+          console.log('Download the latest binary from GitHub Releases:');
+          console.log('  https://github.com/garrytan/gbrain/releases');
+        } else {
+          failureIsKnownNoSwap = true;
+          console.error(`Binary self-update failed (${result.reason}${result.error ? `: ${result.error}` : ''}).`);
+          console.error('Your existing binary is unchanged. Download manually if needed:');
+          console.error('  https://github.com/garrytan/gbrain/releases');
+          recordUpgradeError({
+            phase: 'binary-self-update',
+            fromVersion: oldVersion,
+            toVersion: '',
+            error: `${result.reason}${result.error ? `: ${result.error}` : ''}`,
+            hint: 'Download from https://github.com/garrytan/gbrain/releases',
+          }, transitionContext);
+        }
+        break;
+      }
+
+      default:
+        break;
+    }
+
+    if (!upgraded) {
+      if (failureIsKnownNoSwap) {
+        saveUpgradeState(
+          oldVersion,
+          oldVersion,
+          'complete',
+          undefined,
+          transitionContext,
+        );
+      } else {
+        // A package/source updater can fail after replacing only part of the
+        // install (for bun-link, git pull may succeed before bun install
+        // fails). Preserve the unverified write-ahead fence verbatim so the
+        // next runnable binary can either recover it or block the old binary.
+        recordUpgradeError({
+          phase: 'binary-swap',
+          fromVersion: oldVersion,
+          toVersion: UNVERIFIED_UPGRADE_TARGET,
+          error: 'binary/source update did not complete cleanly',
+          hint: 'Verify or reinstall the intended release, then run: gbrain post-upgrade',
+        }, transitionContext);
+      }
+      return null;
+    }
+
+    // Verification is authoritative. The write-ahead fence remains untrusted
+    // until the same install reports a strict forward release target.
+    const newVersion = verifyUpgrade(undefined, oldVersion, targetVersion);
+    // Re-evaluate the policy after the swap and before trusting the handoff.
+    // The exact-version check above prevents a remote/latest race from turning
+    // approval for X into installation of Y.
+    assertInlineUpgradeTargetAllowed(newVersion, oldVersion);
+    saveUpgradeState(
+      oldVersion,
+      newVersion,
+      swapOnly ? 'deferred' : 'post_upgrade_pending',
+      undefined,
+      transitionContext,
+    );
+
     try {
       const su = await import('../core/self-upgrade.ts');
       su.writeJustUpgraded(oldVersion);
@@ -119,43 +371,43 @@ export async function runUpgrade(args: string[]) {
       /* best-effort: never block the upgrade on confirmation bookkeeping */
     }
 
-    // --swap-only stops here: the swap is done + smoke-verified, but the
-    // (potentially 30-min) post-upgrade is deferred to the next launch so the
-    // autopilot silent channel can swap + relaunch without freezing its tick.
-    // connectEngine's pending-migration probe + runPostUpgrade run on boot.
-    if (swapOnly) {
-      return;
-    }
-    // Run post-upgrade feature discovery (reads migration files from the NEW binary).
-    // Timeout bumped 300s → 1800s (30 min) in v0.15.2 because v0.12.0 graph
-    // backfill on 50K+ brains regularly exceeded the old ceiling. The heartbeat
-    // wiring added in v0.15.2 makes the long wait observable; a hard 300s
-    // cap would still kill legit migrations mid-run. Override via
-    // GBRAIN_POST_UPGRADE_TIMEOUT_MS env var.
-    const postUpgradeTimeoutMs = Number(
-      process.env.GBRAIN_POST_UPGRADE_TIMEOUT_MS || 1_800_000,
+    return { oldVersion, newVersion, swapOnly, transitionContext };
+  });
+
+  if (!handoff || handoff.swapOnly) return;
+
+  const postUpgradeTimeoutMs = Number(
+    process.env.GBRAIN_POST_UPGRADE_TIMEOUT_MS || 1_800_000,
+  );
+  try {
+    const invocation = resolveUpgradeInvocation(['post-upgrade']);
+    execFileSync(invocation[0]!, invocation.slice(1), {
+      stdio: 'inherit', timeout: postUpgradeTimeoutMs,
+    });
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    await recordParentPostUpgradeFailureIfMissing(
+      handoff.oldVersion,
+      handoff.newVersion,
+      message,
+      handoff.transitionContext,
     );
-    try {
-      execSync('gbrain post-upgrade', { stdio: 'inherit', timeout: postUpgradeTimeoutMs });
-    } catch (e) {
-      // post-upgrade is best-effort, don't fail the upgrade. BUT leave a
-      // trail so `gbrain doctor` can surface it and give the user a clear
-      // paste-ready recovery command. Silent failure here is how users end
-      // up with half-upgraded brains and no signal.
-      recordUpgradeError({
-        phase: 'post-upgrade',
-        fromVersion: oldVersion,
-        toVersion: newVersion,
-        error: e instanceof Error ? e.message : String(e),
-        hint: 'Run: gbrain apply-migrations --yes',
-      });
-    }
-    // Run features scan to show what's new and what to fix
-    try {
-      execSync('gbrain features', { stdio: 'inherit', timeout: 30_000 });
-    } catch {
-      // features scan is best-effort
-    }
+    throw new Error(
+      `Upgrade incomplete: post-upgrade migrations failed. ` +
+      `The new binary is installed, but feature setup was skipped. ` +
+      `Run \`gbrain post-upgrade\` to resume the full idempotent setup. ` +
+      `For read-only diagnosis use \`gbrain apply-migrations --list\` or \`--dry-run\`; ` +
+      `mutation recovery must stay inside \`gbrain post-upgrade\`.`,
+      { cause: e },
+    );
+  }
+
+  await assertUpgradeTransitionComplete(handoff);
+  try {
+    const invocation = resolveUpgradeInvocation(['features']);
+    execFileSync(invocation[0]!, invocation.slice(1), { stdio: 'inherit', timeout: 30_000 });
+  } catch {
+    // features scan is best-effort
   }
 }
 
@@ -199,14 +451,43 @@ function findBunInstallRootFromArgv(): string | null {
   }
 }
 
-function verifyUpgrade(): string {
+export function verifyUpgrade(
+  run?: () => string,
+  previousVersion?: string,
+  expectedVersion?: string,
+): string {
+  const execute = run ?? (() => {
+    const invocation = resolveUpgradeInvocation(['--version']);
+    return execFileSync(invocation[0]!, invocation.slice(1), {
+      encoding: 'utf-8', timeout: 10_000,
+    });
+  });
   try {
-    const output = execSync('gbrain --version', { encoding: 'utf-8', timeout: 10_000 }).trim();
+    const output = execute().trim();
+    const version = normalizedVersion(output);
+    if (!version) throw new Error('replacement binary returned an empty version');
+    if (!parseSupportedUpgradeVersion(version)) {
+      throw new Error(`replacement binary returned unsupported version ${JSON.stringify(version)}`);
+    }
+    if (
+      expectedVersion !== undefined &&
+      normalizedVersion(expectedVersion) !== version
+    ) {
+      throw new Error(
+        `replacement binary reported ${version}, not approved target ` +
+        normalizedVersion(expectedVersion),
+      );
+    }
+    if (previousVersion !== undefined && !isStrictUpgrade(previousVersion, version)) {
+      throw new Error(`replacement binary did not advance ${normalizedVersion(previousVersion)} -> ${version}`);
+    }
     console.log(`Upgrade complete. Now running: ${output}`);
-    return output.replace(/^gbrain\s*/i, '').trim();
-  } catch {
-    console.log('Upgrade complete. Could not verify new version.');
-    return '';
+    return version;
+  } catch (error) {
+    throw new Error(
+      'Binary replacement could not be verified; the write-ahead fence remains and no target was trusted.',
+      { cause: error },
+    );
   }
 }
 
@@ -223,43 +504,188 @@ export function recordUpgradeError(record: {
   toVersion: string;
   error: string;
   hint: string;
-}): void {
+}, context?: UpgradeTransitionContext): void {
+  const line = JSON.stringify({
+    ts: new Date().toISOString(),
+    phase: sanitizeUpgradeEvidenceError(record.phase),
+    from_version: sanitizeUpgradeEvidenceError(record.fromVersion),
+    to_version: sanitizeUpgradeEvidenceError(record.toVersion),
+    error: sanitizeUpgradeEvidenceError(record.error),
+    hint: sanitizeUpgradeEvidenceError(record.hint),
+    ...(context
+      ? { transition_id: context.transitionId, brain_id: context.brainId }
+      : {}),
+  }) + '\n';
   try {
-    const dir = join(process.env.HOME || '', '.gbrain');
-    mkdirSync(dir, { recursive: true });
-    const path = join(dir, 'upgrade-errors.jsonl');
-    const line = JSON.stringify({
-      ts: new Date().toISOString(),
-      phase: record.phase,
-      from_version: record.fromVersion,
-      to_version: record.toVersion,
-      error: record.error,
-      hint: record.hint,
-    }) + '\n';
-    appendFileSync(path, line);
+    appendOwnedStateFile(
+      gbrainPath('upgrade-errors.jsonl'),
+      line,
+      MAX_UPGRADE_ERROR_LOG_BYTES,
+      gbrainPath(),
+    );
   } catch {
-    // Recording errors is itself best-effort. The user will still see the
-    // underlying failure in stdout/stderr from the original command.
+    // A symlink, hardlink, oversized file, or torn prior write is not trusted.
+    // Reset this best-effort evidence atomically without reading/following the
+    // old target. If the directory itself is unsafe, the reset also fails.
+    try {
+      writeOwnedStateFileAtomic(
+        gbrainPath('upgrade-errors.jsonl'),
+        line,
+        MAX_UPGRADE_ERROR_LOG_BYTES,
+        gbrainPath(),
+      );
+    } catch {
+      // The user still sees the underlying failure on stdout/stderr.
+    }
   }
 }
 
-function saveUpgradeState(oldVersion: string, newVersion: string) {
+export type UpgradeCompletionStatus =
+  | 'swap_running'
+  | 'post_upgrade_pending'
+  | 'deferred'
+  | 'running'
+  | 'complete'
+  | 'incomplete';
+
+function transitionContextFromRecord(value: unknown): UpgradeTransitionContext | null {
+  if (!value || typeof value !== 'object') return null;
+  const record = value as { transition_id?: unknown; brain_id?: unknown; brain_required?: unknown };
+  if (typeof record.transition_id !== 'string' || !UPGRADE_UUID_RE.test(record.transition_id)) return null;
+  if (!(record.brain_id === null || (
+    typeof record.brain_id === 'string' && UPGRADE_BRAIN_ID_RE.test(record.brain_id)
+  ))) return null;
+  if (record.brain_required !== (record.brain_id !== null)) return null;
+  return { transitionId: record.transition_id, brainId: record.brain_id };
+}
+
+export function saveUpgradeState(
+  oldVersion: string,
+  newVersion: string,
+  status: UpgradeCompletionStatus,
+  error?: string,
+  context?: UpgradeTransitionContext,
+) {
+  const statePath = gbrainPath('upgrade-state.json');
+  let state: Record<string, unknown> = {};
   try {
-    const dir = join(process.env.HOME || '', '.gbrain');
-    mkdirSync(dir, { recursive: true });
-    const statePath = join(dir, 'upgrade-state.json');
-    const state: Record<string, unknown> = existsSync(statePath)
-      ? JSON.parse(readFileSync(statePath, 'utf-8'))
-      : {};
-    state.last_upgrade = {
-      from: oldVersion,
-      to: newVersion,
-      ts: new Date().toISOString(),
-    };
-    writeFileSync(statePath, JSON.stringify(state, null, 2));
-  } catch {
-    // best-effort
+    const parsed = JSON.parse(
+      readOwnedStateFile(statePath, MAX_UPGRADE_STATE_BYTES, gbrainPath()),
+    ) as unknown;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('canonical upgrade state root is not an object');
+    }
+    state = parsed as Record<string, unknown>;
+  } catch (error) {
+    if (isMissingStateError(error)) {
+      state = {};
+    } else if (status === 'complete') {
+      // A completed historical record may replace an unsafe redirect without
+      // following it. Pending/incomplete evidence is never reset this way.
+      state = {};
+    } else {
+      throw new Error(
+        `Cannot publish ${status} upgrade state over unreadable or malformed canonical evidence`,
+        { cause: error },
+      );
+    }
   }
+  const prior = (state as { last_upgrade?: unknown }).last_upgrade;
+  const priorRecord = prior && typeof prior === 'object'
+    ? prior as { from?: unknown; to?: unknown; status?: unknown }
+    : null;
+  const resolvedContext = context
+    ?? (priorRecord?.from === oldVersion && priorRecord?.to === newVersion
+      ? transitionContextFromRecord(prior)
+      : null)
+    ?? { transitionId: randomUUID(), brainId: null };
+  if (
+    !UPGRADE_UUID_RE.test(resolvedContext.transitionId) ||
+    !(resolvedContext.brainId === null || UPGRADE_BRAIN_ID_RE.test(resolvedContext.brainId))
+  ) {
+    throw new Error('Refusing to write upgrade state with a malformed transition or database identity');
+  }
+
+  if (priorRecord) {
+    const priorStatus = priorRecord.status;
+    const priorContext = transitionContextFromRecord(prior);
+    const exactLegacyAdoption = priorStatus === undefined
+      && priorRecord.from === oldVersion
+      && priorRecord.to === newVersion
+      && context !== undefined;
+
+    if (priorStatus !== undefined && ![
+      'swap_running', 'post_upgrade_pending', 'deferred', 'running', 'complete', 'incomplete',
+    ].includes(String(priorStatus))) {
+      throw new Error(`Refusing to overwrite upgrade state with unknown status ${String(priorStatus)}`);
+    }
+
+    if (priorStatus !== 'complete') {
+      const exactSwapPromotion = priorStatus === 'swap_running'
+        && priorRecord.from === oldVersion
+        && priorRecord.to === UNVERIFIED_UPGRADE_TARGET
+        && priorContext?.transitionId === resolvedContext.transitionId
+        && priorContext.brainId === resolvedContext.brainId;
+      if (!exactLegacyAdoption && !exactSwapPromotion) {
+        if (!priorContext) {
+          throw new Error('Refusing to overwrite unresolved upgrade state without a valid transition binding');
+        }
+        if (
+          priorContext.transitionId !== resolvedContext.transitionId ||
+          priorContext.brainId !== resolvedContext.brainId ||
+          priorRecord.from !== oldVersion ||
+          priorRecord.to !== newVersion
+        ) {
+          throw new Error(
+            `Upgrade transition CAS mismatch: unresolved transition ${priorContext.transitionId} cannot be overwritten by ${resolvedContext.transitionId}`,
+          );
+        }
+      }
+    } else if (status === 'complete' && (
+      !priorContext ||
+      priorContext.transitionId !== resolvedContext.transitionId ||
+      priorContext.brainId !== resolvedContext.brainId
+    )) {
+      throw new Error('Upgrade transition CAS mismatch: completed evidence is immutable across transitions');
+    }
+  }
+
+  state.last_upgrade = {
+    from: oldVersion,
+    to: newVersion,
+    ts: new Date().toISOString(),
+    status,
+    transition_id: resolvedContext.transitionId,
+    brain_required: resolvedContext.brainId !== null,
+    brain_id: resolvedContext.brainId,
+    ...(status === 'incomplete'
+      ? {
+          safety_mode: 'migration_gate_blocked',
+          recovery: 'gbrain post-upgrade',
+          ...(error ? { error: sanitizeUpgradeEvidenceError(error) } : {}),
+        }
+      : {}),
+  };
+  writeOwnedStateFileAtomic(
+    statePath,
+    JSON.stringify(state, null, 2) + '\n',
+    MAX_UPGRADE_STATE_BYTES,
+    gbrainPath(),
+  );
+}
+
+/** Fsynced write-ahead fence published before any updater can replace code. */
+export function publishUpgradeSwapWriteAhead(
+  oldVersion: string,
+  context: UpgradeTransitionContext,
+): void {
+  saveUpgradeState(
+    oldVersion,
+    UNVERIFIED_UPGRADE_TARGET,
+    'swap_running',
+    undefined,
+    context,
+  );
 }
 
 /**
@@ -333,34 +759,954 @@ async function applySelfUpgradeSetup(): Promise<void> {
   }
 }
 
+interface PendingUpgradeTransition {
+  from: string;
+  to: string;
+  status: Exclude<UpgradeCompletionStatus, 'complete'>;
+  context: UpgradeTransitionContext | null;
+  tsMs: number;
+  legacy: boolean;
+}
+
+interface CompletedUpgradeTransition {
+  from: string;
+  to: string;
+  context: UpgradeTransitionContext;
+  tsMs: number;
+}
+
+interface ForeignTargetUpgradeTransition {
+  from: string;
+  to: string;
+  status: string;
+  tsMs: number;
+}
+
+type UpgradeStateLoadResult =
+  | { kind: 'missing' }
+  | { kind: 'complete'; transition: CompletedUpgradeTransition }
+  | { kind: 'pending'; transition: PendingUpgradeTransition }
+  | { kind: 'legacy'; transition: PendingUpgradeTransition }
+  | { kind: 'foreign'; transition: ForeignTargetUpgradeTransition; message: string }
+  | { kind: 'invalid'; message: string };
+
+function isMissingStateError(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error
+    && (error as { code?: unknown }).code === 'ENOENT';
+}
+
+function normalizedVersion(value: string): string {
+  return value.replace(/^gbrain\s*/i, '').replace(/^v/i, '').trim();
+}
+
+function parseSupportedUpgradeVersion(value: string): {
+  numbers: [number, number, number, number];
+  prerelease: string | null;
+} | null {
+  const match = /^(\d+)\.(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(value);
+  if (!match) return null;
+  const numbers = match.slice(1, 5).map(Number) as [number, number, number, number];
+  if (!numbers.every(Number.isSafeInteger)) return null;
+  return { numbers, prerelease: match[5] ?? null };
+}
+
+function isStrictUpgrade(previous: string, next: string): boolean {
+  const prior = parseSupportedUpgradeVersion(normalizedVersion(previous));
+  const target = parseSupportedUpgradeVersion(next);
+  if (!prior || !target) return false;
+  for (let i = 0; i < 4; i++) {
+    if (target.numbers[i]! > prior.numbers[i]!) return true;
+    if (target.numbers[i]! < prior.numbers[i]!) return false;
+  }
+  // Same numeric release: only prerelease -> stable is an upgrade.
+  return prior.prerelease !== null && target.prerelease === null;
+}
+
+function parseUpgradeState(
+  raw: string,
+  label: string,
+  allowHistoricalForeignTarget = false,
+): UpgradeStateLoadResult {
+  let parsed: { last_upgrade?: unknown };
+  try { parsed = JSON.parse(raw) as { last_upgrade?: unknown }; }
+  catch { return { kind: 'invalid', message: `${label} upgrade state is malformed JSON` }; }
+  const last = parsed.last_upgrade;
+  if (!last || typeof last !== 'object') {
+    return { kind: 'invalid', message: `${label} upgrade state has no last_upgrade record` };
+  }
+  const record = last as { from?: unknown; to?: unknown; status?: unknown; ts?: unknown };
+  if (typeof record.from !== 'string' || typeof record.to !== 'string') {
+    return { kind: 'invalid', message: `${label} upgrade state has invalid from/to versions` };
+  }
+  const tsMs = typeof record.ts === 'string' ? Date.parse(record.ts) : Number.NaN;
+
+  if (record.status === undefined) {
+    if (!Number.isFinite(tsMs)) {
+      return { kind: 'invalid', message: `${label} upgrade state has an invalid timestamp` };
+    }
+    if (normalizedVersion(record.to) !== normalizedVersion(VERSION)) {
+      const message = `${label} legacy handoff targets ${record.to || '<empty>'}, not this ${VERSION} binary`;
+      if (allowHistoricalForeignTarget) {
+        return {
+          kind: 'foreign',
+          transition: {
+            from: record.from, to: record.to, status: 'legacy', tsMs,
+          },
+          message,
+        };
+      }
+      return {
+        kind: 'invalid',
+        message,
+      };
+    }
+    return {
+      kind: 'legacy',
+      transition: {
+        from: record.from,
+        to: record.to,
+        status: 'deferred',
+        context: null,
+        tsMs,
+        legacy: true,
+      },
+    };
+  }
+
+  const status = String(record.status);
+  if (![
+    'swap_running', 'post_upgrade_pending', 'deferred', 'running', 'complete', 'incomplete',
+  ].includes(status)) {
+    return { kind: 'invalid', message: `${label} upgrade state has unknown status ${status}` };
+  }
+  if (status === 'swap_running') {
+    const context = transitionContextFromRecord(last);
+    if (!context || record.to !== UNVERIFIED_UPGRADE_TARGET) {
+      return { kind: 'invalid', message: `${label} interrupted binary swap state is malformed or unbound` };
+    }
+    if (!Number.isFinite(tsMs)) {
+      return { kind: 'invalid', message: `${label} upgrade state has an invalid timestamp` };
+    }
+    if (!isStrictUpgrade(record.from, VERSION)) {
+      return {
+        kind: 'invalid',
+        message: `${label} binary swap was interrupted without a verified forward target; reinstall or deliberately recover the intended newer binary before retrying`,
+      };
+    }
+    // A different, runnable VERSION proves the replacement can execute. Bind
+    // the interrupted write-ahead record to this binary and require the full
+    // explicit post-upgrade gate before normal operation.
+    return {
+      kind: 'pending',
+      transition: {
+        from: record.from,
+        to: VERSION,
+        status: 'post_upgrade_pending',
+        context,
+        tsMs,
+        legacy: false,
+      },
+    };
+  }
+  const targetMatchesRunning =
+    normalizedVersion(record.to) === normalizedVersion(VERSION);
+  if (status === 'complete' && !targetMatchesRunning) {
+    const runningVersion = parseSupportedUpgradeVersion(normalizedVersion(VERSION));
+    const completedTarget = parseSupportedUpgradeVersion(normalizedVersion(record.to));
+    if (!runningVersion || !completedTarget) {
+      return {
+        kind: 'invalid',
+        message: `${label} completed upgrade target ${record.to || '<empty>'} cannot be safely compared with this ${VERSION} binary`,
+      };
+    }
+    if (isStrictUpgrade(VERSION, normalizedVersion(record.to))) {
+      return {
+        kind: 'invalid',
+        message: `${label} completed upgrade targets newer ${record.to}, but this binary is ${VERSION}; restore the matched database and file state or reinstall the completed target binary`,
+      };
+    }
+  }
+  if (status !== 'complete' && !targetMatchesRunning) {
+    const message = `${label} ${status} handoff targets ${record.to || '<empty>'}, not this ${VERSION} binary`;
+    if (allowHistoricalForeignTarget) {
+      return {
+        kind: 'foreign',
+        transition: { from: record.from, to: record.to, status, tsMs },
+        message,
+      };
+    }
+    return {
+      kind: 'invalid',
+      message,
+    };
+  }
+  const context = transitionContextFromRecord(last);
+  if (!context) {
+    return { kind: 'invalid', message: `${label} ${status} upgrade state is not bound to a transition and brain` };
+  }
+  if (!Number.isFinite(tsMs)) {
+    return { kind: 'invalid', message: `${label} upgrade state has an invalid timestamp` };
+  }
+  if (status === 'complete') {
+    if (
+      allowHistoricalForeignTarget &&
+      !targetMatchesRunning
+    ) {
+      return {
+        kind: 'foreign',
+        transition: { from: record.from, to: record.to, status, tsMs },
+        message: `${label} completed upgrade targets ${record.to || '<empty>'}, not this ${VERSION} binary`,
+      };
+    }
+    return {
+      kind: 'complete',
+      transition: { from: record.from, to: record.to, context, tsMs },
+    };
+  }
+  return {
+    kind: 'pending',
+    transition: {
+      from: record.from,
+      to: record.to,
+      status: status as PendingUpgradeTransition['status'],
+      context,
+      tsMs,
+      legacy: false,
+    },
+  };
+}
+
+function readUpgradeStateCandidate(
+  path: string,
+  root: string,
+  label: string,
+  allowHistoricalForeignTarget = false,
+): UpgradeStateLoadResult {
+  try {
+    return parseUpgradeState(
+      readOwnedStateFile(path, MAX_UPGRADE_STATE_BYTES, root),
+      label,
+      allowHistoricalForeignTarget,
+    );
+  } catch (error) {
+    if (isMissingStateError(error)) return { kind: 'missing' };
+    return {
+      kind: 'invalid',
+      message: `${label} upgrade state is unreadable or unsafe: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+function markLegacyStateForCanonicalAdoption(
+  state: UpgradeStateLoadResult,
+): UpgradeStateLoadResult {
+  if (state.kind === 'pending' || state.kind === 'legacy') {
+    return {
+      kind: 'legacy',
+      transition: { ...state.transition, legacy: true },
+    };
+  }
+  return state;
+}
+
+function upgradeStateRecordsEqual(
+  left: Extract<UpgradeStateLoadResult, { kind: 'complete' | 'pending' | 'legacy' }>,
+  right: Extract<UpgradeStateLoadResult, { kind: 'complete' | 'pending' | 'legacy' }>,
+): boolean {
+  const descriptor = (state: typeof left | typeof right) => {
+    if (state.kind === 'complete') {
+      return {
+        status: 'complete',
+        from: state.transition.from,
+        to: state.transition.to,
+        transitionId: state.transition.context.transitionId,
+        brainId: state.transition.context.brainId,
+      };
+    }
+    return {
+      status: state.transition.status,
+      from: state.transition.from,
+      to: state.transition.to,
+      transitionId: state.transition.context?.transitionId ?? null,
+      brainId: state.transition.context?.brainId ?? null,
+    };
+  };
+  return JSON.stringify(descriptor(left)) === JSON.stringify(descriptor(right));
+}
+
+function upgradeStateTimestamp(state: UpgradeStateLoadResult): number {
+  if (
+    state.kind === 'complete' || state.kind === 'pending' ||
+    state.kind === 'legacy' || state.kind === 'foreign'
+  ) return state.transition.tsMs;
+  return Number.NaN;
+}
+
+function loadUpgradeState(): UpgradeStateLoadResult {
+  const canonicalRoot = gbrainPath();
+  const canonicalPath = gbrainPath('upgrade-state.json');
+  const canonical = readUpgradeStateCandidate(canonicalPath, canonicalRoot, 'Canonical');
+  const legacyRoot = join(process.env.HOME || homedir(), '.gbrain');
+  const legacyPath = join(legacyRoot, 'upgrade-state.json');
+  if (resolve(legacyPath) === resolve(canonicalPath)) return canonical;
+
+  // Read both authorities together. A prior binary wrote only to HOME, so a
+  // rollback/re-upgrade can create a fresh legacy handoff while a stale
+  // canonical completion still exists under GBRAIN_HOME.
+  const legacy = readUpgradeStateCandidate(
+    legacyPath,
+    legacyRoot,
+    'Legacy HOME',
+    true,
+  );
+  if (canonical.kind === 'invalid') return canonical;
+  if (canonical.kind === 'foreign') {
+    return { kind: 'invalid', message: canonical.message };
+  }
+  if (legacy.kind === 'invalid') return legacy;
+  if (canonical.kind === 'missing') {
+    return legacy.kind === 'foreign'
+      ? { kind: 'invalid', message: legacy.message }
+      : markLegacyStateForCanonicalAdoption(legacy);
+  }
+  if (legacy.kind === 'missing') return canonical;
+
+  if (legacy.kind === 'foreign') {
+    const canonicalTs = upgradeStateTimestamp(canonical);
+    if (
+      Number.isFinite(canonicalTs) &&
+      Number.isFinite(legacy.transition.tsMs) &&
+      canonicalTs >= legacy.transition.tsMs
+    ) return canonical;
+    return {
+      kind: 'invalid',
+      message: `${legacy.message}; it is not older than canonical state`,
+    };
+  }
+
+  if (upgradeStateRecordsEqual(canonical, legacy)) return canonical;
+
+  // Once a statusless HOME handoff is adopted, canonical state advances
+  // deferred -> running -> complete while the immutable old breadcrumb stays
+  // behind. Same versions + a newer bound canonical record prove that lineage.
+  if (
+    legacy.kind === 'legacy' &&
+    (canonical.kind === 'pending' || canonical.kind === 'complete') &&
+    canonical.transition.from === legacy.transition.from &&
+    canonical.transition.to === legacy.transition.to &&
+    Number.isFinite(canonical.transition.tsMs) &&
+    Number.isFinite(legacy.transition.tsMs) &&
+    canonical.transition.tsMs >= legacy.transition.tsMs
+  ) return canonical;
+
+  // The one deliberate reconciliation: complete and pending records for the
+  // current target are ordered by their durable timestamps. The newer pending
+  // legacy handoff must not be hidden; after adoption/completion, the newer
+  // canonical completion in turn suppresses the stale legacy breadcrumb.
+  if (
+    canonical.kind === 'complete' &&
+    (legacy.kind === 'pending' || legacy.kind === 'legacy') &&
+    normalizedVersion(legacy.transition.to) === normalizedVersion(VERSION) &&
+    Number.isFinite(canonical.transition.tsMs) &&
+    Number.isFinite(legacy.transition.tsMs)
+  ) {
+    if (legacy.transition.tsMs > canonical.transition.tsMs) {
+      return markLegacyStateForCanonicalAdoption(legacy);
+    }
+    if (
+      canonical.transition.tsMs >= legacy.transition.tsMs &&
+      canonical.transition.from === legacy.transition.from &&
+      canonical.transition.to === legacy.transition.to
+    ) return canonical;
+  }
+
+  return {
+    kind: 'invalid',
+    message: 'Canonical and Legacy HOME upgrade states disagree; no migration was started',
+  };
+}
+
+export type ReconciledUpgradeState =
+  | { kind: 'missing' }
+  | {
+      kind: 'complete'; from: string; to: string; status: 'complete';
+      transitionId: string; brainId: string | null; tsMs: number;
+    }
+  | {
+      kind: 'pending'; from: string; to: string;
+      status: Exclude<UpgradeCompletionStatus, 'complete'>;
+      transitionId: string | null; brainId: string | null; legacy: boolean;
+      tsMs: number;
+    }
+  | { kind: 'invalid'; message: string };
+
+export type PostUpgradeInvocation =
+  | { kind: 'resume' }
+  | { kind: 'help' }
+  | { kind: 'recover-migration'; version: string }
+  | {
+      kind: 'repair-ownership';
+      sourceId: string;
+      sourcePath: string;
+      keepSlug: string;
+    };
+
+const ORCHESTRATOR_VERSION_RE = /^\d+\.\d+\.\d+(?:\.\d+)?$/;
+
+/**
+ * Parse the complete post-upgrade surface. Recovery is intentionally two
+ * fixed commands rather than an argv passthrough to apply-migrations or
+ * upgrade-preflight, so an unresolved handoff cannot become a generic gate
+ * bypass when those commands gain new flags later.
+ */
+export function parsePostUpgradeInvocation(args: readonly string[]): PostUpgradeInvocation {
+  if (args.length === 0) return { kind: 'resume' };
+  if (args.length === 1 && (args[0] === '--help' || args[0] === '-h')) {
+    return { kind: 'help' };
+  }
+  if (
+    args.length === 3
+    && args[0] === 'recover-migration'
+    && args[1] === '--force-retry'
+    && ORCHESTRATOR_VERSION_RE.test(args[2] ?? '')
+  ) {
+    return { kind: 'recover-migration', version: args[2]! };
+  }
+  if (
+    args.length === 8
+    && args[0] === 'repair-ownership'
+    && args[1] === '--source'
+    && Boolean(args[2]) && !args[2]!.startsWith('-')
+    && args[3] === '--path'
+    && args[4] !== undefined
+    && args[5] === '--keep'
+    && Boolean(args[6]) && !args[6]!.startsWith('-')
+    && args[7] === '--yes'
+  ) {
+    return {
+      kind: 'repair-ownership',
+      sourceId: args[2]!,
+      sourcePath: args[4]!,
+      keepSlug: args[6]!,
+    };
+  }
+  throw new Error(
+    'Invalid post-upgrade invocation. Run `gbrain post-upgrade --help`; ' +
+    'arbitrary migration and preflight arguments are not accepted.',
+  );
+}
+
+/** Read-only canonical+legacy authority view shared with doctor/health checks. */
+export function loadReconciledUpgradeState(
+  opts: { repairPermissions?: boolean } = {},
+): ReconciledUpgradeState {
+  return withOwnedStateReadPolicy(opts.repairPermissions === true, () => {
+    const state = loadUpgradeState();
+    if (state.kind === 'missing') return state;
+    if (state.kind === 'invalid' || state.kind === 'foreign') {
+      return { kind: 'invalid', message: state.message };
+    }
+    if (state.kind === 'complete') {
+      return {
+        kind: 'complete',
+        from: state.transition.from,
+        to: state.transition.to,
+        status: 'complete',
+        transitionId: state.transition.context.transitionId,
+        brainId: state.transition.context.brainId,
+        tsMs: state.transition.tsMs,
+      };
+    }
+    return {
+      kind: 'pending',
+      from: state.transition.from,
+      to: state.transition.to,
+      status: state.transition.status,
+      transitionId: state.transition.context?.transitionId ?? null,
+      brainId: state.transition.context?.brainId ?? null,
+      legacy: state.transition.legacy,
+      tsMs: state.transition.tsMs,
+    };
+  });
+}
+
+function isExplicitUpgradeGateCommand(command: string, args: readonly string[]): boolean {
+  if (command === 'doctor') {
+    // Full doctor goes through connectEngine(), whose compatibility probe may
+    // apply schema migrations. Only the filesystem-only diagnostic is safe
+    // outside the bound post-upgrade transition.
+    return args.includes('--fast')
+      && !args.includes('--fix')
+      && !args.includes('--remediate')
+      && !args.includes('--remediation-plan');
+  }
+  if (command === 'apply-migrations') {
+    return args.length === 1 && (args[0] === '--list' || args[0] === '--dry-run');
+  }
+  if (command === 'upgrade-preflight') {
+    return args.length === 0 || (args.length === 1 && args[0] === '--json');
+  }
+  if (command === 'post-upgrade') {
+    try {
+      parsePostUpgradeInvocation(args);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  return command === 'upgrade' || command === 'check-update';
+}
+
+export function isAutopilotDaemonStartInvocation(args: readonly string[]): boolean {
+  return !args.some(arg => [
+    '--install', '--uninstall', '--status', '--help', '-h',
+  ].includes(arg));
+}
+
+/**
+ * Global pre-dispatch fence: no ordinary CLI path may connect to a brain or
+ * perform file-plane work while the binary handoff is unresolved. Keep the
+ * allow-list deliberately small and explicit so new commands fail closed.
+ */
+export function assertUpgradeStateAllowsCliCommand(
+  command: string,
+  args: readonly string[],
+  state?: ReconciledUpgradeState,
+): void {
+  if (isExplicitUpgradeGateCommand(command, args)) return;
+  // Routine CLI dispatch may safely tighten current-owner state permissions.
+  // Doctor/list inspection calls loadReconciledUpgradeState() directly and
+  // retains the no-metadata-mutation default.
+  const reconciled = state ?? loadReconciledUpgradeState({ repairPermissions: true });
+  if (reconciled.kind === 'missing' || reconciled.kind === 'complete') return;
+  if (
+    command === 'autopilot'
+    && reconciled.kind === 'pending'
+    && (reconciled.status === 'deferred' || reconciled.status === 'running')
+    && isAutopilotDaemonStartInvocation(args)
+  ) return;
+
+  if (reconciled.kind === 'invalid') {
+    throw new Error(
+      'Upgrade authority is invalid or contradictory; normal commands are blocked before database connect. ' +
+      'Run `gbrain doctor --fast`, then recover the handoff with `gbrain post-upgrade`.',
+    );
+  }
+
+  const transition = reconciled.transitionId ?? '<legacy>';
+  throw new Error(
+    `Upgrade transition ${transition} is ${reconciled.status}; normal commands are blocked before database connect. ` +
+    'Run `gbrain post-upgrade`.',
+  );
+}
+
+function loadPendingUpgradeTransition(): PendingUpgradeTransition | null {
+  const loaded = loadUpgradeState();
+  if (loaded.kind === 'invalid') throw new Error(loaded.message);
+  if (loaded.kind === 'pending' || loaded.kind === 'legacy') return loaded.transition;
+  return null;
+}
+
+function assertNoUnresolvedUpgradeTransition(): void {
+  const loaded = loadUpgradeState();
+  if (loaded.kind === 'invalid') throw new Error(loaded.message);
+  if (loaded.kind === 'pending' || loaded.kind === 'legacy') {
+    throw new Error(
+      `Upgrade transition ${loaded.transition.context?.transitionId ?? '<legacy>'} is still ` +
+      `${loaded.transition.status}; complete or recover it before starting another upgrade.`,
+    );
+  }
+}
+
+async function bindPendingUpgradeTransition(
+  transition: PendingUpgradeTransition,
+  resolveBrainId: () => Promise<string | null>,
+  establishBrainId: () => Promise<string | null>,
+): Promise<PendingUpgradeTransition> {
+  // A bound handoff is a read-only authority check. Only an unbound legacy
+  // breadcrumb may establish identity while it is being deliberately adopted.
+  const currentBrainId = transition.legacy && !transition.context
+    ? await establishBrainId()
+    : await resolveBrainId();
+  if (transition.legacy) {
+    if (transition.context && currentBrainId !== transition.context.brainId) {
+      throw new Error(
+        `Legacy HOME upgrade is bound to ${transition.context.brainId ?? 'no local brain'}, ` +
+        `but the active configuration resolves to ${currentBrainId ?? 'no local brain'}.`,
+      );
+    }
+    const context: UpgradeTransitionContext = transition.context ?? {
+      transitionId: randomUUID(), brainId: currentBrainId,
+    };
+    // Publish the canonical, bound handoff before any post-upgrade side effect.
+    saveUpgradeState(transition.from, transition.to, transition.status, undefined, context);
+    return { ...transition, context, legacy: false };
+  }
+  if (!transition.context) {
+    throw new Error('Pending upgrade state is not bound to a database; no migration was started.');
+  }
+  if (currentBrainId !== transition.context.brainId) {
+    throw new Error(
+      `Pending upgrade is bound to ${transition.context.brainId ?? 'no local brain'}, ` +
+      `but the active configuration resolves to ${currentBrainId ?? 'no local brain'}. ` +
+      'No migration was started; restore the original brain configuration or re-run the upgrade deliberately.',
+    );
+  }
+  return transition;
+}
+
+function recordParentPostUpgradeFailureIfMissingLocked(
+  fromVersion: string,
+  toVersion: string,
+  error: string,
+  context?: UpgradeTransitionContext,
+): boolean {
+  const loaded = loadUpgradeState();
+  if (loaded.kind === 'invalid' || loaded.kind === 'foreign') {
+    throw new Error(loaded.message);
+  }
+  if (loaded.kind === 'complete') {
+    const exactCompletion = context !== undefined
+      && loaded.transition.from === fromVersion
+      && loaded.transition.to === toVersion
+      && loaded.transition.context.transitionId === context.transitionId
+      && loaded.transition.context.brainId === context.brainId;
+    if (exactCompletion) return false;
+    throw new Error(
+      'Refusing to downgrade completed upgrade evidence after a mismatched parent failure.',
+    );
+  }
+  if (loaded.kind === 'pending' || loaded.kind === 'legacy') {
+    const exactVersions = loaded.transition.from === fromVersion
+      && loaded.transition.to === toVersion;
+    const exactContext = context === undefined
+      ? true
+      : loaded.transition.context?.transitionId === context.transitionId
+        && loaded.transition.context?.brainId === context.brainId;
+    if (!exactVersions || !exactContext) {
+      throw new Error(
+        'Refusing to attach a parent failure to a different unresolved upgrade transition.',
+      );
+    }
+    if (loaded.transition.status === 'incomplete') return false;
+  }
+  recordUpgradeError({
+    phase: 'post-upgrade',
+    fromVersion,
+    toVersion,
+    error,
+    hint: 'Run: gbrain post-upgrade',
+  }, context);
+  saveUpgradeState(fromVersion, toVersion, 'incomplete', error, context);
+  return true;
+}
+
+/** Parent fallback when the child failed before its own durable transition ran. */
+export async function recordParentPostUpgradeFailureIfMissing(
+  fromVersion: string,
+  toVersion: string,
+  error: string,
+  context?: UpgradeTransitionContext,
+): Promise<boolean> {
+  return withUpgradeStateLock(() => recordParentPostUpgradeFailureIfMissingLocked(
+    fromVersion,
+    toVersion,
+    error,
+    context,
+  ));
+}
+
+async function assertUpgradeTransitionComplete(handoff: {
+  oldVersion: string;
+  newVersion: string;
+  transitionContext: UpgradeTransitionContext;
+}): Promise<void> {
+  await withUpgradeStateLock(() => {
+    const loaded = loadUpgradeState();
+    if (loaded.kind === 'invalid') throw new Error(loaded.message);
+    if (
+      loaded.kind !== 'complete' ||
+      loaded.transition.from !== handoff.oldVersion ||
+      loaded.transition.to !== handoff.newVersion ||
+      loaded.transition.context.transitionId !== handoff.transitionContext.transitionId ||
+      loaded.transition.context.brainId !== handoff.transitionContext.brainId
+    ) {
+      throw new Error(
+        `Post-upgrade child exited without completing transition ${handoff.transitionContext.transitionId}`,
+      );
+    }
+  });
+}
+
+async function runPostUpgradeStateTransitionLocked(
+  run: (transition: PendingUpgradeTransition | null) => Promise<void>,
+  resolveBrainId: () => Promise<string | null>,
+  establishBrainId: () => Promise<string | null>,
+): Promise<void> {
+  let transition = loadPendingUpgradeTransition();
+  try {
+    if (transition) {
+      transition = await bindPendingUpgradeTransition(
+        transition,
+        resolveBrainId,
+        establishBrainId,
+      );
+    }
+    await run(transition);
+    if (transition?.context) {
+      saveUpgradeState(transition.from, transition.to, 'complete', undefined, transition.context);
+    }
+  } catch (error) {
+    if (transition) {
+      const message = error instanceof Error ? error.message : String(error);
+      recordUpgradeError({
+        phase: 'post-upgrade',
+        fromVersion: transition.from,
+        toVersion: transition.to,
+        error: message,
+        hint: 'Run: gbrain post-upgrade',
+      }, transition.context ?? undefined);
+      if (transition.context) {
+        saveUpgradeState(transition.from, transition.to, 'incomplete', message, transition.context);
+      }
+    }
+    throw error;
+  }
+}
+
+/** Durable state boundary shared by upgrade-spawned and direct recovery runs. */
+export async function runPostUpgradeStateTransition(
+  run: (transition: PendingUpgradeTransition | null) => Promise<void>,
+  resolveBrainId: () => Promise<string | null> = resolveConfiguredUpgradeBrainId,
+  opts: { lockDir?: string; establishBrainId?: () => Promise<string | null> } = {},
+): Promise<void> {
+  const establishBrainId = opts.establishBrainId
+    ?? (resolveBrainId === resolveConfiguredUpgradeBrainId
+      ? establishConfiguredUpgradeBrainId
+      : resolveBrainId);
+  return withUpgradeStateLock(
+    () => runPostUpgradeStateTransitionLocked(run, resolveBrainId, establishBrainId),
+    opts.lockDir,
+  );
+}
+
+function printPostUpgradeHelp(): void {
+  console.log(`Usage: gbrain post-upgrade [recovery]
+
+Resume the exact pending upgrade transition and run its migration/schema gates.
+
+Recovery commands (available only inside an unresolved, bound transition):
+  gbrain post-upgrade recover-migration --force-retry <version>
+  gbrain post-upgrade repair-ownership --source <id> --path <path> --keep <slug> --yes
+
+Recovery performs only the named repair, then resumes the normal post-upgrade
+gate in the same invocation. Direct mutating apply-migrations and
+upgrade-preflight repair commands stay blocked while a handoff is unresolved.`);
+}
+
 export async function runPostUpgrade(args: string[] = []): Promise<void> {
-  if (args.includes('--help') || args.includes('-h')) {
-    console.log('Usage: gbrain post-upgrade');
-    console.log('Prints feature pitches for new migrations and runs apply-migrations.');
-    console.log('Idempotent — safe to re-run any time.');
+  const invocation = parsePostUpgradeInvocation(args);
+  if (invocation.kind === 'help') {
+    printPostUpgradeHelp();
+    return;
+  }
+  return runPostUpgradeStateTransition(async transition => {
+    const authority = toUpgradeChildTransition(transition);
+    if (invocation.kind !== 'resume') {
+      await runPostUpgradeRecoveryAction(invocation, authority);
+    }
+    await runPostUpgradeCore([], authority);
+  });
+}
+
+function toUpgradeChildTransition(
+  transition: PendingUpgradeTransition | null,
+): UpgradeChildTransition | undefined {
+  if (!transition) return undefined;
+  if (!transition.context) {
+    throw new Error('Pending upgrade state is not bound; no migration child was authorized.');
+  }
+  return {
+    transitionId: transition.context.transitionId,
+    brainId: transition.context.brainId,
+    fromVersion: transition.from,
+    toVersion: transition.to,
+  };
+}
+
+type PostUpgradeRecoveryInvocation = Extract<
+  PostUpgradeInvocation,
+  { kind: 'recover-migration' | 'repair-ownership' }
+>;
+
+function assertBoundPostUpgradeRecoveryAuthority(
+  transition: UpgradeChildTransition | undefined,
+): asserts transition is UpgradeChildTransition & { brainId: string } {
+  if (
+    !transition
+    || !UPGRADE_UUID_RE.test(transition.transitionId)
+    || typeof transition.brainId !== 'string'
+    || !UPGRADE_BRAIN_ID_RE.test(transition.brainId)
+    || transition.fromVersion.length === 0
+    || transition.fromVersion.length > 128
+    || transition.toVersion !== VERSION
+  ) {
+    throw new Error(
+      'Recovery requires one exact unresolved upgrade transition bound to this release and configured brain; no repair ran.',
+    );
+  }
+}
+
+/**
+ * Execute one narrowly named recovery action under the caller's canonical
+ * upgrade-state lock. The authority is rechecked here and again at the
+ * database mutation boundary; no arbitrary argv or generic bypass exists.
+ */
+export async function runPostUpgradeRecoveryAction(
+  invocation: PostUpgradeRecoveryInvocation,
+  transition: UpgradeChildTransition | undefined,
+): Promise<void> {
+  assertBoundPostUpgradeRecoveryAuthority(transition);
+
+  if (invocation.kind === 'recover-migration') {
+    const { runApplyMigrations } = await import('./apply-migrations.ts');
+    const result = await runApplyMigrations(
+      ['--force-retry', invocation.version],
+      {
+        expectedBrainId: transition.brainId,
+        upgradeTransition: transition,
+      },
+    );
+    if (result.exitCode !== 0 || result.reason !== 'force_retry_recorded') {
+      throw new Error(
+        `Bound migration recovery for ${invocation.version} was refused` +
+        `${result.message ? `: ${result.message}` : ''}`,
+      );
+    }
+    console.log(`Bound recovery accepted for migration ${invocation.version}; resuming post-upgrade.`);
     return;
   }
 
-  // v0.35.8.0: lay down ~/.gbrain/.gitignore retroactively. Existing users
-  // never re-run `gbrain init`, so init-only coverage misses them entirely
-  // (codex F-CDX-8). Idempotent + non-clobbering — safe to run every upgrade.
-  try {
-    const { ensureGitignore } = await import('../core/config.ts');
-    ensureGitignore();
-  } catch {
-    // Best-effort hygiene; never block upgrade.
+  const {
+    escapeTerminalText,
+    repairSourcePathOwnershipForUpgrade,
+  } = await import('./upgrade-preflight.ts');
+  const receipt = await repairSourcePathOwnershipForUpgrade(
+    {
+      sourceId: invocation.sourceId,
+      sourcePath: invocation.sourcePath,
+      keepSlug: invocation.keepSlug,
+    },
+    {
+      expectedBrainId: transition.brainId,
+      upgradeTransition: transition,
+    },
+  );
+  console.log(
+    `Bound ownership repair kept ` +
+    `[${escapeTerminalText(receipt.sourceId)}:${escapeTerminalText(receipt.keepSlug)}] and cleared ` +
+    `${receipt.cleared_slugs.length} competing claim(s); resuming post-upgrade.`,
+  );
+}
+
+/**
+ * Consume the swap-only handoff before autopilot opens its ordinary engine.
+ *
+ * The local O_EXCL lock makes concurrent relaunches single-flight. State moves
+ * deferred → running before side effects; a crash leaves running visible and a
+ * later boot can replay the idempotent post-upgrade path. Incomplete states are
+ * not retried in a boot loop—they remain fail-closed for explicit recovery.
+ */
+export async function resumeDeferredPostUpgradeAtBoot(opts: {
+  run?: (transition: PendingUpgradeTransition | null) => Promise<void>;
+  resolveBrainId?: () => Promise<string | null>;
+  establishBrainId?: () => Promise<string | null>;
+  lockDir?: string;
+} = {}): Promise<'none' | 'complete'> {
+  const initial = loadPendingUpgradeTransition();
+  if (!initial) return 'none';
+  if (initial.status === 'incomplete' || initial.status === 'post_upgrade_pending') {
+    throw new Error(
+      `Upgrade handoff is ${initial.status}; run \`gbrain post-upgrade\` before starting autopilot.`,
+    );
   }
 
-  // v0.42 self-upgrade setup: default existing installs to NOTIFY (a nudge, no
-  // autonomy), inform once, and rewrite an existing systemd unit to
-  // Restart=always so the silent channel's exit-for-relaunch respawns. All
-  // file-plane + mechanical + idempotent; never blocks the upgrade.
-  await applySelfUpgradeSetup();
+  return withUpgradeStateLock(
+    async () => {
+      const transition = loadPendingUpgradeTransition();
+      if (!transition) return 'none';
+      if (transition.status === 'incomplete' || transition.status === 'post_upgrade_pending') {
+        throw new Error(
+          `Upgrade handoff is ${transition.status}; run \`gbrain post-upgrade\` before starting autopilot.`,
+        );
+      }
+      const bound = await bindPendingUpgradeTransition(
+        transition,
+        opts.resolveBrainId ?? resolveConfiguredUpgradeBrainId,
+        opts.establishBrainId ?? (opts.resolveBrainId ?? establishConfiguredUpgradeBrainId),
+      );
+      saveUpgradeState(
+        bound.from,
+        bound.to,
+        'running',
+        undefined,
+        bound.context!,
+      );
+      await runPostUpgradeStateTransitionLocked(
+        opts.run ?? (current => runPostUpgradeCore([], toUpgradeChildTransition(current))),
+        opts.resolveBrainId ?? resolveConfiguredUpgradeBrainId,
+        opts.establishBrainId ?? (opts.resolveBrainId ?? establishConfiguredUpgradeBrainId),
+      );
+      return 'complete';
+    },
+    opts.lockDir ?? gbrainPath('locks'),
+  );
+}
+
+async function runPostUpgradeCore(
+  args: string[] = [],
+  upgradeTransition?: UpgradeChildTransition,
+): Promise<void> {
+  if (args.includes('--help') || args.includes('-h')) {
+    printPostUpgradeHelp();
+    return;
+  }
+
+  // The data-plane migration/preflight gate is the first side-effecting phase.
+  // File-plane setup (.gitignore, config defaults, systemd rewrites) cannot
+  // make a blocked upgrade look partially successful.
+  const expectedBrainId = upgradeTransition?.brainId;
+  try {
+    await runPostUpgradeSetupBoundary(
+      () => runPostUpgradeMigrationGate(undefined, expectedBrainId, upgradeTransition),
+      () => runPostUpgradeSchemaGate(expectedBrainId),
+      async () => {
+        // v0.35.8.0: lay down ~/.gbrain/.gitignore retroactively.
+        try {
+          const { ensureGitignore } = await import('../core/config.ts');
+          ensureGitignore();
+        } catch {
+          // Best-effort hygiene after the hard gate.
+        }
+        await applySelfUpgradeSetup();
+      },
+    );
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error(`\napply-migrations failed: ${msg}`);
+    console.error('Run `gbrain post-upgrade` to retry the full idempotent setup.');
+    console.error(
+      'For read-only diagnosis use `gbrain apply-migrations --list` or `--dry-run`; ' +
+      'mutation recovery must stay inside `gbrain post-upgrade`.',
+    );
+    throw e;
+  }
+
   // Cosmetic: print feature pitches for migrations newer than the prior binary.
   try {
-    const statePath = join(process.env.HOME || '', '.gbrain', 'upgrade-state.json');
+    const statePath = gbrainPath('upgrade-state.json');
     if (existsSync(statePath)) {
-      const state = JSON.parse(readFileSync(statePath, 'utf-8'));
+      const state = JSON.parse(readOwnedStateFile(statePath, MAX_UPGRADE_STATE_BYTES, gbrainPath()));
       const from = state?.last_upgrade?.from;
       if (from) {
         const { migrations } = await import('./migrations/index.ts');
@@ -381,40 +1727,32 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
     // Pitch printing is cosmetic — don't gate migrations on it.
   }
 
-  // Mechanical: run every outstanding migration. Idempotent; exits 0 quickly
-  // when nothing is pending. Stays inside the same process so a long Phase F
-  // (autopilot install) doesn't hit a subprocess boundary.
-  try {
-    const { runApplyMigrations } = await import('./apply-migrations.ts');
-    await runApplyMigrations(['--yes', '--non-interactive']);
-  } catch (e) {
-    // Surface the error but don't throw — post-upgrade is best-effort.
-    // Users can re-run `gbrain apply-migrations` manually if they want
-    // to retry.
-    const msg = e instanceof Error ? e.message : String(e);
-    console.error(`\napply-migrations failed: ${msg}`);
-    console.error('Run `gbrain apply-migrations --yes` manually to retry.');
-  }
-
-  // v0.28.5 (X1): explicitly apply pending schema migrations.
-  // apply-migrations runs orchestrator migrations and only WARNs about
-  // schema-version drift (apply-migrations.ts:296-302). Without this hook,
-  // `gbrain upgrade` leaves wedged brains wedged — the user has to read
-  // the WARN and run `gbrain init --migrate-only` themselves. We've shipped
-  // 11 wedge incidents asking users to read warnings; close the loop here.
-  // A1's hasPendingMigrations probe in connectEngine is belt-and-suspenders
-  // for any path that bypasses upgrade (autopilot, direct CLI on stale brain).
+  // Reconnect to the schema-verified brain for post-gate feature setup. The
+  // actual initSchema call already completed before file-plane setup above;
+  // do not run it twice or move DDL behind those host mutations again.
   try {
     const { loadConfig: lcSchema, toEngineConfig: toCfgSchema } = await import('../core/config.ts');
     const { createEngine } = await import('../core/engine-factory.ts');
     const cfgSchema = lcSchema();
+    if (expectedBrainId === null && cfgSchema) {
+      throw new Error('A local brain became configured during a binary-only upgrade handoff; schema setup was not started.');
+    }
+    if (typeof expectedBrainId === 'string' && !cfgSchema) {
+      throw new Error(`Configured brain disappeared before schema setup; expected ${expectedBrainId}.`);
+    }
     if (cfgSchema) {
       const engine = await createEngine(toCfgSchema(cfgSchema));
       try {
         await engine.connect(toCfgSchema(cfgSchema));
-        await engine.initSchema();
-        console.log('  Schema up to date.');
-
+        if (expectedBrainId !== undefined) {
+          const actualBrainId = await readDatabaseInstanceId(engine);
+          if (actualBrainId !== expectedBrainId) {
+            throw new Error(
+              `Configured brain ${actualBrainId} does not match pending upgrade brain ${expectedBrainId}; ` +
+              'schema setup was not started.',
+            );
+          }
+        }
         // v0.32.3 search-lite mode banner. One-shot: fires at most once per
         // install (state persisted via `search.mode_upgrade_notice_shown`).
         // Reframes from "behavior is regressing" to "named modes available"
@@ -537,12 +1875,15 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
       }
     }
   } catch (e) {
-    // Non-fatal: connection or DDL failure here falls back to the existing
-    // user-facing WARN. apply-migrations.ts:296-302 already surfaces the
-    // hint to run `gbrain init --migrate-only`.
+    // A schema error means the upgrade is incomplete. Stop before later
+    // feature setup and return non-zero through the CLI's single exit seam.
     const msg = e instanceof Error ? e.message : String(e);
-    console.warn(`\nSchema auto-apply skipped: ${msg}`);
-    console.warn('Run `gbrain init --migrate-only` manually if your brain is wedged.');
+    console.error(`\nSchema auto-apply failed: ${msg}`);
+    console.error(
+      'Fix the reported gate, then run `gbrain post-upgrade`; direct schema mutation stays blocked ' +
+      'while the upgrade handoff is unresolved.',
+    );
+    throw e;
   }
 
   // v0.25.1: agent-readable advisory listing recommended skills the
@@ -581,6 +1922,97 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
   } catch {
     // Fail-open per A18: never crash post-upgrade from the banner.
   }
+}
+
+/**
+ * Fail-closed library seam between post-upgrade and the orchestrator runner.
+ * `runApplyMigrations` deliberately returns an outcome rather than exiting the
+ * process: an empty/list/dry-run plan must not terminate the rest of
+ * post-upgrade. Conversely, partial, wedged, ambiguous, and failed outcomes
+ * must stop schema/feature setup from making the upgrade look green.
+ */
+async function runPostUpgradeSchemaGate(expectedBrainId?: string | null): Promise<void> {
+  const { loadConfig, toEngineConfig } = await import('../core/config.ts');
+  const { createEngine } = await import('../core/engine-factory.ts');
+  const config = loadConfig();
+  if (expectedBrainId === null && config) {
+    throw new Error('A local brain became configured during a binary-only upgrade handoff; schema setup was not started.');
+  }
+  if (typeof expectedBrainId === 'string' && !config) {
+    throw new Error(`Configured brain disappeared before schema setup; expected ${expectedBrainId}.`);
+  }
+  if (!config) return;
+
+  const engineConfig = toEngineConfig(config);
+  const engine = await createEngine(engineConfig);
+  try {
+    await engine.connect(engineConfig);
+    if (expectedBrainId !== undefined) {
+      const actualBrainId = await readDatabaseInstanceId(engine);
+      if (actualBrainId !== expectedBrainId) {
+        throw new Error(
+          `Configured brain ${actualBrainId} does not match pending upgrade brain ${expectedBrainId}; ` +
+          'schema setup was not started.',
+        );
+      }
+    } else {
+      await getOrCreateDatabaseInstanceId(engine);
+    }
+    await engine.initSchema();
+    console.log('  Schema up to date.');
+  } finally {
+    try { await engine.disconnect(); } catch { /* best-effort */ }
+  }
+}
+
+export async function runPostUpgradeSetupBoundary(
+  migrationGate: () => Promise<unknown>,
+  schemaGate: () => Promise<unknown>,
+  setup: () => Promise<void>,
+): Promise<void> {
+  await migrationGate();
+  await schemaGate();
+  await setup();
+}
+
+export async function runPostUpgradeMigrationGate(
+  runner?: (
+    args: string[],
+    authority: {
+      expectedBrainId?: string | null;
+      upgradeTransition?: UpgradeChildTransition;
+    },
+  ) => Promise<import('./apply-migrations.ts').ApplyMigrationsOutcome>,
+  expectedBrainId?: string | null,
+  upgradeTransition?: UpgradeChildTransition,
+): Promise<import('./apply-migrations.ts').ApplyMigrationsOutcome> {
+  const run = runner ?? (async (
+    args: string[],
+    authority: {
+      expectedBrainId?: string | null;
+      upgradeTransition?: UpgradeChildTransition;
+    },
+  ) => {
+    const { runApplyMigrations } = await import('./apply-migrations.ts');
+    return runApplyMigrations(args, authority);
+  });
+  const result = await run(
+    ['--yes', '--non-interactive'],
+    { expectedBrainId, upgradeTransition },
+  );
+  if (typeof expectedBrainId === 'string' && result.reason === 'no_config') {
+    throw new Error(`apply-migrations lost configured brain ${expectedBrainId} before execution`);
+  }
+  if (expectedBrainId === null && result.reason !== 'no_config') {
+    throw new Error('apply-migrations found a local brain during a binary-only upgrade handoff');
+  }
+  if (result.exitCode !== 0) {
+    const blocked = result.blockedVersions?.length
+      ? ` (blocked: ${result.blockedVersions.join(', ')})`
+      : '';
+    throw new Error(`apply-migrations ${result.reason}${blocked}${result.message ? `: ${result.message}` : ''}`);
+  }
+  return result;
 }
 
 /**
@@ -652,7 +2084,7 @@ export async function postUpgradeReferenceSweep(
 function isNewerThan(version: string, baseline: string): boolean {
   const v = version.split('.').map(Number);
   const b = baseline.split('.').map(Number);
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < Math.max(v.length, b.length); i++) {
     if ((v[i] || 0) > (b[i] || 0)) return true;
     if ((v[i] || 0) < (b[i] || 0)) return false;
   }

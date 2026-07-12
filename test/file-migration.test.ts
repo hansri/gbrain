@@ -102,7 +102,10 @@ describe('file migration lifecycle', () => {
     expect(existsSync(join(brainDir, 'raw/photo.jpg.redirect'))).toBe(true);
 
     // Resolver fetches from storage via redirect
-    const result = await resolveFile('raw/photo.jpg', brainDir, storage);
+    const result = await resolveFile(
+      'raw/photo.jpg', brainDir, storage, 'default',
+      { allowLegacyUnqualified: true },
+    );
     expect(result.source).toBe('redirect');
     expect(result.data.toString()).toBe('fake jpg data');
   });

@@ -20,17 +20,14 @@
  */
 
 import type { Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult } from './types.ts';
-import { appendCompletedMigration } from '../../core/preferences.ts';
-import { loadConfig, toEngineConfig } from '../../core/config.ts';
-import { createEngine } from '../../core/engine-factory.ts';
+import { runSnapshotMigrateOnly, withMigrationEngine } from './snapshot.ts';
 
 // ── Phase A — Schema ────────────────────────────────────────
 
 async function phaseASchema(opts: OrchestratorOpts): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) return { name: 'schema', status: 'skipped', detail: 'dry-run' };
   try {
-    const { runMigrateOnlyCore } = await import('./in-process.ts');
-    await runMigrateOnlyCore();
+    await runSnapshotMigrateOnly(opts);
     return { name: 'schema', status: 'complete' };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -43,12 +40,7 @@ async function phaseASchema(opts: OrchestratorOpts): Promise<OrchestratorPhaseRe
 async function phaseBBackfillStorage(opts: OrchestratorOpts): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) return { name: 'backfill_storage', status: 'skipped', detail: 'dry-run' };
   try {
-    const config = loadConfig();
-    if (!config) return { name: 'backfill_storage', status: 'skipped', detail: 'no brain configured' };
-
-    const engine = await createEngine(toEngineConfig(config));
-    await engine.connect(toEngineConfig(config));
-    try {
+    return await withMigrationEngine(opts, async engine => {
       if (engine.kind === 'pglite') {
         return { name: 'backfill_storage', status: 'skipped', detail: 'pglite (no files table)' };
       }
@@ -68,7 +60,7 @@ async function phaseBBackfillStorage(opts: OrchestratorOpts): Promise<Orchestrat
       // Ledger exists. If storage isn't configured, run the dry-run
       // path — we can still report the ledger state but we can't
       // COPY objects. Operator then wires storage and re-runs.
-      const storage = config.storage ? await loadStorageBackend(config.storage) : null;
+      const storage = opts.gbrainConfig.storage ? await loadStorageBackend(opts.gbrainConfig.storage) : null;
 
       const { runStorageBackfill } = await import('./v0_18_0-storage-backfill.ts');
       const report = await runStorageBackfill(engine, storage, { dryRun: !storage });
@@ -95,9 +87,7 @@ async function phaseBBackfillStorage(opts: OrchestratorOpts): Promise<Orchestrat
 
       const detail = `${report.total} files: ${report.alreadyComplete} already complete, ${report.nowComplete} newly migrated`;
       return { name: 'backfill_storage', status: 'complete', detail };
-    } finally {
-      try { await engine.disconnect(); } catch {}
-    }
+    });
   } catch (e) {
     return {
       name: 'backfill_storage',
@@ -122,12 +112,7 @@ async function loadStorageBackend(storageConfig: unknown): Promise<import('../..
 async function phaseCVerify(opts: OrchestratorOpts): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) return { name: 'verify', status: 'skipped', detail: 'dry-run' };
   try {
-    const config = loadConfig();
-    if (!config) return { name: 'verify', status: 'skipped', detail: 'no brain configured' };
-
-    const engine = await createEngine(toEngineConfig(config));
-    await engine.connect(toEngineConfig(config));
-    try {
+    return await withMigrationEngine(opts, async engine => {
       // 1. sources('default') exists (Step 1 / v16).
       const defaults = await engine.executeRaw<{ id: string }>(
         `SELECT id FROM sources WHERE id = 'default'`,
@@ -156,9 +141,7 @@ async function phaseCVerify(opts: OrchestratorOpts): Promise<OrchestratorPhaseRe
       }
 
       return { name: 'verify', status: 'complete', detail: 'sources primitive installed' };
-    } finally {
-      try { await engine.disconnect(); } catch {}
-    }
+    });
   } catch (e) {
     return { name: 'verify', status: 'failed', detail: e instanceof Error ? e.message : String(e) };
   }
@@ -198,18 +181,6 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
 }
 
 function finalize(phases: OrchestratorPhaseResult[], status: 'complete' | 'partial' | 'failed'): OrchestratorResult {
-  if (status !== 'failed') {
-    try {
-      appendCompletedMigration({
-        version: '0.18.0',
-        completed_at: new Date().toISOString(),
-        status: status as 'complete' | 'partial',
-        phases: phases.map(p => ({ name: p.name, status: p.status })),
-      });
-    } catch {
-      // Best-effort.
-    }
-  }
   return { version: '0.18.0', status, phases };
 }
 

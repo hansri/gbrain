@@ -1,5 +1,11 @@
 import type { BrainEngine } from './engine.ts';
 import { slugifyPath } from './sync.ts';
+import {
+  assertCriticalOwnershipIndexes,
+  assertCriticalOwnershipIndexesForVersion,
+  verifyFileStorageIndex,
+  verifySourcePathOwnerIndex,
+} from './source-path-owner-index.ts';
 
 /**
  * Schema migrations — run automatically on initSchema().
@@ -14,7 +20,7 @@ import { slugifyPath } from './sync.ts';
  * (e.g., data transformations that need TypeScript, not just SQL).
  */
 
-interface Migration {
+export interface Migration {
   version: number;
   name: string;
   /** Engine-agnostic SQL. Used when `sqlFor` is absent. Set to '' for handler-only or sqlFor-only migrations. */
@@ -38,7 +44,8 @@ interface Migration {
    * EXISTS / ALTER ... IF NOT EXISTS / INSERT ... ON CONFLICT, so re-running
    * is safe). Explicit `idempotent: false` blocks the verify-hook
    * self-healing path from re-running a destructive migration; the runner
-   * surfaces `MigrationDriftError` and requires `--skip-verify` to force.
+   * surfaces `MigrationDriftError`; operators must run upgrade-preflight and
+   * repair the failed invariant before retrying.
    *
    * NEW migrations should declare this explicitly; the CONTRIBUTING
    * migration template lists it as required for clarity.
@@ -69,9 +76,43 @@ export function isMigrationIdempotent(m: Migration): boolean {
 }
 
 /**
+ * Enforce a migration verify hook, allowing exactly one idempotent repair
+ * attempt. The second verify is mandatory: advancing the version after a
+ * persistently false post-condition turns a known schema drift into a false
+ * green receipt.
+ */
+export async function verifyMigrationPostcondition(
+  engine: BrainEngine,
+  migration: Migration,
+  rerun: () => Promise<void>,
+): Promise<void> {
+  if (!migration.verify) return;
+  const firstOk = await migration.verify(engine).catch(() => false);
+  if (firstOk) return;
+  if (!isMigrationIdempotent(migration)) {
+    throw new MigrationDriftError(
+      migration.version,
+      migration.name,
+      'Schema does not match the expected post-condition.',
+    );
+  }
+
+  console.warn(`  [${migration.version}] ⚠️  verify failed; re-running idempotent migration once`);
+  await rerun();
+  const retryOk = await migration.verify(engine).catch(() => false);
+  if (!retryOk) {
+    throw new MigrationDriftError(
+      migration.version,
+      migration.name,
+      'Schema still does not match the expected post-condition after one idempotent retry; version was not advanced.',
+    );
+  }
+}
+
+/**
  * Migration drift error — verify hook failed and migration is non-idempotent.
- * Caller surfaces the column/table names that diverged and requires
- * `--skip-verify` to force re-run.
+ * Caller surfaces the column/table names that diverged. There is deliberately
+ * no verify-bypass flag: repair the invariant before retrying.
  */
 export class MigrationDriftError extends Error {
   constructor(
@@ -5511,14 +5552,52 @@ export const MIGRATIONS: Migration[] = [
     // File paths are source-local, just like page slugs. The legacy global
     // UNIQUE(storage_path) made an image imported into source B overwrite the
     // metadata row owned by source A when both repos used the same relative
-    // path. Replace it with the composite identity used by BrainEngine's file
-    // API. The unique index is idempotent and works on Postgres + PGLite.
+    // path. Add the composite identity used by BrainEngine's file API alongside
+    // the legacy key during the rollback canary. The unique index is idempotent
+    // and works on Postgres + PGLite.
+    //
+    // Rollback compatibility: keep the legacy UNIQUE(storage_path) constraint
+    // throughout this release/canary. The new binary uses the composite key,
+    // while the immediately previous binary can still execute its historical
+    // ON CONFLICT(storage_path) writer after a code rollback. Removing the
+    // global constraint is a separately staged, post-canary migration.
     idempotent: true,
     sql: `
-      ALTER TABLE files DROP CONSTRAINT IF EXISTS files_storage_path_key;
       CREATE UNIQUE INDEX IF NOT EXISTS idx_files_source_storage_path
         ON files(source_id, storage_path);
+
+      DO $$
+      DECLARE file_index RECORD;
+      BEGIN
+        SELECT i.indisunique, i.indisvalid, i.indisready, i.indimmediate,
+               pg_get_indexdef(i.indexrelid) AS definition,
+               pg_get_expr(i.indpred, i.indrelid) AS predicate
+          INTO file_index
+          FROM pg_index i
+          JOIN pg_class idx ON idx.oid = i.indexrelid
+          JOIN pg_class tbl ON tbl.oid = i.indrelid
+          JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+         WHERE idx.relname = 'idx_files_source_storage_path'
+           AND tbl.relname = 'files'
+           AND ns.nspname = 'public';
+
+        IF NOT FOUND
+           OR NOT file_index.indisunique
+           OR NOT file_index.indisvalid
+           OR NOT file_index.indisready
+           OR NOT file_index.indimmediate
+           OR regexp_replace(lower(file_index.definition), '[[:space:]\"]', '', 'g')
+                NOT LIKE '%(source_id,storage_path)%'
+           OR file_index.predicate IS NOT NULL
+        THEN
+          RAISE EXCEPTION USING
+            ERRCODE = '42P07',
+            MESSAGE = 'idx_files_source_storage_path exists with a non-canonical definition',
+            HINT = 'Stop writers, inspect and drop only the wrong same-name index, then rerun migrations.';
+        END IF;
+      END $$;
     `,
+    verify: verifyFileStorageIndex,
   },
   {
     version: 124,
@@ -5561,7 +5640,41 @@ export const MIGRATIONS: Migration[] = [
       CREATE UNIQUE INDEX IF NOT EXISTS pages_source_path_owner_uniq
         ON pages(source_id, source_path)
         WHERE source_path IS NOT NULL;
+
+      DO $$
+      DECLARE owner_index RECORD;
+      BEGIN
+        SELECT i.indisunique, i.indisvalid, i.indisready, i.indimmediate,
+               pg_get_indexdef(i.indexrelid) AS definition,
+               pg_get_expr(i.indpred, i.indrelid) AS predicate
+          INTO owner_index
+          FROM pg_index i
+          JOIN pg_class idx ON idx.oid = i.indexrelid
+          JOIN pg_class tbl ON tbl.oid = i.indrelid
+          JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+         WHERE idx.relname = 'pages_source_path_owner_uniq'
+           AND tbl.relname = 'pages'
+           AND ns.nspname = 'public';
+
+        IF NOT FOUND
+           OR NOT owner_index.indisunique
+           OR NOT owner_index.indisvalid
+           OR NOT owner_index.indisready
+           OR NOT owner_index.indimmediate
+           OR regexp_replace(lower(owner_index.definition), '[[:space:]\"]', '', 'g')
+                NOT LIKE '%(source_id,source_path)%'
+           OR regexp_replace(lower(COALESCE(owner_index.predicate, '')), '[()[:space:]\"]', '', 'g')
+                <> 'source_pathisnotnull'
+        THEN
+          RAISE EXCEPTION USING
+            ERRCODE = '42P07',
+            MESSAGE = 'pages_source_path_owner_uniq exists with a non-canonical definition',
+            HINT = 'Stop writers, inspect the existing index, drop only the wrong same-name index, then rerun gbrain upgrade-preflight and migrations.';
+        END IF;
+      END $$;
+
     `,
+    verify: verifySourcePathOwnerIndex,
   },
   {
     version: 125,
@@ -5752,6 +5865,11 @@ async function runMigrationSQL(
     // SET LOCAL scopes the timeout to this transaction only.
     await engine.transaction(async (tx) => {
       if (engine.kind === 'postgres') {
+        // GBrain's one supported Postgres schema authority is public. Pin the
+        // exact transaction before any migration SQL so a role/search_path
+        // change between preflight and execution cannot redirect unqualified
+        // historical DDL into a shadow schema.
+        await tx.runMigration(m.version, 'SET LOCAL search_path = public');
         try {
           await tx.runMigration(m.version, "SET LOCAL statement_timeout = '600000'");
         } catch {
@@ -5776,6 +5894,9 @@ async function runMigrationSQL(
     // The reserved-connection primitive is new in PR #356. See
     // BrainEngine.withReservedConnection.
     await engine.withReservedConnection(async (conn) => {
+      // Session pin is safe because the backend is reserved for this callback
+      // and returned only after the non-transactional DDL completes.
+      await conn.executeRaw('SET search_path = public');
       try {
         await conn.executeRaw("SET statement_timeout = '600000'");
       } catch {
@@ -5950,6 +6071,13 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
 
   const pending = sorted.filter(m => m.version > current);
 
+  // A version counter only proves that the ownership migrations once ran.
+  // Re-verify their exact post-conditions on every init/force-schema pass so
+  // a later DROP INDEX or weaker same-name replacement cannot remain green.
+  // v123 requires the file index; v124 adds the page index. A database that
+  // stopped cleanly between them must still be able to run its pending v124.
+  await assertCriticalOwnershipIndexesForVersion(engine, current);
+
   // #2038: schema-drift self-heal. A migration renumbered during a master
   // merge (v102 timeline dedup, originally v99) can be recorded-as-applied
   // without its DDL ever running — the version counter can't see it. Repair
@@ -6033,31 +6161,23 @@ export async function runMigrations(engine: BrainEngine): Promise<{ applied: num
     // v0.30.1 (D6): post-condition probe. If a verify hook is declared, run
     // it before bumping config.version. When verify returns false, check
     // idempotent — if true, log + retry the same migration once; if false,
-    // throw MigrationDriftError so operator runs --skip-verify deliberately.
-    if (m.verify) {
-      const verifyOk = await m.verify(engine).catch(() => false);
-      if (!verifyOk) {
-        const idempotent = isMigrationIdempotent(m);
-        if (idempotent) {
-          console.warn(`  [${m.version}] ⚠️  verify failed; re-running idempotent migration once`);
-          if (sql) await runMigrationSQLWithRetry(engine, m, sql);
-          if (m.handler) await m.handler(engine);
-          // Best-effort: don't double-throw if second run still fails verify.
-          // Operator's next run of doctor will re-detect drift.
-        } else {
-          throw new MigrationDriftError(
-            m.version,
-            m.name,
-            `Schema does not match expected post-condition. Run with --skip-verify to force.`,
-          );
-        }
-      }
-    }
+    // throw MigrationDriftError so the operator repairs the preflight
+    // invariant before retrying; advancing a known-bad schema is forbidden.
+    await verifyMigrationPostcondition(engine, m, async () => {
+      if (sql) await runMigrationSQLWithRetry(engine, m, sql);
+      if (m.handler) await m.handler(engine);
+    });
 
     // Update version after both SQL and handler succeed
     await engine.setConfig('version', String(m.version));
     process.stderr.write(`  [${m.version}] ✓ ${m.name}\n`);
     applied++;
+  }
+
+  // Fresh/pre-v123 brains reach the invariant only after the chain creates it.
+  // Keep this before the success return and after every version bump.
+  if (LATEST_VERSION >= 123) {
+    await assertCriticalOwnershipIndexes(engine);
   }
 
   return { applied, current: LATEST_VERSION };

@@ -25,6 +25,7 @@ function snap(over: Partial<LockSnapshot>): LockSnapshot {
     id: 'gbrain-supervisor:default',
     holder_pid: 4242,
     holder_host: 'box',
+    holder_token: 'fixture-token',
     acquired_at: new Date(),
     ttl_expires_at: new Date(),
     age_ms: 1000,

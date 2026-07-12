@@ -19,13 +19,22 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-OUT_BIN="$(mktemp /tmp/gbrain-wasm-check.XXXXXX)"
-trap 'rm -f "$OUT_BIN"' EXIT
+# Keep Bun's build working directory and final binary on the same filesystem.
+# Docker Desktop exposes the repository through a bind mount; when Bun builds
+# from /app but writes to /tmp, its atomic rename crosses that boundary and
+# fails. Building from the /tmp workspace while using an absolute entrypoint
+# keeps the rename local without copying the repository or its dependencies.
+OUT_DIR="$(mktemp -d /tmp/gbrain-wasm-check.XXXXXX)"
+OUT_BIN="$OUT_DIR/gbrain-wasm-check"
+trap 'rm -rf "$OUT_DIR"' EXIT
 
 # Build a minimal smoketest binary that imports the chunker. We compile this
 # instead of the full gbrain CLI so the failure mode is laser-focused on
 # chunker + WASM path resolution, not unrelated CLI wiring.
-bun build --compile --outfile "$OUT_BIN" scripts/chunker-smoketest.ts >/dev/null 2>&1
+(
+  cd "$OUT_DIR"
+  bun build --compile --outfile "$OUT_BIN" "$REPO_ROOT/scripts/chunker-smoketest.ts" >/dev/null
+)
 
 # Run it and capture JSON output.
 OUTPUT="$("$OUT_BIN" 2>&1)"

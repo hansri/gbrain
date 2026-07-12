@@ -47,6 +47,7 @@ describe('runBinarySelfUpdate', () => {
       const target = join(dir, 'gbrain');
       writeFileSync(target, 'OLD BINARY');
       const res = await runBinarySelfUpdate(target, {
+        expectedVersion: '9.9.9',
         platform: 'darwin',
         arch: 'arm64',
         fetchRelease: async () => ({ tag: 'v9.9.9', assets: ASSETS }),
@@ -56,6 +57,24 @@ describe('runBinarySelfUpdate', () => {
       expect(res.ok).toBe(true);
       expect(res.asset).toBe('gbrain-darwin-arm64');
       expect(readFileSync(target, 'utf8')).toBe('NEW BINARY');
+    });
+  });
+
+  test('release tag mismatch fails before download and leaves target untouched', async () => {
+    await withTmp(async (dir) => {
+      const target = join(dir, 'gbrain');
+      writeFileSync(target, 'OLD');
+      let downloaded = false;
+      const res = await runBinarySelfUpdate(target, {
+        expectedVersion: '9.9.9',
+        platform: 'darwin',
+        arch: 'arm64',
+        fetchRelease: async () => ({ tag: 'v9.9.10', assets: ASSETS }),
+        download: async () => { downloaded = true; },
+      });
+      expect(res).toMatchObject({ ok: false, reason: 'version_mismatch' });
+      expect(downloaded).toBe(false);
+      expect(readFileSync(target, 'utf8')).toBe('OLD');
     });
   });
 

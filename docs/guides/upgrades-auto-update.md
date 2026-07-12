@@ -11,10 +11,10 @@ version with stale skills and missing features. Or worse, someone runs
 `gbrain upgrade` but skips the post-upgrade steps, leaving new code with old
 agent behavior.
 
-With this: the agent checks for updates daily, sells the upgrade with punchy
-benefit-focused bullets, waits for explicit permission, then runs the full
-upgrade flow including re-reading skills, running migrations, and syncing
-schema. The user gets new capabilities automatically.
+With this: the agent checks for updates daily, explains the useful changes,
+waits for explicit permission, then follows the release's verified upgrade
+boundary. Inline-safe releases use the normal flow. Supervised releases pause
+at one clear operator action before any binary or database change.
 
 ## Self-upgrade modes (v0.42)
 
@@ -22,17 +22,18 @@ gbrain now stays current the way gstack does: it rides invocation frequency. A
 throttled, cache-read-only check runs at the start of every `gbrain` invocation
 (CLI and MCP) and emits an `UPGRADE_AVAILABLE <old> <new>` marker on stderr. No
 host cron required — every agent kind (Claude Code, Codex, OpenClaw, Hermes, the
-`gbrain serve` host behind a Perplexity thin client) converges to current by
-construction. The behavior is governed by one file-plane config key,
+`gbrain serve` host behind a Perplexity thin client) discovers version drift
+without another scheduler. Whether it may apply that release is a separate,
+fail-closed decision. The behavior is governed by one file-plane config key,
 `self_upgrade.mode`:
 
 | Mode | Behavior | Who it's for |
 |------|----------|--------------|
 | `notify` (default) | Emit the marker + a 4-option prompt; never apply without confirmation. | Interactive installs / anyone with a human in the loop. |
-| `auto` (opt-in) | Apply silently, but ONLY during quiet hours, ONLY when the brain is idle, doctor-gated, and never re-trying a known-bad version. | Headless / always-on installs (autopilot daemon, the `gbrain serve` host). |
+| `auto` (opt-in) | Apply a locally approved inline-safe target silently, but ONLY during quiet hours, ONLY when the brain is idle, doctor-gated, and never re-trying a known-bad version. Supervised or unknown future targets pause. | Headless / always-on installs (autopilot daemon, the `gbrain serve` host). |
 | `off` | Never check. | Air-gapped / pinned installs. |
 
-Enable hands-off upgrades on an always-on install with one line:
+Enable bounded auto-upgrades on an always-on install with one line:
 
 ```bash
 gbrain config set self_upgrade.mode auto
@@ -41,8 +42,27 @@ gbrain config set self_upgrade.mode auto
 `auto` is deliberately NOT a default anywhere — it's an explicit autonomy grant,
 because applying code from GitHub unattended is, by design, remote code
 execution. The trust model is TLS + GitHub (same as `gbrain upgrade`);
-signature verification is a tracked follow-up. Apply manually any time with
-`gbrain self-upgrade`.
+signature verification is a tracked follow-up. A manual request still follows
+the target release's migration boundary.
+
+New binaries carry a machine-readable local policy because a running process
+cannot safely discover or trust migration prose that ships only inside a new
+release. Binaries containing that policy block silent/inline promotion at
+v0.42.59.0 and fail closed for every unknown future target unless they
+explicitly allowlist it as inline-safe.
+
+For an inline-safe release, every entry point first resolves one exact version,
+checks it against that local policy, passes the same version through the
+package/tag/asset swap, and verifies the replacement reports exactly that
+version. Direct `bun update`, `clawhub update`, moving-branch checkouts, and
+unverified downloads are not supported upgrade paths because they can change
+the target after approval.
+
+That local policy is not retroactive: v0.42.58-era binaries do not contain it.
+The release workflow therefore publishes v0.42.59.0 and unknown later targets
+as prereleases with `make_latest=false`. They must stay out of GitHub's normal
+`latest` channel until a safe compatibility bridge is deliberately shipped.
+This intentionally trades hands-off availability for recoverability.
 
 ## Implementation
 
@@ -96,39 +116,53 @@ what they can DO now that they couldn't before, not what files changed.
 
 **In `notify` mode (the default), never auto-upgrade — always wait for explicit
 confirmation.** The `auto` mode (opt-in, see "Self-upgrade modes" above) is the
-only path that applies without a prompt, and only under its conservative gates
-(quiet hours + idle + doctor-gate). This per-cron-prompt flow is the `notify`
-experience.
+only path that can apply without a prompt, and only for a locally approved
+inline-safe target under its conservative gates (quiet hours + idle +
+doctor-gate). This per-cron-prompt flow is the `notify` experience.
 
 ### The Full Upgrade Flow (after user says yes)
 
 ```
 full_upgrade():
-  // Step 1: Update the binary/package
-  run("gbrain upgrade")
+  // Step 1: Resolve the exact version range and read migration guides FIRST
+  migrations = read_local_verified_migration_guides(old_version, new_version)
 
-  // Step 2: Re-read all updated skills
+  // Step 2: Respect release-specific cutover boundaries
+  if migrations.require_supervised_staged_release:
+    stop_services_and_writers()
+    backup_database_and_canonical_plus_legacy_state_together()
+    staged = operator_verified_immutable_new_binary()
+    run(staged, "upgrade-preflight --json")
+    repair_only_with_explicit_operator_choice()
+    run(staged, "apply-migrations --yes --non-interactive")
+    run(staged, "doctor")
+    promote_and_restart_only_when_green()
+  else:
+    target = resolve_exact_latest_release_before_mutation()
+    run("gbrain upgrade", "--target", target)
+
+  // Step 3: Re-read all updated skills
   for skill in find("skills/*/SKILL.md"):
     read_and_internalize(skill)  // updated skills = better agent behavior
 
-  // Step 3: Re-read production reference docs
+  // Step 4: Re-read production reference docs
   read("docs/GBRAIN_SKILLPACK.md")
   read("docs/GBRAIN_RECOMMENDED_SCHEMA.md")
 
-  // Step 4: Check for version-specific migration directives
+  // Step 5: Execute remaining non-schema migration directives
   for version in range(old_version, new_version):
     migration = find(f"skills/migrations/v{version}.md")
     if migration exists:
       read_and_execute(migration)  // in order, don't skip
 
-  // Step 5: Schema sync — suggest new, respect declined
+  // Step 6: Schema sync — suggest new, respect declined
   state = read("~/.gbrain/update-state.json")
   for recommendation in new_schema_recommendations:
     if recommendation not in state.declined:
       suggest_to_user(recommendation)
   update(state, new_choices)
 
-  // Step 6: Report what changed
+  // Step 7: Report what changed
   summarize_to_user(actions_taken)
 ```
 
@@ -182,6 +216,11 @@ copy. Set up a weekly cron to check automatically.
    only during quiet hours, only when idle, doctor-gated, never retrying a
    known-bad version. Don't enable `auto` on an interactive workstation; the
    prompt-first `notify` flow is the right default there.
+
+   The running binary's local release policy blocks supervised and unknown
+   future targets before the inline updater runs. Stop at one operator
+   intervention; do not silently replace a matched database/state backup or
+   new-binary preflight with an inline update.
 
 2. **Migration files are agent instructions, not scripts.** They tell the agent
    what to do step by step in plain language. They are NOT bash scripts to

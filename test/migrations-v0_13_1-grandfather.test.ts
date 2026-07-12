@@ -13,6 +13,7 @@ import { resetPgliteState } from './helpers/reset-pglite.ts';
 import { withEnv } from './helpers/with-env.ts';
 import { phaseCGrandfather } from '../src/commands/migrations/v0_13_1.ts';
 import type { OrchestratorOpts } from '../src/commands/migrations/types.ts';
+import { migrationTestOpts } from './helpers/migration-opts.ts';
 
 let engine: PGLiteEngine;
 
@@ -46,7 +47,7 @@ const fmOf = async (slug: string, sourceId = 'default') => {
 // Run the phase with an isolated GBRAIN_HOME so the rollback log lands in a
 // tempdir (withEnv keeps R1 test-isolation compliance — no raw process.env writes).
 async function gf(home: string, opts: Partial<OrchestratorOpts> = {}) {
-  const full: OrchestratorOpts = { yes: true, dryRun: false, noAutopilotInstall: true, ...opts };
+  const full: OrchestratorOpts = migrationTestOpts(opts);
   return withEnv({ GBRAIN_HOME: home }, () => phaseCGrandfather(engine, full));
 }
 

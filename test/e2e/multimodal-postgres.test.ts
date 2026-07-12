@@ -15,10 +15,12 @@
 
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
+import type { FileSpec } from '../../src/core/engine.ts';
 import { importFromContent, importImageBuffer } from '../../src/core/import-file.ts';
 import { MIGRATIONS } from '../../src/core/migrate.ts';
+import { getPostgresTestUrl } from '../helpers/postgres-test-authority.ts';
 
-const DATABASE_URL = process.env.DATABASE_URL;
+const DATABASE_URL = getPostgresTestUrl();
 const skip = !DATABASE_URL;
 
 if (skip) {
@@ -159,37 +161,73 @@ describe.skipIf(skip)('multimodal v0.27.1 against real Postgres', () => {
     expect(r2.created).toBe(false);
   }, 30_000);
 
-  test('migration v123 replaces legacy global file-path uniqueness', async () => {
+  test('upsertFile preserves the legacy implicit-default contract on Postgres', async () => {
+    // Runtime compatibility for an older untyped client; current TypeScript
+    // callers are required to bind source_id explicitly.
+    const r = await pg.upsertFile({
+      filename: 'legacy-default.jpg',
+      storage_path: 'legacy/default.jpg',
+      content_hash: 'sha256:legacy-default',
+    } as unknown as FileSpec);
+    expect(r.created).toBe(true);
+    expect((await pg.getFile('default', 'legacy/default.jpg'))?.source_id).toBe('default');
+  }, 30_000);
+
+  test('migration v123 adds composite identity while preserving previous-binary rollback', async () => {
     const migration = MIGRATIONS.find(entry => entry.version === 123);
     expect(migration?.name).toBe('files_source_storage_path_identity');
 
     // Recreate the canonical pre-v123 shape, then prove the migration can be
-    // replayed safely and admits the same relative path in two sources.
+    // replayed safely without removing the legacy conflict target.
     await pg.executeRaw('DROP INDEX IF EXISTS idx_files_source_storage_path');
     await pg.executeRaw('ALTER TABLE files DROP CONSTRAINT IF EXISTS files_storage_path_key');
     await pg.executeRaw('ALTER TABLE files ADD CONSTRAINT files_storage_path_key UNIQUE(storage_path)');
     await pg.runMigration(123, migration!.sql);
     await pg.runMigration(123, migration!.sql);
 
+    expect(await pg.executeRaw(
+      `SELECT 1 FROM pg_constraint WHERE conname = 'files_storage_path_key'`,
+    )).toHaveLength(1);
+    expect(await pg.executeRaw(
+      `SELECT 1 FROM pg_indexes WHERE indexname = 'idx_files_source_storage_path'`,
+    )).toHaveLength(1);
+
+    // Exact SQL shape used by the immediately previous binary.
     await pg.executeRaw(
-      `INSERT INTO sources (id, name, config)
-       VALUES ('source-a', 'source-a', '{}'::jsonb),
-              ('source-b', 'source-b', '{}'::jsonb)
-       ON CONFLICT (id) DO NOTHING`,
+      `INSERT INTO files (source_id, filename, storage_path, content_hash, metadata)
+       VALUES ('default', 'same.png', 'photos/same.png', 'a', '{}'::jsonb)
+       ON CONFLICT (storage_path) DO UPDATE SET content_hash = EXCLUDED.content_hash`,
     );
-    await pg.upsertFile({
-      source_id: 'source-a', filename: 'same.png',
-      storage_path: 'photos/same.png', content_hash: 'a',
-    });
-    await pg.upsertFile({
-      source_id: 'source-b', filename: 'same.png',
-      storage_path: 'photos/same.png', content_hash: 'b',
-    });
-    const rows = await pg.executeRaw<{ source_id: string }>(
-      `SELECT source_id FROM files WHERE storage_path = $1 ORDER BY source_id`,
-      ['photos/same.png'],
+    await pg.executeRaw(
+      `INSERT INTO files (source_id, filename, storage_path, content_hash, metadata)
+       VALUES ('default', 'same.png', 'photos/same.png', 'b', '{}'::jsonb)
+       ON CONFLICT (storage_path) DO UPDATE SET content_hash = EXCLUDED.content_hash`,
     );
-    expect(rows.map(row => row.source_id)).toEqual(['source-a', 'source-b']);
+    expect((await pg.getFile('default', 'photos/same.png'))?.content_hash).toBe('b');
+  }, 30_000);
+
+  test('migration v123 rejects a non-canonical same-name file index', async () => {
+    const migration = MIGRATIONS.find(entry => entry.version === 123)!;
+    await pg.executeRaw('DROP INDEX IF EXISTS idx_files_source_storage_path');
+    try {
+      await pg.executeRaw(
+        `CREATE UNIQUE INDEX idx_files_source_storage_path
+           ON files(storage_path, source_id)`,
+      );
+
+      await expect(pg.runMigration(123, migration.sql!))
+        .rejects.toThrow('non-canonical definition');
+
+      expect(await pg.executeRaw(
+        `SELECT 1 FROM pg_constraint WHERE conname = 'files_storage_path_key'`,
+      )).toHaveLength(1);
+      expect(await pg.executeRaw(
+        `SELECT 1 FROM pg_indexes WHERE indexname = 'idx_files_source_storage_path'`,
+      )).toHaveLength(1);
+    } finally {
+      await pg.executeRaw('DROP INDEX IF EXISTS idx_files_source_storage_path');
+      await pg.runMigration(123, migration.sql!);
+    }
   }, 30_000);
 
   test('migration v124 rejects duplicate source_path owners before creating its index', async () => {
@@ -210,6 +248,38 @@ describe.skipIf(skip)('multimodal v0.27.1 against real Postgres', () => {
       )).toHaveLength(0);
     } finally {
       await pg.executeRaw(`DELETE FROM pages WHERE slug IN ('v124/a', 'v124/b')`);
+      await pg.runMigration(124, migration.sql!);
+    }
+  }, 30_000);
+
+  test('migration v124 rejects a deferrable same-name ownership constraint', async () => {
+    const migration = MIGRATIONS.find(entry => entry.version === 124)!;
+    await pg.executeRaw('DROP INDEX IF EXISTS pages_source_path_owner_uniq');
+    try {
+      // A DEFERRABLE unique constraint creates an indisunique index with the
+      // expected name and keys, but indimmediate=false. CREATE INDEX IF NOT
+      // EXISTS would otherwise accept the lookalike and silently weaken the
+      // ownership boundary.
+      await pg.executeRaw(
+        `ALTER TABLE pages
+           ADD CONSTRAINT pages_source_path_owner_uniq
+           UNIQUE (source_id, source_path)
+           DEFERRABLE INITIALLY DEFERRED`,
+      );
+      const state = await pg.executeRaw<{ indimmediate: boolean }>(
+        `SELECT i.indimmediate
+           FROM pg_index i
+           JOIN pg_class idx ON idx.oid = i.indexrelid
+          WHERE idx.relname = 'pages_source_path_owner_uniq'`,
+      );
+      expect(state).toEqual([{ indimmediate: false }]);
+
+      await expect(pg.runMigration(124, migration.sql!))
+        .rejects.toThrow('non-canonical definition');
+    } finally {
+      await pg.executeRaw(
+        'ALTER TABLE pages DROP CONSTRAINT IF EXISTS pages_source_path_owner_uniq',
+      );
       await pg.runMigration(124, migration.sql!);
     }
   }, 30_000);
@@ -439,7 +509,9 @@ describe.skipIf(skip)('multimodal v0.27.1 against real Postgres', () => {
     expect(await pg.getTimeline(slug, { sourceId: 'default' })).toHaveLength(1);
   }, 60_000);
 
-  test('image import and file upsert isolate identical paths by source', async () => {
+  test('post-canary image import isolates identical paths after the legacy guard is retired', async () => {
+    await pg.executeRaw('ALTER TABLE files DROP CONSTRAINT IF EXISTS files_storage_path_key');
+    try {
     await pg.executeRaw(
       `INSERT INTO sources (id, name, config)
        VALUES ('source-a', 'source-a', '{}'::jsonb),
@@ -482,6 +554,10 @@ describe.skipIf(skip)('multimodal v0.27.1 against real Postgres', () => {
       [path],
     );
     expect(rows.map(row => row.source_id)).toEqual(['source-a', 'source-b']);
+    } finally {
+      await pg.executeRaw('DELETE FROM files');
+      await pg.executeRaw('ALTER TABLE files ADD CONSTRAINT files_storage_path_key UNIQUE(storage_path)');
+    }
   }, 30_000);
 
   test('upsertChunks writes embedding_image + modality columns (round-trip)', async () => {

@@ -22,10 +22,19 @@ import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
 import { withRetry, BULK_RETRY_OPTS, resolveBulkRetryOpts, computeNextDelay, type BatchAuditSite } from './retry.ts';
 import { logBatchRetry as auditLogBatchRetry, logBatchExhausted as auditLogBatchExhausted } from './audit/batch-retry-audit.ts';
 import { runMigrations } from './migrate.ts';
+import { assertCriticalOwnershipIndexes } from './source-path-owner-index.ts';
 import { PGLITE_SCHEMA_SQL, getPGLiteSchema } from './pglite-schema.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
 import { DELETE_BATCH_SIZE } from './engine-constants.ts';
-import { acquireLock, releaseLock, type LockHandle } from './pglite-lock.ts';
+import {
+  acquireLock,
+  assertExistingPgliteDataDirAuthority,
+  closeExistingPgliteDataDirAuthority,
+  PgliteDataDirAuthorityError,
+  releaseLock,
+  type ExistingPgliteDataDirAuthority,
+  type LockHandle,
+} from './pglite-lock.ts';
 import type {
   Page, PageInput, PageFilters, PageType,
   Chunk, ChunkInput, StaleChunkRow, StalePageRow,
@@ -263,6 +272,11 @@ export class PGLiteEngine implements BrainEngine {
   private _savedConfig: EngineConfig | null = null;
   private _databaseIdentity: string | null = null;
   private readonly _inMemoryIdentity = randomUUID();
+  private _existingDataDirAuthority: ExistingPgliteDataDirAuthority | undefined;
+
+  constructor(options: { existingDataDirAuthority?: ExistingPgliteDataDirAuthority } = {}) {
+    this._existingDataDirAuthority = options.existingDataDirAuthority;
+  }
 
   getDatabaseIdentity(): string {
     if (!this._databaseIdentity) {
@@ -286,7 +300,18 @@ export class PGLiteEngine implements BrainEngine {
     const dataDir = config.database_path || undefined; // undefined = in-memory
 
     // Acquire file lock to prevent concurrent PGLite access (crashes with Aborted())
-    this._lock = await acquireLock(dataDir);
+    try {
+      this._lock = await acquireLock(dataDir, this._existingDataDirAuthority
+        ? {
+            createDataDir: false,
+            dataDirAuthority: this._existingDataDirAuthority,
+          }
+        : undefined);
+    } catch (error) {
+      closeExistingPgliteDataDirAuthority(this._existingDataDirAuthority);
+      this._existingDataDirAuthority = undefined;
+      throw error;
+    }
 
     if (!this._lock.acquired) {
       throw new Error('Could not acquire PGLite lock. Another gbrain process is using the database.');
@@ -312,14 +337,22 @@ export class PGLiteEngine implements BrainEngine {
     // a snapshot/restore around these awaits does NOT contain them. That is
     // why the CLI's exit paths read gbrain's own verdict
     // (cli-force-exit.ts currentExitCode), never ambient process.exitCode.
+    let createdDb: PGLiteDB | null = null;
     try {
-      this._db = await preservingProcessExitCode(() =>
+      if (this._existingDataDirAuthority) {
+        assertExistingPgliteDataDirAuthority(this._existingDataDirAuthority);
+      }
+      createdDb = await preservingProcessExitCode(() =>
         PGlite.create({
           dataDir,
           loadDataDir,
           extensions: { vector, pg_trgm },
         }),
       );
+      if (this._existingDataDirAuthority) {
+        assertExistingPgliteDataDirAuthority(this._existingDataDirAuthority);
+      }
+      this._db = createdDb;
       this._databaseIdentity = dataDir
         ? databaseIdentity({ database_path: dataDir })
         : databaseIdentity({ database_path: `memory:${this._inMemoryIdentity}` });
@@ -330,16 +363,22 @@ export class PGLiteEngine implements BrainEngine {
       // read-only on older macOS + Bun 1.3.x, so PGLite can't extract its
       // pglite.data WASM payload). Route the hint by failure shape so
       // users get the right next step.
-      const original = err instanceof Error ? err.message : String(err);
-      const verdict = classifyPgliteInitError(original);
-      const wrapped = new Error(buildPgliteInitErrorMessage(verdict, original));
+      if (createdDb) {
+        try { await createdDb.close(); } catch { /* best-effort authority failure cleanup */ }
+        createdDb = null;
+      }
       // Release the lock so a fresh process can try again; leaking the lock
       // here turns a recoverable init error into a stuck-brain state.
       if (this._lock?.acquired) {
         try { await releaseLock(this._lock); } catch { /* ignore cleanup error */ }
         this._lock = null;
       }
-      throw wrapped;
+      closeExistingPgliteDataDirAuthority(this._existingDataDirAuthority);
+      this._existingDataDirAuthority = undefined;
+      if (err instanceof PgliteDataDirAuthorityError) throw err;
+      const original = err instanceof Error ? err.message : String(err);
+      const verdict = classifyPgliteInitError(original);
+      throw new Error(buildPgliteInitErrorMessage(verdict, original));
     }
   }
 
@@ -374,6 +413,8 @@ export class PGLiteEngine implements BrainEngine {
       if (lock?.acquired) {
         await releaseLock(lock);
       }
+      closeExistingPgliteDataDirAuthority(this._existingDataDirAuthority);
+      this._existingDataDirAuthority = undefined;
     }
   }
 
@@ -402,6 +443,9 @@ export class PGLiteEngine implements BrainEngine {
     // Tier 3: snapshot was loaded into PGlite — schema + migrations already
     // applied. Nothing to do. Returns immediately.
     if (this._snapshotLoaded) {
+      // Snapshot version metadata proves build compatibility, not that a
+      // critical index inside the artifact is present and canonical.
+      await assertCriticalOwnershipIndexes(this);
       return;
     }
     // Pre-schema bootstrap: add forward-referenced state the embedded schema
@@ -3817,6 +3861,7 @@ export class PGLiteEngine implements BrainEngine {
 
   // Files (v0.27.1): see PostgresEngine.upsertFile for the same contract.
   async upsertFile(spec: FileSpec): Promise<{ id: number; created: boolean }> {
+    const sourceId = spec.source_id ?? 'default';
     const result = await this.db.query<{ id: number; created: boolean }>(
       `INSERT INTO files (source_id, page_slug, page_id, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
@@ -3830,7 +3875,7 @@ export class PGLiteEngine implements BrainEngine {
          metadata = EXCLUDED.metadata
        RETURNING id, (xmax = 0) AS created`,
       [
-        spec.source_id,
+        sourceId,
         spec.page_slug ?? null,
         spec.page_id ?? null,
         spec.filename,

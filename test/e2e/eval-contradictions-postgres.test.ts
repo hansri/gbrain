@@ -24,8 +24,9 @@ import { writeRunRow, loadTrend } from '../../src/core/eval-contradictions/trend
 import { JudgeCache, buildCacheKey } from '../../src/core/eval-contradictions/cache.ts';
 import type { ProbeReport } from '../../src/core/eval-contradictions/types.ts';
 import { operationsByName, type OperationContext } from '../../src/core/operations.ts';
+import { getPostgresTestUrl } from '../helpers/postgres-test-authority.ts';
 
-const DATABASE_URL = process.env.DATABASE_URL;
+const DATABASE_URL = getPostgresTestUrl();
 
 let engine: PostgresEngine | null = null;
 

@@ -23,11 +23,46 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import postgres from 'postgres';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
+import * as db from '../../src/core/db.ts';
+import { getOrCreateDatabaseInstanceId } from '../../src/core/database-instance-id.ts';
+import { runMigrateOnlyCore } from '../../src/commands/migrations/in-process.ts';
 import { LATEST_VERSION } from '../../src/core/migrate.ts';
+import { getPostgresTestUrl } from '../helpers/postgres-test-authority.ts';
 
-const DATABASE_URL = process.env.DATABASE_URL;
+const DATABASE_URL = getPostgresTestUrl();
 const skip = !DATABASE_URL;
+
+const GRANTED_SCHEMA_LOCK_COUNT_SQL = `
+  SELECT count(*)::int AS n
+    FROM pg_locks
+   WHERE locktype = 'advisory'
+     AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+     AND classid = 0
+     AND objid = $1::oid
+     AND objsubid = 1
+     AND granted
+`;
+
+async function grantedSchemaLockCount(engine: PostgresEngine): Promise<number> {
+  const rows = await engine.executeRaw<{ n: number }>(GRANTED_SCHEMA_LOCK_COUNT_SQL, [
+    db.SCHEMA_MIGRATION_LOCK_KEY,
+  ]);
+  return Number(rows[0]?.n ?? 0);
+}
+
+async function completesWithin<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} exceeded ${timeoutMs}ms`)), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 describe.skipIf(skip)('PostgresEngine forward-reference bootstrap (E2E)', () => {
   let engine: PostgresEngine;
@@ -170,4 +205,202 @@ describe.skipIf(skip)('PostgresEngine forward-reference bootstrap (E2E)', () => 
       expect(JSON.stringify(r.proconfig ?? [])).toContain('search_path=');
     }
   });
+});
+
+describe.skipIf(skip)('Postgres schema migration lock lifecycle (E2E)', () => {
+  test('conflicting shadow search_path is rejected before GBrain DDL', async () => {
+    const shadowSchema = 'gbrain_shadow_authority_e2e';
+    const shadowDatabase = 'gbrain_shadow_authority_e2e_db';
+    const admin = postgres(DATABASE_URL!, { max: 1 });
+    const engine = new PostgresEngine();
+    const priorDirect = process.env.GBRAIN_DIRECT_DATABASE_URL;
+    try {
+      delete process.env.GBRAIN_DIRECT_DATABASE_URL;
+      await admin.unsafe(`DROP DATABASE IF EXISTS ${shadowDatabase} WITH (FORCE)`);
+      await admin.unsafe(`CREATE DATABASE ${shadowDatabase}`);
+
+      const targetUrl = new URL(DATABASE_URL!);
+      targetUrl.pathname = `/${shadowDatabase}`;
+      const prep = postgres(targetUrl.toString(), { max: 1 });
+      try {
+        await prep.unsafe(`CREATE SCHEMA ${shadowSchema}`);
+      } finally {
+        await prep.end({ timeout: 5 });
+      }
+
+      const shadowUrl = new URL(targetUrl);
+      shadowUrl.searchParams.set('options', `-csearch_path=${shadowSchema},public`);
+      await engine.connect({ database_url: shadowUrl.toString(), poolSize: 1 });
+
+      await expect(engine.initSchema()).rejects.toThrow('incompatible search_path');
+
+      // Setup created only the empty shadow schema. initSchema must reject
+      // before bootstrap, extension creation, SCHEMA_SQL, config identity, and
+      // every migration in either the shadow target or public work schema.
+      const inspector = postgres(targetUrl.toString(), { max: 1 });
+      try {
+        const rows = await inspector<{ n: number }[]>`
+          SELECT count(*)::int AS n
+            FROM information_schema.tables
+           WHERE table_schema IN ('public', ${shadowSchema})
+        `;
+        expect(Number(rows[0]?.n ?? -1)).toBe(0);
+        const extensions = await inspector<{ n: number }[]>`
+          SELECT count(*)::int AS n FROM pg_extension WHERE extname = 'vector'
+        `;
+        expect(Number(extensions[0]?.n ?? -1)).toBe(0);
+      } finally {
+        await inspector.end({ timeout: 5 });
+      }
+    } finally {
+      await engine.disconnect().catch(() => {});
+      if (priorDirect === undefined) delete process.env.GBRAIN_DIRECT_DATABASE_URL;
+      else process.env.GBRAIN_DIRECT_DATABASE_URL = priorDirect;
+      await admin.unsafe(`DROP DATABASE IF EXISTS ${shadowDatabase} WITH (FORCE)`).catch(() => {});
+      await admin.end({ timeout: 5 });
+    }
+  }, 30_000);
+
+  test('database instance identity is shared across independent connection pools', async () => {
+    const first = new PostgresEngine();
+    const second = new PostgresEngine();
+    try {
+      await first.connect({ database_url: DATABASE_URL!, poolSize: 1 });
+      await second.connect({ database_url: DATABASE_URL!, poolSize: 3 });
+      expect(await getOrCreateDatabaseInstanceId(first))
+        .toBe(await getOrCreateDatabaseInstanceId(second));
+    } finally {
+      await second.disconnect();
+      await first.disconnect();
+    }
+  }, 30_000);
+
+  test('snapshotted schema phase accepts only the database-owned Postgres identity', async () => {
+    const probe = new PostgresEngine();
+    try {
+      await probe.connect({ database_url: DATABASE_URL!, poolSize: 1 });
+      await probe.initSchema();
+      const brainId = await getOrCreateDatabaseInstanceId(probe);
+      const config = { engine: 'postgres' as const, database_url: DATABASE_URL! };
+
+      expect((await runMigrateOnlyCore({
+        config,
+        engineConfig: config,
+        expectedDatabaseIdentity: brainId,
+      })).engine).toBe('postgres');
+      await expect(runMigrateOnlyCore({
+        config,
+        engineConfig: config,
+        expectedDatabaseIdentity: 'db:00000000-0000-4000-8000-000000000000',
+      })).rejects.toThrow('Configured database identity changed');
+    } finally {
+      await probe.disconnect();
+    }
+  }, 60_000);
+
+  test('PostgresEngine.initSchema leaves no granted key-42 lock on a primed pool', async () => {
+    const engine = new PostgresEngine();
+    try {
+      await engine.connect({ database_url: DATABASE_URL!, poolSize: 5 });
+
+      // Force postgres.js to open multiple backends. The pre-fix pooled
+      // session lock leaked only after lock/work/unlock rotated across them.
+      const probes = await Promise.all(
+        Array.from({ length: 5 }, () =>
+          engine.executeRaw<{ pid: number }>('SELECT pg_backend_pid() AS pid, pg_sleep(0.02)'),
+        ),
+      );
+      expect(new Set(probes.map(rows => rows[0]?.pid)).size).toBeGreaterThan(1);
+
+      await engine.initSchema();
+
+      // Keep the engine and all of its pooled sessions alive while checking.
+      // Closing the pool would hide a leaked session lock by releasing it.
+      expect(await grantedSchemaLockCount(engine)).toBe(0);
+      expect((await engine.executeRaw<{ one: number }>('SELECT 1 AS one'))[0]?.one).toBe(1);
+    } finally {
+      await engine.disconnect();
+    }
+  }, 30_000);
+
+  test('db.initSchema leaves no granted key-42 lock on a primed module pool', async () => {
+    const priorPoolSize = process.env.GBRAIN_POOL_SIZE;
+    process.env.GBRAIN_POOL_SIZE = '5';
+    await db.disconnect();
+    try {
+      await db.connect({ database_url: DATABASE_URL! });
+      const conn = db.getConnection();
+      const probes = await Promise.all(
+        Array.from({ length: 5 }, () =>
+          conn.unsafe<{ pid: number }[]>('SELECT pg_backend_pid() AS pid, pg_sleep(0.02)'),
+        ),
+      );
+      expect(new Set(probes.map(rows => rows[0]?.pid)).size).toBeGreaterThan(1);
+
+      await db.initSchema();
+
+      const rows = await conn.unsafe<{ n: number }[]>(GRANTED_SCHEMA_LOCK_COUNT_SQL, [
+        db.SCHEMA_MIGRATION_LOCK_KEY,
+      ]);
+      expect(Number(rows[0]?.n ?? 0)).toBe(0);
+      expect((await conn.unsafe<{ one: number }[]>('SELECT 1 AS one'))[0]?.one).toBe(1);
+    } finally {
+      await db.disconnect();
+      if (priorPoolSize === undefined) delete process.env.GBRAIN_POOL_SIZE;
+      else process.env.GBRAIN_POOL_SIZE = priorPoolSize;
+    }
+  }, 30_000);
+
+  test('a poolSize=1 peer init completes while the first engine stays connected', async () => {
+    const first = new PostgresEngine();
+    const peer = new PostgresEngine();
+    try {
+      await first.connect({ database_url: DATABASE_URL!, poolSize: 1 });
+      await completesWithin(first.initSchema(), 10_000, 'first poolSize=1 initSchema');
+      expect(await grantedSchemaLockCount(first)).toBe(0);
+
+      await peer.connect({ database_url: DATABASE_URL!, poolSize: 1 });
+      await completesWithin(peer.initSchema(), 10_000, 'peer poolSize=1 initSchema');
+
+      expect(await grantedSchemaLockCount(first)).toBe(0);
+      expect(await grantedSchemaLockCount(peer)).toBe(0);
+      expect((await first.executeRaw<{ one: number }>('SELECT 1 AS one'))[0]?.one).toBe(1);
+      expect((await peer.executeRaw<{ one: number }>('SELECT 1 AS one'))[0]?.one).toBe(1);
+    } finally {
+      await peer.disconnect();
+      await first.disconnect();
+    }
+  }, 30_000);
+
+  test('withSchemaMigrationLock rolls back and releases after a thrown callback', async () => {
+    const probe = new PostgresEngine();
+    const marker = new Error('schema-lock-test-callback-failed');
+    try {
+      await probe.connect({ database_url: DATABASE_URL!, poolSize: 1 });
+
+      let observed: unknown;
+      try {
+        const handle = await db.acquireDatabaseSessionLock(DATABASE_URL!, db.SCHEMA_MIGRATION_LOCK_KEY);
+        await handle.assertOwned();
+        await handle.release();
+        await db.withSchemaMigrationLock(DATABASE_URL!, async () => {
+          throw marker;
+        });
+      } catch (error) {
+        observed = error;
+      }
+      expect(observed).toBe(marker);
+      expect(await grantedSchemaLockCount(probe)).toBe(0);
+
+      const reacquired = await completesWithin(
+        db.withSchemaMigrationLock(DATABASE_URL!, async () => 'reacquired'),
+        5_000,
+        'schema lock reacquire after rollback',
+      );
+      expect(reacquired).toBe('reacquired');
+      expect(await grantedSchemaLockCount(probe)).toBe(0);
+    } finally {
+      await probe.disconnect();
+    }
+  }, 30_000);
 });

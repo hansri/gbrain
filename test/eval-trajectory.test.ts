@@ -11,11 +11,20 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { configureGateway } from '../src/core/ai/gateway.ts';
 import { runEvalTrajectory } from '../src/commands/eval-trajectory.ts';
 
 let engine: PGLiteEngine;
 
 beforeAll(async () => {
+  // This fixture writes 1536-d vectors. Pin the schema before initSchema;
+  // another file in the same Bun batch may legitimately leave the ambient
+  // gateway on the production 1280-d default before this file's beforeAll.
+  configureGateway({
+    embedding_model: 'openai:text-embedding-3-large',
+    embedding_dimensions: 1536,
+    env: { ...process.env },
+  });
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();

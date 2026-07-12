@@ -80,6 +80,10 @@ mkdir -p "$E2E_TMP_HOME/.gbrain"
 for _e2e_var in $(env | grep -oE '^(CONDUCTOR_|MCP_|OPENCLAW_|GBRAIN_)[A-Za-z0-9_]*' | sort -u); do
   case "$_e2e_var" in
     GBRAIN_HOME) ;;  # required for HOME isolation (set above) — keep
+    # Explicit CI topology fixtures, not operator/agent behavior overrides.
+    # Keeping these is what makes the transaction-pooler and wrong-direct
+    # authority regressions execute instead of silently skip.
+    GBRAIN_PGBOUNCER_URL|GBRAIN_PGBOUNCER_DIRECT_URL|GBRAIN_PGBOUNCER_WRONG_DIRECT_URL|GBRAIN_TEST_DB) ;;
     *) unset "$_e2e_var" || true ;;
   esac
 done
@@ -152,15 +156,13 @@ for f in "${files[@]}"; do
   name=$(basename "$f")
   echo ""
   echo "=== $name ==="
-  # Cross-file isolation: terminate any stale connections from the prior
-  # file's pool before the next file's setupDB() runs. Without this,
-  # idle postgres connections from the previous bun process race with
-  # the next file's TRUNCATE CASCADE → cross-file fixture-state pollution
-  # (people/sarah-chen disappears mid-test, etc.). The terminate call is
-  # idempotent + fast (~50ms); on the first iteration there's nothing to
-  # terminate so it's effectively free.
+  # Cross-file Postgres isolation: files intentionally exercise different
+  # embedding dimensions and historical schema states. A TRUNCATE cannot
+  # reset vector typmods/defaults, so sharing the schema makes later files
+  # order-dependent. The reset helper verifies exact gbrain_test authority +
+  # GBRAIN_TEST_DB=1, terminates stale test connections, and recreates public.
   if [ -n "${DATABASE_URL:-}" ]; then
-    psql "$DATABASE_URL" -At -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid != pg_backend_pid() AND datname = current_database()" >/dev/null 2>&1 || true
+    bun run scripts/reset-e2e-postgres.ts
   fi
   # Hard outer timeout (180s per file). bun's --timeout is per-test; if a
   # PGLite WASM call hangs in beforeAll/afterAll, --timeout never fires and

@@ -26,6 +26,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:tes
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import { makeIngestCaptureHandler } from '../../src/core/minions/handlers/ingest-capture.ts';
+import { prepareIngestCaptureJobData } from '../../src/core/minions/ingest-boundary.ts';
 import type { MinionJobContext } from '../../src/core/minions/types.ts';
 import type { IngestionEvent } from '../../src/core/ingestion/types.ts';
 import { createHash } from 'node:crypto';
@@ -51,8 +52,12 @@ function buildEvent(content: string, sourceUri: string): IngestionEvent {
  * `job.data`; other fields can be undefined/no-op for this test.
  */
 function buildJobCtx(data: Record<string, unknown>): MinionJobContext {
+  const persistedData = prepareIngestCaptureJobData(
+    { ...data, remote: false },
+    true,
+  );
   return {
-    data,
+    data: persistedData,
     job: { id: 1, name: 'ingest_capture', status: 'active' } as never,
     signal: new AbortController().signal,
     shutdownSignal: new AbortController().signal,
@@ -77,6 +82,10 @@ describe('capture-generation regression (D3 + codex #5)', () => {
 
   beforeEach(async () => {
     await resetPgliteState(engine);
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config)
+       VALUES ('test-src', 'test-src', '{"federated": false}'::jsonb)`,
+    );
   });
 
   async function readGeneration(slug: string): Promise<number | null> {

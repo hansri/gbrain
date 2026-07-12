@@ -21,12 +21,22 @@
 
 import { existsSync, readFileSync, writeFileSync, renameSync, openSync, closeSync, unlinkSync, statSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
-import { execSync, execFileSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { compareVersions } from '../commands/migrations/index.ts';
+import { resolveUpgradeInvocation } from '../commands/upgrade.ts';
 import { gbrainPath } from './config.ts';
 import type { GBrainConfig } from './config.ts';
 import { promptLineStderr } from './cli-util.ts';
 import type { CliOptions } from './cli-options.ts';
+import { resolveUpgradeReleasePolicy } from './upgrade-release-policy.ts';
+
+/** Exact current-release argv; PATH never selects upgrade or verification. */
+export function resolveThinClientUpgradeInvocation(
+  args: readonly string[],
+  runtime?: Parameters<typeof resolveUpgradeInvocation>[1],
+): string[] {
+  return resolveUpgradeInvocation(args, runtime);
+}
 
 // Structural shape of the banner identity payload. Defined here (not imported
 // from src/cli.ts) to avoid a circular import; cli.ts's BrainIdentity is
@@ -86,7 +96,7 @@ export function driftLevel(local: string, remote: string): 'major' | 'minor' | '
 // State file
 // ============================================================================
 
-export type LastResponse = 'yes' | 'no' | 'failed';
+export type LastResponse = 'yes' | 'no' | 'failed' | 'supervised';
 
 export interface PromptStateEntry {
   last_prompted_remote_version: string;
@@ -117,7 +127,10 @@ function isValidPromptStateEntry(value: unknown): value is PromptStateEntry {
   const e = value as Record<string, unknown>;
   if (typeof e.last_prompted_remote_version !== 'string') return false;
   if (typeof e.last_prompted_at_iso !== 'string') return false;
-  if (e.last_response !== 'yes' && e.last_response !== 'no' && e.last_response !== 'failed') return false;
+  if (
+    e.last_response !== 'yes' && e.last_response !== 'no' &&
+    e.last_response !== 'failed' && e.last_response !== 'supervised'
+  ) return false;
   return true;
 }
 
@@ -254,6 +267,7 @@ export function decideAction(input: DecisionInput): Decision {
   if (entry && entry.last_prompted_remote_version === input.remoteVersion) {
     if (entry.last_response === 'no') return { kind: 'noop' };
     if (entry.last_response === 'yes') return { kind: 'noop' };
+    if (entry.last_response === 'supervised') return { kind: 'noop' };
     // 'failed' → fall through and re-prompt.
   }
 
@@ -272,17 +286,26 @@ export function _setVerifierForTest(fn: Verifier | null): void {
   _verifier = fn ?? defaultVerifyUpgradeAdvanced;
 }
 
+export function isExactApprovedUpgrade(
+  installedVersion: string,
+  approvedVersion: string,
+): boolean {
+  return safeCompare(installedVersion, approvedVersion) === 0;
+}
+
 function defaultVerifyUpgradeAdvanced(remoteVersion: string): { advanced: boolean; newVersion: string | null } {
   try {
     // Spawn `gbrain --version` as a fresh subprocess so we read the NEW binary
     // the upgrade just installed (not the old VERSION constant baked into the
     // currently-running process). Output shape: "gbrain X.Y.Z" or just "X.Y.Z".
-    const out = execFileSync('gbrain', ['--version'], { encoding: 'utf-8', timeout: 10_000 });
+    const invocation = resolveThinClientUpgradeInvocation(['--version']);
+    const out = execFileSync(invocation[0]!, invocation.slice(1), {
+      encoding: 'utf-8', timeout: 10_000,
+    });
     const match = out.trim().match(/(\d+\.\d+\.\d+(?:\.\d+)?)/);
     if (!match) return { advanced: false, newVersion: null };
     const newVersion = match[1];
-    const cmp = safeCompare(newVersion, remoteVersion);
-    return { advanced: cmp !== null && cmp >= 0, newVersion };
+    return { advanced: isExactApprovedUpgrade(newVersion, remoteVersion), newVersion };
   } catch {
     return { advanced: false, newVersion: null };
   }
@@ -310,10 +333,13 @@ export function _setPromptReaderForTest(fn: PromptReader | null): void {
 // Upgrade runner injection (for unit tests)
 // ============================================================================
 
-export type UpgradeRunner = () => void;
+export type UpgradeRunner = (targetVersion: string) => void;
 
-function defaultRunUpgrade(): void {
-  execSync('gbrain upgrade', { stdio: 'inherit' });
+function defaultRunUpgrade(targetVersion: string): void {
+  const invocation = resolveThinClientUpgradeInvocation([
+    'upgrade', '--target', targetVersion,
+  ]);
+  execFileSync(invocation[0]!, invocation.slice(1), { stdio: 'inherit' });
 }
 
 let _upgradeRunner: UpgradeRunner = defaultRunUpgrade;
@@ -399,6 +425,22 @@ export async function maybePromptForUpgrade(
   if (!lock) return;
 
   try {
+    const releasePolicy = resolveUpgradeReleasePolicy(identity.version);
+    if (!releasePolicy.inlineAllowed) {
+      writeStateBestEffort(
+        state,
+        mcpUrl,
+        identity.version,
+        'supervised',
+        new Date().toISOString(),
+      );
+      log(
+        `Local inline upgrade paused: v${identity.version} requires supervised staged promotion. ` +
+        'Stop services/writers and follow the release migration guide.',
+      );
+      return;
+    }
+
     const levelWord = decision.level === 'major' ? 'major' : 'minor';
     const promptText =
       `Remote brain is on v${identity.version} (you're on v${localVersion}). This is a ${levelWord} upgrade.\n` +
@@ -436,7 +478,7 @@ export async function maybePromptForUpgrade(
     let upgradeThrew = false;
     let upgradeError: string | null = null;
     try {
-      _upgradeRunner();
+      _upgradeRunner(identity.version);
     } catch (e) {
       upgradeThrew = true;
       upgradeError = e instanceof Error ? e.message : String(e);

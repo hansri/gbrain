@@ -25,9 +25,9 @@
  * not one-time schema+backfill work.
  */
 
-import { execSync } from 'child_process';
 import { runGbrainSubprocess } from './in-process.ts';
 import type { Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult } from './types.ts';
+import { runSnapshotMigrateOnly } from './snapshot.ts';
 // Bug 3 — ledger writes moved to the runner (apply-migrations.ts). The
 // orchestrator returns its result and the runner persists it.
 
@@ -38,18 +38,14 @@ import type { Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhase
 // ~10s (ALTER + index builds). Bumped timeout accounts for slow Supabase
 // links (v0.12.1 pattern — migrations can time out on the 60s default).
 //
-// Shell out to the canonical `gbrain` shim on PATH (`/usr/local/bin/gbrain`
-// by default). An earlier revision resolved via the active Node/Bun runtime
-// binary, but on bun-installed trees that binary is `bun` — the spawned
-// `bun extract ...` gets reinterpreted as `bun run extract` and crashes the
-// upgrade mid-migration. The shim is already the canonical wrapper; trust
-// it. Regression guarded by test/migrations-v0_13_0.test.ts.
+// Child phases are pinned to the exact running release. This matters during a
+// supervised staged upgrade, when PATH intentionally still resolves the old
+// production shim until every migration gate has passed.
 
 async function phaseASchema(opts: OrchestratorOpts): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) return { name: 'schema', status: 'skipped', detail: 'dry-run' };
   try {
-    const { runMigrateOnlyCore } = await import('./in-process.ts');
-    await runMigrateOnlyCore();
+    await runSnapshotMigrateOnly(opts);
     return { name: 'schema', status: 'complete' };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -59,14 +55,16 @@ async function phaseASchema(opts: OrchestratorOpts): Promise<OrchestratorPhaseRe
 
 // ── Phase B — Frontmatter edge backfill ─────────────────────
 
-function phaseBBackfill(opts: OrchestratorOpts): OrchestratorPhaseResult {
+async function phaseBBackfill(opts: OrchestratorOpts): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) return { name: 'frontmatter_backfill', status: 'skipped', detail: 'dry-run' };
   try {
     // `--source db` iterates pages from the engine (no local checkout required).
     // `--include-frontmatter` is the v0.13 flag that enables the canonical
     // frontmatter link extractor. Default-OFF in the CLI for back-compat;
     // the migration explicitly opts in because this is the canonical backfill.
-    runGbrainSubprocess('gbrain extract links --source db --include-frontmatter', { timeoutMs: 1_800_000 });
+    await runGbrainSubprocess(['extract', 'links', '--source', 'db', '--include-frontmatter'], {
+      timeoutMs: 1_800_000, snapshot: opts, effect: 'mutating',
+    });
     return { name: 'frontmatter_backfill', status: 'complete' };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -76,7 +74,7 @@ function phaseBBackfill(opts: OrchestratorOpts): OrchestratorPhaseResult {
 
 // ── Phase C — Verify ────────────────────────────────────────
 
-function phaseCVerify(opts: OrchestratorOpts): OrchestratorPhaseResult {
+async function phaseCVerify(opts: OrchestratorOpts): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) return { name: 'verify', status: 'skipped', detail: 'dry-run' };
   try {
     // Query frontmatter edge count via get_stats + a secondary --json call
@@ -87,8 +85,8 @@ function phaseCVerify(opts: OrchestratorOpts): OrchestratorPhaseResult {
     // docs-only brains, and brains with no entity pages legitimately
     // produce 0. Phase B's own stdout shows `Links: created N` which is
     // the authoritative signal — user sees it during upgrade.
-    const out = execSync('gbrain call get_stats', {
-      encoding: 'utf-8', timeout: 60_000, env: process.env,
+    const out = await runGbrainSubprocess(['call', 'get_stats'], {
+      timeoutMs: 60_000, snapshot: opts, effect: 'read_only',
     });
     const parsed = JSON.parse(out) as { link_count?: number; page_count?: number };
     const linkCount = parsed.link_count ?? 0;
@@ -118,13 +116,13 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
   phases.push(a);
   if (a.status === 'failed') return finalizeResult(phases, 'failed');
 
-  const b = phaseBBackfill(opts);
+  const b = await phaseBBackfill(opts);
   phases.push(b);
   // Backfill failure → partial. Schema is already applied so re-running
   // only re-tries the backfill (idempotent via ON CONFLICT DO NOTHING).
   if (b.status === 'failed') return finalizeResult(phases, 'partial');
 
-  const c = phaseCVerify(opts);
+  const c = await phaseCVerify(opts);
   phases.push(c);
 
   // a.status and b.status were narrowed to 'skipped' | 'complete' by early returns above.

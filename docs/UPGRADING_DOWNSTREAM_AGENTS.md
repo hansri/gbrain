@@ -11,10 +11,15 @@ Cross-reference against your fork's local skill files.
 
 ## Why this exists
 
-`gbrain upgrade` ships the new binary. `gbrain post-upgrade [--execute --yes]` runs
-the schema migrations and backfills the data. But the **skill files themselves**
-that tell the agent how to behave — those are user-owned. If your `~/git/<your-agent>/workspace/skills/brain-ops/SKILL.md`
-says `# Based on gbrain v0.10.0` at the top, it doesn't know about v0.12.0 features.
+For an ordinary release, `gbrain upgrade` ships the new binary and
+`gbrain post-upgrade` runs schema migrations and backfills. Read every skipped
+version's `skills/migrations/v*.md` first: a release-specific supervised
+cutover overrides that shortcut. The first hop into v0.42.59.0 must use a
+staged new binary for preflight, migration, and doctor while services are
+stopped; see that migration guide. The **skill files themselves** that tell the
+agent how to behave are user-owned. If your
+`~/git/<your-agent>/workspace/skills/brain-ops/SKILL.md` says `# Based on gbrain
+v0.10.0` at the top, it doesn't know about v0.12.0 features.
 
 The agent will keep manually calling `gbrain link` after every `put_page` (now redundant —
 auto-link does it), miss out on `gbrain graph-query` for relationship questions, and
@@ -314,7 +319,11 @@ v0.13 edges carry new `link_type` values. If your fork has graph-query skills th
 
 ### Migration timing
 
-`gbrain upgrade` takes 2-5 min on a 46K-page brain (one-time). Runs out-of-process via `gbrain post-upgrade`. If your agent holds a DB connection during the upgrade, reconnect after; otherwise keep serving.
+Historical v0.13 runs took 2-5 minutes on a 46K-page brain and used the
+out-of-process `gbrain post-upgrade` handoff. The current invariant is stricter:
+stop every service and writer before a supervised migration or binary swap,
+keep old agents stopped, and reconnect only after the staged new binary's
+migration and doctor gates are green. Never keep serving through an upgrade.
 
 ### Type normalization NOT in v0.13
 
@@ -546,8 +555,9 @@ diff <(grep -A3 "Based on gbrain" ~/<your-fork>/skills/brain-ops/SKILL.md) \
 snake_case config-key name on it; the worker resolves the value from its
 `loadConfig()` at child-spawn time and injects it into the child env. Names
 land in the row; values never persist from `inherit:`. Validation runs
-**pre-enqueue** in both submit paths (CLI + `submit_job` op), so a malformed
-payload never lands in `minion_jobs.data`.
+**pre-enqueue** in both trusted host submit paths (CLI + the local-only
+`submit_job` operation), so a malformed payload never lands in
+`minion_jobs.data`. Remote MCP cannot invoke generic job submission.
 
 **Why.** Pre-v0.36.5.0, agents that wanted to call `gbrain` from shell jobs
 had to either write `database_url` to `~/.gbrain/config.json` plaintext or
@@ -609,4 +619,3 @@ job + `inherit:` for `localOnly` admin ops (`sync`, `embed`, `dream`,
 | `shell: inherit entries must be non-empty strings` | Element was empty, non-string, or null. | Use snake_case config-key names. |
 | `shell: inherit name "<X>" must match [a-z][a-z0-9_]*` | Name failed snake_case regex (uppercase, leading underscore, etc.). | Use the config-key verbatim — `database_url`, not `DATABASE_URL`. |
 | `shell: inherit requested "<X>" but worker has no <X> configured` | Worker can't resolve the name from its `loadConfig()`. | Run `gbrain config set <X> <value>` on the worker host. |
-

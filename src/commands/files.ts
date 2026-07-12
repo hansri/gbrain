@@ -6,16 +6,20 @@ import {
   fsyncSync,
   linkSync,
   lstatSync,
+  mkdirSync,
   openSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
+  type BigIntStats,
 } from 'fs';
-import { join, relative, extname, basename, dirname } from 'path';
+import { join, relative, extname, basename, dirname, isAbsolute, resolve, sep } from 'path';
 import { randomUUID } from 'crypto';
+import { dlopen, FFIType, ptr } from 'bun:ffi';
 import type { BrainEngine } from '../core/engine.ts';
 import { sqlQueryForEngine } from '../core/sql-query.ts';
 import {
@@ -24,10 +28,13 @@ import {
   parseRedirectContent,
   parseRedirectYaml,
   parseRedirectYamlContent,
+  parseMarkerContent,
   sourceQualifiedStoragePath,
   validateLegacyRedirect,
-  validateRedirectYaml,
+  validateRedirectYamlForSource,
   verifyRedirectBytes,
+  type MarkerInfo,
+  type ValidatedRedirect,
 } from '../core/file-resolver.ts';
 import {
   ensureStoredObjectExact,
@@ -62,6 +69,7 @@ export async function runFiles(engine: BrainEngine, args: string[]) {
   const commandArgs = parsedSource.rest;
   const sourceAware = new Set([
     'list', 'mirror', 'upload', 'upload-raw', 'signed-url', 'sync', 'verify',
+    'unmirror', 'redirect', 'restore', 'clean',
   ]).has(subcommand ?? '');
   const sourceId = sourceAware
     ? await resolveSourceId(engine, parsedSource.value)
@@ -84,16 +92,16 @@ export async function runFiles(engine: BrainEngine, args: string[]) {
       await mirrorFiles(sourceId!, commandArgs);
       break;
     case 'unmirror':
-      await unmirrorFiles(commandArgs);
+      await unmirrorFiles(sourceId!, commandArgs);
       break;
     case 'redirect':
-      await redirectFiles(commandArgs);
+      await redirectFiles(sourceId!, commandArgs);
       break;
     case 'restore':
-      await restoreFiles(commandArgs);
+      await restoreFiles(sourceId!, commandArgs);
       break;
     case 'clean':
-      await cleanFiles(commandArgs);
+      await cleanFiles(sourceId!, commandArgs);
       break;
     case 'upload-raw':
       await uploadRaw(engine, sourceId!, commandArgs);
@@ -197,6 +205,11 @@ export interface RedirectOriginalSnapshot {
   identity: RedirectOriginalIdentity;
 }
 
+interface RedirectOriginalSnapshotWithLinks {
+  snapshot: RedirectOriginalSnapshot;
+  linkCount: bigint;
+}
+
 function sameRedirectOriginalIdentity(
   left: RedirectOriginalIdentity,
   right: RedirectOriginalIdentity,
@@ -234,26 +247,266 @@ function sameRedirectSnapshot(
     && left.content.equals(right.content);
 }
 
-/**
- * Read one regular-file revision through a no-follow descriptor and bind its
- * bytes to stable filesystem identity. Metadata is checked on both sides of
- * the read so a concurrent writer cannot silently produce a mixed snapshot.
- */
-export function readRedirectOriginalSnapshot(path: string): RedirectOriginalSnapshot {
-  const fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-  try {
-    const before = fstatSync(fd, { bigint: true });
-    if (!before.isFile()) {
-      throw new Error(`Redirect original is not a regular file: ${path}`);
+interface StableDirectoryHandle {
+  path: string;
+  fd: number;
+  dev: bigint;
+  ino: bigint;
+}
+
+export interface StableRootReadHooks {
+  /** @internal Deterministic race-test hook; production callers omit it. */
+  beforeRootOpen?: () => void;
+  /** @internal Deterministic race-test hook; production callers omit it. */
+  beforeLeafOpen?: () => void;
+}
+
+type NativeOpenAt = (
+  dirFd: number,
+  path: ReturnType<typeof ptr>,
+  flags: number,
+  mode: number,
+) => number;
+
+let nativeOpenAt: NativeOpenAt | null = null;
+const nativeOpenAtLibraries: Array<{ close(): void }> = [];
+
+function loadNativeOpenAt(): NativeOpenAt {
+  if (nativeOpenAt) return nativeOpenAt;
+  const muslArch = process.arch === 'arm64'
+    ? 'aarch64'
+    : process.arch === 'x64'
+      ? 'x86_64'
+      : process.arch;
+  const candidates = process.platform === 'darwin'
+    ? ['/usr/lib/libSystem.B.dylib']
+    : [
+        'libc.so.6',
+        `/lib/libc.musl-${muslArch}.so.1`,
+        `/lib/ld-musl-${muslArch}.so.1`,
+      ];
+  let lastError: unknown;
+  for (const libraryPath of candidates) {
+    try {
+      const library = dlopen(libraryPath, {
+        openat: {
+          args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.u32],
+          returns: FFIType.i32,
+        },
+      });
+      const linked = library.symbols.openat as NativeOpenAt;
+      nativeOpenAtLibraries.push(library);
+      nativeOpenAt = linked;
+      return linked;
+    } catch (error) {
+      lastError = error;
     }
-    const content = readFileSync(fd);
-    const after = fstatSync(fd, { bigint: true });
+  }
+  throw new Error('This platform cannot provide the required POSIX openat boundary', {
+    cause: lastError,
+  });
+}
+
+/** Open one slash-free child relative to a held directory descriptor. */
+function openAtNoFollow(parentFd: number, entry: string, flags: number): number {
+  if (!entry || entry.includes('/') || entry.includes('\\') || entry.includes('\0')) {
+    throw new Error('Invalid stable-root path segment');
+  }
+  const encoded = Buffer.from(`${entry}\0`);
+  const fd = loadNativeOpenAt()(parentFd, ptr(encoded), flags, 0);
+  if (!Number.isInteger(fd) || fd < 0) {
+    throw new Error(`Stable-root openat refused path segment: ${entry}`);
+  }
+  return fd;
+}
+
+function openStableDirectory(
+  path: string,
+  label: string,
+  parent?: StableDirectoryHandle,
+  entry?: string,
+): StableDirectoryHandle {
+  const noFollow = fsConstants.O_NOFOLLOW;
+  const directory = fsConstants.O_DIRECTORY;
+  if (typeof noFollow !== 'number' || typeof directory !== 'number') {
+    throw new Error('This platform cannot perform a no-follow directory traversal');
+  }
+
+  const before = lstatSync(path, { bigint: true });
+  if (before.isSymbolicLink() || !before.isDirectory()) {
+    throw new Error(`${label} uses a symlink or non-directory ancestor: ${path}`);
+  }
+  const fd = parent && entry
+    ? openAtNoFollow(parent.fd, entry, fsConstants.O_RDONLY | noFollow | directory)
+    : openSync(path, fsConstants.O_RDONLY | noFollow | directory);
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    const named = lstatSync(path, { bigint: true });
+    if (
+      !opened.isDirectory()
+      || named.isSymbolicLink()
+      || !named.isDirectory()
+      || opened.dev !== before.dev
+      || opened.ino !== before.ino
+      || named.dev !== opened.dev
+      || named.ino !== opened.ino
+    ) {
+      throw new Error(`${label} ancestor changed while it was being opened: ${path}`);
+    }
+    return { path, fd, dev: opened.dev, ino: opened.ino };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+/**
+ * Open an absolute directory without following any symlink in its ancestry.
+ *
+ * `open(path, O_NOFOLLOW)` protects only the final component. Starting from a
+ * held `/` descriptor and resolving every segment with `openat` extends that
+ * guarantee to the complete root path. Keep every descriptor alive until the
+ * leaf read finishes so a concurrent rename cannot redirect later segments.
+ */
+function openStableAbsoluteDirectoryChain(
+  absolutePath: string,
+  label: string,
+): StableDirectoryHandle[] {
+  if (process.platform === 'win32' || !isAbsolute(absolutePath)) {
+    throw new Error('This platform cannot perform a POSIX stable-root traversal');
+  }
+
+  const handles: StableDirectoryHandle[] = [];
+  let current: string = sep;
+  try {
+    handles.push(openStableDirectory(current, label));
+    const segments = absolutePath.split(sep).filter(Boolean);
+    for (const segment of segments) {
+      current = join(current, segment);
+      handles.push(openStableDirectory(
+        current,
+        label,
+        handles[handles.length - 1],
+        segment,
+      ));
+    }
+    return handles;
+  } catch (error) {
+    for (const handle of handles.reverse()) closeSync(handle.fd);
+    throw error;
+  }
+}
+
+function assertStableDirectory(handle: StableDirectoryHandle, label: string): void {
+  let opened: ReturnType<typeof fstatSync>;
+  let named: ReturnType<typeof lstatSync>;
+  try {
+    opened = fstatSync(handle.fd, { bigint: true });
+    named = lstatSync(handle.path, { bigint: true });
+  } catch (error) {
+    throw new Error(`${label} ancestor moved while the file was being read: ${handle.path}`, {
+      cause: error,
+    });
+  }
+  if (
+    !opened.isDirectory()
+    || named.isSymbolicLink()
+    || !named.isDirectory()
+    || opened.dev !== handle.dev
+    || opened.ino !== handle.ino
+    || named.dev !== handle.dev
+    || named.ino !== handle.ino
+  ) {
+    throw new Error(`${label} ancestor changed while the file was being read: ${handle.path}`);
+  }
+}
+
+function sameEntryRevision(
+  left: BigIntStats,
+  right: BigIntStats,
+): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mtimeNs === right.mtimeNs
+    && left.ctimeNs === right.ctimeNs
+    && left.nlink === right.nlink;
+}
+
+/**
+ * Read a relative file beneath one stable root without trusting pathname
+ * validation performed earlier. Every parent is opened with O_NOFOLLOW and
+ * held through the leaf read; the leaf must match the revision captured before
+ * open, and the complete directory chain is revalidated before and after I/O.
+ * A parent rename/symlink swap therefore produces no returned bytes.
+ */
+function readStableRootSnapshotWithLinks(
+  rootPath: string,
+  relativePath: string,
+  allowedLinkCounts: ReadonlySet<bigint>,
+  linkError: string,
+  hooks: StableRootReadHooks = {},
+): RedirectOriginalSnapshotWithLinks {
+  const root = resolve(rootPath);
+  const normalized = normalizeRelativePath(relativePath, 'stable-root file path');
+  const segments = normalized.split('/');
+  const leafPath = join(root, ...segments);
+  const handles: StableDirectoryHandle[] = [];
+  let leafFd: number | null = null;
+
+  try {
+    hooks.beforeRootOpen?.();
+    handles.push(...openStableAbsoluteDirectoryChain(root, 'Stable-root read'));
+    let current = root;
+    for (const segment of segments.slice(0, -1)) {
+      current = join(current, segment);
+      handles.push(openStableDirectory(
+        current,
+        'Stable-root read',
+        handles[handles.length - 1],
+        segment,
+      ));
+    }
+    for (const handle of handles) assertStableDirectory(handle, 'Stable-root read');
+
+    const before = lstatSync(leafPath, { bigint: true });
+    if (before.isSymbolicLink() || !before.isFile() || !allowedLinkCounts.has(before.nlink)) {
+      throw new Error(`${linkError}: ${leafPath}`);
+    }
+    // lstat(leaf) itself traverses parents; prove they still name the held
+    // directories before allowing the testable open boundary to proceed.
+    for (const handle of handles) assertStableDirectory(handle, 'Stable-root read');
+
+    hooks.beforeLeafOpen?.();
+
+    const noFollow = fsConstants.O_NOFOLLOW;
+    if (typeof noFollow !== 'number') {
+      throw new Error('This platform cannot perform a no-follow file read');
+    }
+    leafFd = openAtNoFollow(
+      handles[handles.length - 1].fd,
+      segments[segments.length - 1],
+      fsConstants.O_RDONLY | noFollow,
+    );
+    const opened = fstatSync(leafFd, { bigint: true });
+    if (
+      !opened.isFile()
+      || !allowedLinkCounts.has(opened.nlink)
+      || !sameEntryRevision(before, opened)
+    ) {
+      throw new Error(`Local original or an ancestor changed before it was opened; preserving it: ${leafPath}`);
+    }
+    for (const handle of handles) assertStableDirectory(handle, 'Stable-root read');
+
+    const content = readFileSync(leafFd);
+    const after = fstatSync(leafFd, { bigint: true });
+    const namedAfter = lstatSync(leafPath, { bigint: true });
     const beforeIdentity: RedirectOriginalIdentity = {
-      dev: before.dev,
-      ino: before.ino,
-      size: before.size,
-      mtimeNs: before.mtimeNs,
-      ctimeNs: before.ctimeNs,
+      dev: opened.dev,
+      ino: opened.ino,
+      size: opened.size,
+      mtimeNs: opened.mtimeNs,
+      ctimeNs: opened.ctimeNs,
       hash: sha256Hex(content),
     };
     const afterIdentity: RedirectOriginalIdentity = {
@@ -264,13 +517,80 @@ export function readRedirectOriginalSnapshot(path: string): RedirectOriginalSnap
       ctimeNs: after.ctimeNs,
       hash: beforeIdentity.hash,
     };
-    if (!sameRedirectOriginalIdentity(beforeIdentity, afterIdentity)) {
-      throw new Error(`Local original changed while it was being read; preserving it: ${path}`);
+    if (
+      after.nlink !== opened.nlink
+      || !allowedLinkCounts.has(after.nlink)
+      || !sameRedirectOriginalIdentity(beforeIdentity, afterIdentity)
+      || namedAfter.isSymbolicLink()
+      || !sameEntryRevision(namedAfter, after)
+    ) {
+      throw new Error(`Local original changed while it was being read; preserving it: ${leafPath}`);
     }
-    return { content, identity: afterIdentity };
+    for (const handle of handles) assertStableDirectory(handle, 'Stable-root read');
+    return {
+      snapshot: { content, identity: afterIdentity },
+      linkCount: after.nlink,
+    };
   } finally {
-    closeSync(fd);
+    if (leafFd !== null) closeSync(leafFd);
+    for (const handle of handles.reverse()) closeSync(handle.fd);
   }
+}
+
+function readRedirectOriginalSnapshotWithLinks(
+  path: string,
+  allowedLinkCounts: ReadonlySet<bigint>,
+  linkError: string,
+): RedirectOriginalSnapshotWithLinks {
+  const absolutePath = resolve(path);
+  const root = realpathSync.native(dirname(absolutePath));
+  return readStableRootSnapshotWithLinks(
+    root,
+    basename(absolutePath),
+    allowedLinkCounts,
+    linkError,
+  );
+}
+
+/**
+ * Read one regular-file revision through a no-follow descriptor and bind its
+ * bytes to stable filesystem identity. Metadata is checked on both sides of
+ * the read so a concurrent writer cannot silently produce a mixed snapshot.
+ */
+export function readRedirectOriginalSnapshot(path: string): RedirectOriginalSnapshot {
+  return readRedirectOriginalSnapshotWithLinks(
+    path,
+    new Set([1n]),
+    'Redirect original is not a single-link regular file',
+  ).snapshot;
+}
+
+/** Stable-root variant used by confined upload/sync/mirror flows. */
+export function readRedirectOriginalSnapshotWithinRoot(
+  root: string,
+  relativePath: string,
+  hooks: StableRootReadHooks = {},
+): RedirectOriginalSnapshot {
+  return readStableRootSnapshotWithLinks(
+    root,
+    relativePath,
+    new Set([1n]),
+    'Upload source is not a single-link regular file',
+    hooks,
+  ).snapshot;
+}
+
+/**
+ * Recovery alone may observe the two names intentionally created by the
+ * link-then-unlink no-clobber protocol. Callers must still prove that both
+ * names resolve to the same expected inode before retiring either one.
+ */
+function readRedirectRecoverySnapshot(path: string): RedirectOriginalSnapshotWithLinks {
+  return readRedirectOriginalSnapshotWithLinks(
+    path,
+    new Set([1n, 2n]),
+    'Redirect recovery artifact has an unsafe link count',
+  );
 }
 
 function isErrnoCode(error: unknown, code: string): boolean {
@@ -315,9 +635,10 @@ function restoreRedirectQuarantineNoClobber(
  * concurrently replaced pointer is restored with no-clobber semantics rather
  * than deleted. This keeps race recovery from turning into a second TOCTOU.
  */
-export function retireOwnedRedirectPointer(
+function retireOwnedRedirectPointerWithLinkCount(
   pointerPath: string,
   expected: RedirectOriginalSnapshot,
+  expectedLinkCount: bigint,
   trace?: RedirectDurabilityTrace,
 ): boolean {
   const quarantinePath = redirectQuarantinePath(pointerPath, 'pointer');
@@ -328,7 +649,18 @@ export function retireOwnedRedirectPointer(
     throw error;
   }
 
-  const captured = readRedirectOriginalSnapshot(quarantinePath);
+  let captured: RedirectOriginalSnapshot;
+  try {
+    captured = readRedirectOriginalSnapshotWithLinks(
+      quarantinePath,
+      new Set([expectedLinkCount]),
+      'Redirect pointer link count changed during retirement',
+    ).snapshot;
+  } catch (error) {
+    try { restoreRedirectQuarantineNoClobber(quarantinePath, pointerPath); }
+    catch { /* preserve the private quarantine as recovery evidence */ }
+    throw error;
+  }
   if (!sameRedirectOriginalRevision(expected.identity, captured.identity)
     || !captured.content.equals(expected.content)) {
     // A newer inode/revision won the race — even identical-looking bytes are
@@ -342,6 +674,14 @@ export function retireOwnedRedirectPointer(
   fsyncDirectory(dirname(pointerPath));
   trace?.('stale_pointer_retired');
   return true;
+}
+
+export function retireOwnedRedirectPointer(
+  pointerPath: string,
+  expected: RedirectOriginalSnapshot,
+  trace?: RedirectDurabilityTrace,
+): boolean {
+  return retireOwnedRedirectPointerWithLinkCount(pointerPath, expected, 1n, trace);
 }
 
 /** Recreate captured pointer bytes without overwriting a concurrently-created pointer. */
@@ -589,6 +929,451 @@ function fsyncDirectory(path: string): void {
   }
 }
 
+interface OwnedMirrorMarker {
+  root: string;
+  path: string;
+  snapshot: RedirectOriginalSnapshot;
+  marker: MarkerInfo;
+  fileCount: number;
+  paths: Set<string> | null;
+}
+
+function canonicalDirectory(path: string): string {
+  const canonical = realpathSync(resolve(path));
+  const stat = lstatSync(canonical);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error(`Expected a real directory: ${path}`);
+  }
+  return canonical;
+}
+
+/** Read and source-bind the one marker that authorizes mirror lifecycle writes. */
+function readOwnedMirrorMarker(dir: string, sourceId: string): OwnedMirrorMarker {
+  const root = canonicalDirectory(dir);
+  const path = join(root, '.supabase');
+  let snapshot: RedirectOriginalSnapshot;
+  try {
+    snapshot = readRedirectOriginalSnapshot(path);
+  } catch (error) {
+    if (isErrnoCode(error, 'ENOENT')) {
+      throw new Error(`Directory must be mirrored first: ${root}`);
+    }
+    throw new Error(`Invalid .supabase marker for ${root}: ${(error as Error).message}`);
+  }
+  const marker = parseMarkerContent(snapshot.content.toString('utf8'));
+  if (marker.source_id !== sourceId || marker.prefix !== `${sourceId}/`) {
+    throw new Error(
+      `Mirror marker source mismatch: expected source_id=${sourceId} and prefix=${sourceId}/`,
+    );
+  }
+  const fileCount = Number(marker.file_count);
+  if (!Number.isSafeInteger(fileCount) || fileCount < 0) {
+    throw new Error('Mirror marker has invalid file_count');
+  }
+  let paths: Set<string> | null = null;
+  let rawPaths: unknown = marker.paths;
+  if (rawPaths === undefined && marker.paths_json !== undefined) {
+    try { rawPaths = JSON.parse(marker.paths_json); }
+    catch { throw new Error('Mirror marker has invalid paths_json ledger'); }
+  }
+  if (rawPaths !== undefined) {
+    if (!Array.isArray(rawPaths) || !rawPaths.every(value => typeof value === 'string')) {
+      throw new Error('Mirror marker has invalid paths ledger');
+    }
+    paths = new Set(rawPaths.map(value => normalizeRelativePath(value, 'mirror marker path')));
+    if (paths.size !== rawPaths.length || paths.size !== fileCount) {
+      throw new Error('Mirror marker paths ledger does not match file_count');
+    }
+  }
+  return { root, path, snapshot, marker, fileCount, paths };
+}
+
+interface MirrorLocatorState {
+  logicalPaths: Set<string>;
+  pointers: Array<{ path: string; snapshot: RedirectOriginalSnapshot; redirect: ValidatedRedirect }>;
+}
+
+function collectMirrorLocatorState(root: string, sourceId: string): MirrorLocatorState {
+  const logicalPaths = new Set<string>();
+  const pointers: MirrorLocatorState['pointers'] = [];
+  const walk = (dir: string): void => {
+    for (const entry of readdirSync(dir).sort()) {
+      if (entry.startsWith('.') || entry === 'node_modules') continue;
+      const full = join(dir, entry);
+      const stat = lstatSync(full);
+      if (stat.isSymbolicLink()) continue;
+      if (stat.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (entry.endsWith('.redirect')) {
+        throw new Error(
+          `Legacy redirect is not a source-bound live locator; restore it before unmirroring: ${full}`,
+        );
+      }
+      if (entry.endsWith('.redirect.yaml')) {
+        const snapshot = readRedirectOriginalSnapshot(full);
+        const redirect = validateRedirectYamlForSource(
+          parseRedirectYamlContent(snapshot.content.toString('utf8')),
+          sourceId,
+        );
+        const original = full.slice(0, -'.redirect.yaml'.length);
+        const logicalPath = containedRelativePath(root, original, 'redirect original');
+        const expectedStoragePath = sourceQualifiedStoragePath(sourceId, logicalPath);
+        if (redirect.storagePath !== expectedStoragePath) {
+          throw new Error(
+            `Redirect is not recoverable through this mirror marker: ${full}`,
+          );
+        }
+        logicalPaths.add(logicalPath);
+        pointers.push({ path: full, snapshot, redirect });
+        continue;
+      }
+      if (!entry.endsWith('.md')) {
+        logicalPaths.add(containedRelativePath(root, full, 'mirror file'));
+      }
+    }
+  };
+  walk(root);
+  return { logicalPaths, pointers };
+}
+
+function normalizeRelativePath(value: string, label: string): string {
+  const normalized = value.replace(/\\/g, '/');
+  if (!normalized || isAbsolute(value) || /[\u0000-\u001f\u007f]/.test(normalized)) {
+    throw new Error(`Invalid ${label}`);
+  }
+  const segments = normalized.split('/');
+  if (segments.some(segment => !segment || segment === '.' || segment === '..')) {
+    throw new Error(`Invalid ${label}`);
+  }
+  return normalized;
+}
+
+function containedRelativePath(root: string, candidate: string, label: string): string {
+  const rel = relative(root, candidate);
+  if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error(`${label} is outside the mirror root`);
+  }
+  return normalizeRelativePath(rel, label);
+}
+
+function pathFromSafeRelative(root: string, rel: string, label: string): string {
+  const normalized = normalizeRelativePath(rel, label);
+  const candidate = resolve(root, ...normalized.split('/'));
+  const check = relative(root, candidate);
+  if (!check || check === '..' || check.startsWith(`..${sep}`) || isAbsolute(check)) {
+    throw new Error(`${label} escapes its root`);
+  }
+  return candidate;
+}
+
+function writeJsonDurableAtomic(path: string, value: unknown): void {
+  const parent = dirname(path);
+  const tmp = join(parent, `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
+  const noFollow = typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0;
+  let fd: number | null = null;
+  try {
+    fd = openSync(
+      tmp,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | noFollow,
+      0o600,
+    );
+    writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+    renameSync(tmp, path);
+    fsyncDirectory(parent);
+  } finally {
+    if (fd !== null) closeSync(fd);
+    if (existsSync(tmp)) unlinkSync(tmp);
+  }
+}
+
+const CLEAN_QUARANTINE_PREFIX = '.gbrain-pointer-quarantine';
+const CLEAN_JOURNAL_FILE = 'MANIFEST.json';
+
+type CleanJournalState = 'prepared' | 'complete' | 'rolled_back';
+
+interface CleanJournalPointer {
+  original_path: string;
+  quarantine_path: string;
+  pointer_sha256: string;
+  storage_path: string;
+  expected_sha256: string;
+  expected_size?: number;
+}
+
+interface CleanJournal {
+  schema_version: 1;
+  state: CleanJournalState;
+  source_id: string;
+  prepared_at: string;
+  completed_at?: string;
+  rolled_back_at?: string;
+  pointers: CleanJournalPointer[];
+}
+
+interface VerifiedCleanPointer {
+  path: string;
+  snapshot: RedirectOriginalSnapshot;
+  redirect: ValidatedRedirect;
+}
+
+function listCleanJournalRoots(root: string): string[] {
+  const roots: string[] = [];
+  for (const entry of readdirSync(root).sort()) {
+    if (!entry.startsWith(CLEAN_QUARANTINE_PREFIX)) continue;
+    const candidate = join(root, entry);
+    const stat = lstatSync(candidate);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+      throw new Error(`Refusing unsafe clean quarantine path: ${candidate}`);
+    }
+    if (entry === CLEAN_QUARANTINE_PREFIX) {
+      // Compatibility with the short-lived nested layout: the shared ancestor
+      // itself is never trusted, but real child run directories can be read for
+      // recovery after proving every component is a regular directory.
+      for (const child of readdirSync(candidate).sort()) {
+        const run = join(candidate, child);
+        const childStat = lstatSync(run);
+        if (!childStat.isDirectory() || childStat.isSymbolicLink()) {
+          throw new Error(`Refusing unsafe clean quarantine run: ${run}`);
+        }
+        roots.push(run);
+      }
+    } else {
+      roots.push(candidate);
+    }
+  }
+  return roots;
+}
+
+function readCleanJournal(runRoot: string): CleanJournal {
+  const snapshot = readRedirectOriginalSnapshot(join(runRoot, CLEAN_JOURNAL_FILE));
+  let raw: unknown;
+  try {
+    raw = JSON.parse(snapshot.content.toString('utf8'));
+  } catch {
+    throw new Error(`Invalid clean recovery journal: ${runRoot}`);
+  }
+  const journal = raw as Partial<CleanJournal>;
+  if (journal.schema_version !== 1 ||
+      !['prepared', 'complete', 'rolled_back'].includes(String(journal.state)) ||
+      typeof journal.source_id !== 'string' || !Array.isArray(journal.pointers)) {
+    throw new Error(`Invalid clean recovery journal schema: ${runRoot}`);
+  }
+  for (const pointer of journal.pointers) {
+    normalizeRelativePath(pointer.original_path, 'journal original_path');
+    normalizeRelativePath(pointer.quarantine_path, 'journal quarantine_path');
+    if (!/^[a-f0-9]{64}$/.test(pointer.pointer_sha256) ||
+        !/^[a-f0-9]{64}$/.test(pointer.expected_sha256) ||
+        typeof pointer.storage_path !== 'string') {
+      throw new Error(`Invalid clean recovery journal pointer: ${runRoot}`);
+    }
+  }
+  return journal as CleanJournal;
+}
+
+function recoverCleanJournalRun(runRoot: string, root: string, sourceId: string): boolean {
+  const journal = readCleanJournal(runRoot);
+  if (journal.source_id !== sourceId) {
+    throw new Error(
+      `Clean recovery journal belongs to source ${journal.source_id}, not ${sourceId}: ${runRoot}`,
+    );
+  }
+  if (journal.state !== 'prepared') return false;
+
+  for (const item of journal.pointers) {
+    const original = pathFromSafeRelative(root, item.original_path, 'journal original_path');
+    const quarantine = pathFromSafeRelative(runRoot, item.quarantine_path, 'journal quarantine_path');
+    const originalExists = existsSync(original);
+    const quarantineExists = existsSync(quarantine);
+    if (!originalExists && !quarantineExists) {
+      throw new Error(`Clean recovery lost both pointer copies: ${item.original_path}`);
+    }
+
+    let quarantineSnapshot: RedirectOriginalSnapshotWithLinks | null = null;
+    if (quarantineExists) {
+      quarantineSnapshot = readRedirectRecoverySnapshot(quarantine);
+      if (sha256Hex(quarantineSnapshot.snapshot.content) !== item.pointer_sha256) {
+        throw new Error(`Clean recovery quarantine changed: ${item.quarantine_path}`);
+      }
+    }
+    if (originalExists) {
+      const live = readRedirectRecoverySnapshot(original);
+      if (sha256Hex(live.snapshot.content) !== item.pointer_sha256) {
+        throw new Error(`Clean recovery found a newer live pointer: ${item.original_path}`);
+      }
+      if (quarantineSnapshot) {
+        const hasRecoveryHardlink = quarantineSnapshot.linkCount === 2n || live.linkCount === 2n;
+        if (hasRecoveryHardlink && (
+          quarantineSnapshot.linkCount !== 2n ||
+          live.linkCount !== 2n ||
+          !sameRedirectSnapshot(quarantineSnapshot.snapshot, live.snapshot)
+        )) {
+          throw new Error(
+            `Clean recovery found an unowned hardlink instead of its exact live pointer: ${item.original_path}`,
+          );
+        }
+        if (!hasRecoveryHardlink && (
+          quarantineSnapshot.linkCount !== 1n || live.linkCount !== 1n
+        )) {
+          throw new Error(`Clean recovery found an unsafe pointer link count: ${item.original_path}`);
+        }
+        if (!retireOwnedRedirectPointerWithLinkCount(
+          quarantine,
+          quarantineSnapshot.snapshot,
+          quarantineSnapshot.linkCount,
+        )) {
+          throw new Error(`Clean recovery could not retire duplicate quarantine: ${item.quarantine_path}`);
+        }
+        const remaining = readRedirectOriginalSnapshot(original);
+        if (!sameRedirectSnapshot(live.snapshot, remaining)) {
+          throw new Error(`Clean recovery live pointer changed during retirement: ${item.original_path}`);
+        }
+      } else if (live.linkCount !== 1n) {
+        throw new Error(`Clean recovery found an unowned hardlink: ${item.original_path}`);
+      }
+      continue;
+    }
+    if (!quarantineSnapshot || quarantineSnapshot.linkCount !== 1n ||
+        !restoreRedirectQuarantineNoClobber(quarantine, original)) {
+      throw new Error(`Clean recovery could not restore pointer: ${item.original_path}`);
+    }
+    fsyncDirectory(dirname(quarantine));
+  }
+
+  writeJsonDurableAtomic(join(runRoot, CLEAN_JOURNAL_FILE), {
+    ...journal,
+    state: 'rolled_back',
+    rolled_back_at: new Date().toISOString(),
+  } satisfies CleanJournal);
+  return true;
+}
+
+function inspectCleanJournals(
+  dir: string,
+  sourceId: string,
+): { root: string; records: Array<{ runRoot: string; journal: CleanJournal }> } {
+  const root = canonicalDirectory(dir);
+  const journalRoots = listCleanJournalRoots(root);
+  const records: Array<{ runRoot: string; journal: CleanJournal }> = [];
+  for (const runRoot of journalRoots) {
+    const journal = readCleanJournal(runRoot);
+    if (journal.source_id !== sourceId) {
+      throw new Error(
+        `Clean recovery journal belongs to source ${journal.source_id}, not ${sourceId}: ${runRoot}`,
+      );
+    }
+    records.push({ runRoot, journal });
+  }
+  return { root, records };
+}
+
+/** Validate journal ownership/shape without performing recovery (dry-run safe). */
+function inspectCleanJournalsReadOnly(dir: string, sourceId: string): void {
+  inspectCleanJournals(dir, sourceId);
+}
+
+function completedCleanLogicalPaths(dir: string, sourceId: string): Set<string> {
+  const paths = new Set<string>();
+  for (const { journal } of inspectCleanJournals(dir, sourceId).records) {
+    if (journal.state !== 'complete') continue;
+    for (const pointer of journal.pointers) {
+      const logicalPath = pointer.original_path
+        .replace(/\.redirect\.yaml$/, '')
+        .replace(/\.redirect$/, '');
+      paths.add(normalizeRelativePath(logicalPath, 'clean journal logical path'));
+    }
+  }
+  return paths;
+}
+
+/** Recover every pre-commit pointer retirement before a mutating lifecycle action. */
+export function recoverInterruptedCleanJournals(dir: string, sourceId: string): number {
+  const { root, records } = inspectCleanJournals(dir, sourceId);
+  // The complete set was validated before the first recovery mutation. A
+  // command routed to the wrong source therefore has zero filesystem effects.
+  let recovered = 0;
+  for (const { runRoot } of records) {
+    if (recoverCleanJournalRun(runRoot, root, sourceId)) recovered++;
+  }
+  return recovered;
+}
+
+function retireVerifiedPointersWithJournal(
+  dir: string,
+  sourceId: string,
+  verified: VerifiedCleanPointer[],
+): string {
+  const root = canonicalDirectory(dir);
+  const runRoot = join(
+    root,
+    `${CLEAN_QUARANTINE_PREFIX}-${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID()}`,
+  );
+  // Direct, exclusive child creation removes the old repo-controlled shared
+  // ancestor. Recursive mkdir begins only below this newly-owned directory.
+  mkdirSync(runRoot, { mode: 0o700 });
+  const runStat = lstatSync(runRoot);
+  const currentUid = typeof process.getuid === 'function' ? process.getuid() : runStat.uid;
+  if (!runStat.isDirectory() || runStat.isSymbolicLink() || runStat.uid !== currentUid ||
+      (runStat.mode & 0o077) !== 0 || dirname(realpathSync(runRoot)) !== root) {
+    throw new Error(`Refusing unsafe clean quarantine root: ${runRoot}`);
+  }
+
+  const journal: CleanJournal = {
+    schema_version: 1,
+    state: 'prepared',
+    source_id: sourceId,
+    prepared_at: new Date().toISOString(),
+    pointers: verified.map(item => {
+      const originalPath = containedRelativePath(root, item.path, 'redirect pointer');
+      return {
+        original_path: originalPath,
+        quarantine_path: originalPath,
+        pointer_sha256: sha256Hex(item.snapshot.content),
+        storage_path: item.redirect.storagePath,
+        expected_sha256: item.redirect.expectedSha256,
+        ...(item.redirect.expectedSize === undefined ? {} : { expected_size: item.redirect.expectedSize }),
+      };
+    }),
+  };
+  writeJsonDurableAtomic(join(runRoot, CLEAN_JOURNAL_FILE), journal);
+
+  try {
+    for (let index = 0; index < verified.length; index++) {
+      const item = verified[index];
+      const journalItem = journal.pointers[index];
+      const quarantine = pathFromSafeRelative(runRoot, journalItem.quarantine_path, 'journal quarantine_path');
+      mkdirSync(dirname(quarantine), { recursive: true, mode: 0o700 });
+      renameSync(item.path, quarantine);
+      const captured = readRedirectOriginalSnapshot(quarantine);
+      if (!sameRedirectSnapshot(item.snapshot, captured) || existsSync(item.path)) {
+        throw new Error(`Redirect was replaced during clean retirement: ${item.path}`);
+      }
+      fsyncDirectory(dirname(item.path));
+      fsyncDirectory(dirname(quarantine));
+    }
+    writeJsonDurableAtomic(join(runRoot, CLEAN_JOURNAL_FILE), {
+      ...journal,
+      state: 'complete',
+      completed_at: new Date().toISOString(),
+    } satisfies CleanJournal);
+    return runRoot;
+  } catch (error) {
+    try {
+      recoverCleanJournalRun(runRoot, root, sourceId);
+    } catch (recoveryError) {
+      throw new Error(
+        `Clean retirement failed and durable recovery needs attention: ${(recoveryError as Error).message}`,
+        { cause: error },
+      );
+    }
+    throw error;
+  }
+}
+
 /**
  * Durably promote already-verified bytes without exposing a partial target.
  *
@@ -687,7 +1472,7 @@ async function uploadFile(engine: BrainEngine, sourceId: string, args: string[])
   if (!config?.storage) {
     throw new Error('No storage backend configured. Refusing to create file metadata without stored bytes.');
   }
-  const content = readFileSync(filePath);
+  const content = readRedirectOriginalSnapshot(filePath).content;
   const filename = basename(filePath);
   const hash = sha256Hex(content);
   const logicalPath = pageSlug ? `${pageSlug}/${filename}` : `unsorted/${hash.slice(0, 8)}-${filename}`;
@@ -736,7 +1521,11 @@ async function uploadRaw(engine: BrainEngine, sourceId: string, args: string[]) 
     process.exit(1);
   }
 
-  const stat = statSync(filePath);
+  // Bind routing + uploaded bytes to one no-follow regular-file snapshot.
+  // A path swapped to a symlink after argument parsing must never redirect an
+  // upload outside the tree.
+  const original = readRedirectOriginalSnapshot(filePath);
+  const stat = { size: original.content.byteLength };
   const filename = basename(filePath);
   const mimeType = getMimeType(filePath);
   const isMedia = mimeType?.startsWith('video/') || mimeType?.startsWith('audio/') || mimeType?.startsWith('image/');
@@ -763,7 +1552,7 @@ async function uploadRaw(engine: BrainEngine, sourceId: string, args: string[]) 
     process.exit(1);
   }
 
-  const content = readFileSync(filePath);
+  const content = original.content;
   const hash = sha256Hex(content);
   const logicalPath = pageSlug ? `${pageSlug}/${filename}` : `unsorted/${hash.slice(0, 8)}-${filename}`;
   const bucket = (config.storage as any).bucket || 'brain-files';
@@ -798,6 +1587,7 @@ async function uploadRaw(engine: BrainEngine, sourceId: string, args: string[]) 
       hash: `sha256:${hash}`,
       mime: mimeType || 'application/octet-stream',
       uploaded: new Date().toISOString(),
+      source_id: sourceId,
       ...(fileType ? { type: fileType } : {}),
     });
     // Write pointer next to the original file
@@ -853,7 +1643,8 @@ async function syncFiles(engine: BrainEngine, sourceId: string, dir?: string) {
     process.exit(1);
   }
 
-  const files = collectFiles(dir);
+  const root = canonicalDirectory(dir);
+  const files = collectFiles(root);
   console.log(`Found ${files.length} files to sync`);
 
   const { loadConfig } = await import('../core/config.ts');
@@ -872,11 +1663,11 @@ async function syncFiles(engine: BrainEngine, sourceId: string, dir?: string) {
 
   for (let i = 0; i < files.length; i++) {
     const filePath = files[i];
-    const relativePath = relative(dir, filePath);
+    const relativePath = containedRelativePath(root, filePath, 'sync file');
 
     progress.tick(1);
 
-    const content = readFileSync(filePath);
+    const content = readRedirectOriginalSnapshotWithinRoot(root, relativePath).content;
     const filename = basename(filePath);
     const mimeType = getMimeType(filePath);
 
@@ -988,6 +1779,20 @@ async function mirrorFiles(sourceId: string, args: string[]) {
   const dryRun = args.includes('--dry-run');
   if (!dir || !existsSync(dir)) { console.error('Usage: gbrain files mirror <dir> [--dry-run]'); process.exit(1); }
 
+  const root = canonicalDirectory(dir);
+  const markerPath = join(root, '.supabase');
+  let existingMarker: OwnedMirrorMarker | null = null;
+  try {
+    lstatSync(markerPath);
+    existingMarker = readOwnedMirrorMarker(root, sourceId);
+  } catch (error) {
+    if (!isErrnoCode(error, 'ENOENT')) throw error;
+  }
+  if (dryRun) inspectCleanJournalsReadOnly(root, sourceId);
+  else recoverInterruptedCleanJournals(root, sourceId);
+  // Validate all existing pointer metadata before considering a marker write.
+  collectMirrorLocatorState(root, sourceId);
+
   const { createStorage } = await import('../core/storage.ts');
   const { loadConfig } = await import('../core/config.ts');
   const { stringify } = await import('../core/yaml-lite.ts');
@@ -995,12 +1800,25 @@ async function mirrorFiles(sourceId: string, args: string[]) {
   if (!config?.storage) { console.error('No storage backend configured. Run gbrain init with storage settings.'); process.exit(1); }
 
   const storage = await createStorage(config.storage as any);
-  const files = collectFiles(dir);
+  const files = collectFiles(root);
+  const currentPaths = new Set(
+    files.map(file => containedRelativePath(root, file, 'mirror file')),
+  );
+  let exactPaths = new Set<string>();
+  if (existingMarker?.paths) {
+    exactPaths = new Set(existingMarker.paths);
+  } else if ((existingMarker?.fileCount ?? 0) > 0) {
+    throw new Error(
+      'Existing count-only mirror marker cannot prove exact historical paths; refusing automatic ledger adoption',
+    );
+  }
+  for (const path of completedCleanLogicalPaths(root, sourceId)) exactPaths.add(path);
+  for (const path of currentPaths) exactPaths.add(path);
   console.log(`Found ${files.length} files to mirror`);
 
   if (dryRun) {
     for (const f of files) {
-      console.log(`  Would upload: ${sourceQualifiedStoragePath(sourceId, relative(dir, f))}`);
+      console.log(`  Would upload: ${sourceQualifiedStoragePath(sourceId, relative(root, f))}`);
     }
     console.log(`\nDry run: ${files.length} files would be uploaded.`);
     return;
@@ -1008,9 +1826,9 @@ async function mirrorFiles(sourceId: string, args: string[]) {
 
   let uploaded = 0;
   for (const filePath of files) {
-    const relPath = relative(dir, filePath);
+    const relPath = relative(root, filePath);
     const storagePath = sourceQualifiedStoragePath(sourceId, relPath);
-    const data = readFileSync(filePath);
+    const data = readRedirectOriginalSnapshotWithinRoot(root, relPath).content;
     const mime = getMimeType(filePath);
     await storage.upload(storagePath, data, mime || undefined);
     uploaded++;
@@ -1022,40 +1840,59 @@ async function mirrorFiles(sourceId: string, args: string[]) {
     bucket: (config.storage as { bucket?: string })?.bucket || 'brain-files',
     source_id: sourceId,
     prefix: `${sourceId}/`,
-    file_count: uploaded,
+    file_count: exactPaths.size,
+    paths_json: JSON.stringify([...exactPaths].sort()),
   });
-  writeFileSync(join(dir, '.supabase'), marker);
+  writeRedirectPointerDurable(markerPath, marker);
 
-  console.log(`Mirrored ${uploaded} files. Marker written to ${dir}/.supabase`);
+  console.log(`Mirrored ${uploaded} files. Marker written to ${markerPath}`);
 }
 
-async function unmirrorFiles(args: string[]) {
+async function unmirrorFiles(sourceId: string, args: string[]) {
   const dir = args.find(a => !a.startsWith('--'));
   if (!dir) { console.error('Usage: gbrain files unmirror <dir>'); process.exit(1); }
 
-  const markerPath = join(dir, '.supabase');
-  if (existsSync(markerPath)) {
-    unlinkSync(markerPath);
-    console.log(`Removed mirror marker from ${dir}. Files remain in storage.`);
-  } else {
-    console.log(`No mirror marker found in ${dir}. Nothing to do.`);
+  const root = canonicalDirectory(dir);
+  const markerPath = join(root, '.supabase');
+  try { lstatSync(markerPath); }
+  catch (error) {
+    if (!isErrnoCode(error, 'ENOENT')) throw error;
+    console.log(`No mirror marker found in ${root}. Nothing to do.`);
+    return;
   }
+  const owned = readOwnedMirrorMarker(root, sourceId);
+  if (owned.fileCount > 0 && !owned.paths) {
+    throw new Error(
+      'Refusing to unmirror: count-only marker has no exact paths ledger; re-mirror with a source-safe version first',
+    );
+  }
+  recoverInterruptedCleanJournals(root, sourceId);
+  const locatorState = collectMirrorLocatorState(root, sourceId);
+  const missingPaths = [...(owned.paths ?? [])]
+    .filter(path => !locatorState.logicalPaths.has(path));
+  if (missingPaths.length > 0) {
+    throw new Error(
+      `Refusing to unmirror: the .supabase marker is the last live locator for ` +
+      `${missingPaths.length} cloud-only file(s) (first: ${missingPaths[0]})`,
+    );
+  }
+  if (!retireOwnedRedirectPointer(owned.path, owned.snapshot)) {
+    throw new Error('Mirror marker changed during unmirror; it was preserved');
+  }
+  console.log(`Removed mirror marker from ${root}. Files remain in storage.`);
 }
 
-async function redirectFiles(args: string[]) {
+async function redirectFiles(sourceId: string, args: string[]) {
   const dir = args.find(a => !a.startsWith('--'));
   const dryRun = args.includes('--dry-run');
   if (!dir || !existsSync(dir)) { console.error('Usage: gbrain files redirect <dir> [--dry-run]'); process.exit(1); }
 
-  const markerPath = join(dir, '.supabase');
-  if (!existsSync(markerPath)) {
-    console.error('Directory must be mirrored first. Run: gbrain files mirror <dir>');
-    process.exit(1);
-  }
-
-  const { parse: parseYaml, stringify } = await import('../core/yaml-lite.ts');
-  const marker = parseYaml(readFileSync(markerPath, 'utf-8'));
-  const files = collectFiles(dir);
+  const owned = readOwnedMirrorMarker(dir, sourceId);
+  if (dryRun) inspectCleanJournalsReadOnly(owned.root, sourceId);
+  else recoverInterruptedCleanJournals(owned.root, sourceId);
+  const { stringify } = await import('../core/yaml-lite.ts');
+  const marker = owned.marker;
+  const files = collectFiles(owned.root);
 
   const { loadConfig } = await import('../core/config.ts');
   const config = loadConfig();
@@ -1066,23 +1903,19 @@ async function redirectFiles(args: string[]) {
   const storage = await createStorage(config.storage as any);
 
   if (dryRun) {
-    for (const f of files) { console.log(`  Would redirect: ${relative(dir, f)}`); }
+    for (const f of files) { console.log(`  Would redirect: ${relative(owned.root, f)}`); }
     console.log(`\nDry run: ${files.length} files would be redirected.`);
     return;
   }
 
   let redirected = 0;
   for (const filePath of files) {
-    const relPath = relative(dir, filePath);
-    // New markers bind the exact source-qualified object namespace. Legacy
-    // markers lack source_id and keep their historical bare-path read only.
-    const storagePath = typeof marker.source_id === 'string'
-      ? sourceQualifiedStoragePath(marker.source_id, relPath)
-      : relPath;
+    const relPath = relative(owned.root, filePath);
+    const storagePath = sourceQualifiedStoragePath(sourceId, relPath);
     // Bind upload + pointer metadata to the exact local revision observed
     // before network I/O. A final identity/hash check prevents a concurrent
     // replacement from being unlinked after a newer revision arrives.
-    const original = readRedirectOriginalSnapshot(filePath);
+    const original = readRedirectOriginalSnapshotWithinRoot(owned.root, relPath);
     const content = original.content;
     const hash = sha256Hex(content);
     const mimeType = getMimeType(filePath);
@@ -1101,6 +1934,7 @@ async function redirectFiles(args: string[]) {
       hash: `sha256:${hash}`,
       mime: mimeType || 'application/octet-stream',
       uploaded: new Date().toISOString(),
+      source_id: sourceId,
     });
     const pointerPath = filePath + '.redirect.yaml';
     replaceLocalWithRedirectDurableGuarded(
@@ -1116,7 +1950,7 @@ async function redirectFiles(args: string[]) {
   console.log('To undo: gbrain files restore <dir>');
 }
 
-async function restoreFiles(args: string[]) {
+async function restoreFiles(sourceId: string, args: string[]) {
   const dir = args.find(a => !a.startsWith('--'));
   if (!dir || !existsSync(dir)) { console.error('Usage: gbrain files restore <dir>'); process.exit(1); }
 
@@ -1126,6 +1960,7 @@ async function restoreFiles(args: string[]) {
   if (!config?.storage) { console.error('No storage backend configured.'); process.exit(1); }
 
   const storage = await createStorage(config.storage as any);
+  const allowLegacy = args.includes('--allow-legacy-unqualified') && args.includes('--yes');
   const redirectFiles: string[] = [];
 
   function findRedirects(d: string) {
@@ -1152,8 +1987,18 @@ async function restoreFiles(args: string[]) {
     try {
       const pointerSnapshot = readRedirectOriginalSnapshot(redirectPath);
       const redirect = redirectPath.endsWith('.redirect.yaml')
-        ? validateRedirectYaml(parseRedirectYamlContent(pointerSnapshot.content.toString('utf8')))
-        : validateLegacyRedirect(parseRedirectContent(pointerSnapshot.content.toString('utf8')));
+        ? validateRedirectYamlForSource(
+            parseRedirectYamlContent(pointerSnapshot.content.toString('utf8')),
+            sourceId,
+            { allowLegacyUnqualified: allowLegacy },
+          )
+        : allowLegacy
+          ? validateLegacyRedirect(parseRedirectContent(pointerSnapshot.content.toString('utf8')))
+          : (() => {
+              throw new Error(
+                'Legacy unqualified redirect requires --allow-legacy-unqualified --yes for one-time restoration',
+              );
+            })();
       const data = await storage.download(redirect.storagePath);
       // Verification precedes every local write. A corrupt/truncated download
       // leaves both the prior local state and pointer untouched.
@@ -1196,7 +2041,7 @@ async function restoreFiles(args: string[]) {
   }
 }
 
-async function cleanFiles(args: string[]) {
+async function cleanFiles(sourceId: string, args: string[]) {
   const dir = args.find(a => !a.startsWith('--'));
   const confirmed = args.includes('--yes');
   if (!dir || !existsSync(dir)) { console.error('Usage: gbrain files clean <dir> [--yes]'); process.exit(1); }
@@ -1209,25 +2054,59 @@ async function cleanFiles(args: string[]) {
     process.exit(1);
   }
 
-  let cleaned = 0;
-  function findAndClean(d: string) {
-    for (const entry of readdirSync(d)) {
-      if (entry.startsWith('.')) continue;
-      const full = join(d, entry);
-      let stat;
-      try {
-        stat = lstatSync(full);
-      } catch {
-        continue; // Broken symlink or permission error
-      }
-      if (stat.isSymbolicLink()) continue;
-      if (stat.isDirectory()) findAndClean(full);
-      else if (entry.endsWith('.redirect.yaml') || entry.endsWith('.redirect')) { unlinkSync(full); cleaned++; }
+  const { createStorage } = await import('../core/storage.ts');
+  const { loadConfig } = await import('../core/config.ts');
+  const owned = readOwnedMirrorMarker(dir, sourceId);
+  recoverInterruptedCleanJournals(owned.root, sourceId);
+  const locatorState = collectMirrorLocatorState(owned.root, sourceId);
+  if (locatorState.pointers.length === 0) {
+    console.log('No source-bound redirect breadcrumbs to clean.');
+    return;
+  }
+  const pointerLogicalPaths = new Set(
+    locatorState.pointers.map(pointer => containedRelativePath(
+      owned.root,
+      pointer.path.slice(0, -'.redirect.yaml'.length),
+      'redirect original',
+    )),
+  );
+  if (owned.paths) {
+    const outsideLedger = [...pointerLogicalPaths].find(path => !owned.paths!.has(path));
+    if (outsideLedger) {
+      throw new Error(`Redirect is absent from the mirror paths ledger: ${outsideLedger}`);
+    }
+  } else {
+    throw new Error(
+      'Count-only mirror marker cannot prove exact historical paths; refusing automatic ledger adoption',
+    );
+  }
+  const config = loadConfig();
+  if (!config?.storage) throw new Error('No storage backend configured. Refusing pointer cleanup.');
+  const storage = await createStorage(config.storage as any);
+
+  // Phase 1: verify every cloud object and capture every exact pointer revision.
+  // Any failure here leaves the whole tree untouched.
+  const verified: VerifiedCleanPointer[] = [];
+  for (const pointer of locatorState.pointers) {
+    const data = await storage.download(pointer.redirect.storagePath);
+    verifyRedirectBytes(data, pointer.redirect, pointer.path);
+    verified.push(pointer);
+  }
+
+  // Recheck the complete set before the first mutation. The per-pointer
+  // quarantine check below closes the remaining compare-to-rename race.
+  for (const item of verified) {
+    if (!sameRedirectSnapshot(item.snapshot, readRedirectOriginalSnapshot(item.path))) {
+      throw new Error(`Redirect changed during clean preflight; zero pointers retired: ${item.path}`);
     }
   }
-  findAndClean(dir);
 
-  console.log(`Cleaned ${cleaned} redirect breadcrumbs. Cloud storage is now the only source.`);
+  const quarantineRoot = retireVerifiedPointersWithJournal(owned.root, sourceId, verified);
+
+  console.log(
+    `Quarantined ${verified.length} verified redirect breadcrumbs under ${quarantineRoot}. ` +
+    'Cloud bytes were hash/size verified before retirement.',
+  );
 }
 
 async function filesStatus(args: string[]) {

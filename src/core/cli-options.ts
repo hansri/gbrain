@@ -197,6 +197,12 @@ export function _resetCliOptionsForTest(): void {
  * unchanged for the common no-flag case).
  */
 export function childGlobalFlags(cliOpts?: CliOptions): string {
+  const parts = childGlobalArgs(cliOpts);
+  return parts.length > 0 ? ' ' + parts.join(' ') : '';
+}
+
+/** Structured equivalent for subprocess APIs that deliberately avoid shell. */
+export function childGlobalArgs(cliOpts?: CliOptions): string[] {
   const opts = cliOpts ?? activeCliOptions;
   const parts: string[] = [];
   if (opts.quiet) parts.push('--quiet');
@@ -204,7 +210,7 @@ export function childGlobalFlags(cliOpts?: CliOptions): string {
   if (opts.progressInterval !== DEFAULT_CLI_OPTIONS.progressInterval) {
     parts.push(`--progress-interval=${opts.progressInterval}`);
   }
-  return parts.length > 0 ? ' ' + parts.join(' ') : '';
+  return parts;
 }
 
 // ============================================================

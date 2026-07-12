@@ -4,13 +4,16 @@
  */
 
 import { lstatSync, realpathSync } from 'fs';
-import { resolve, relative, sep } from 'path';
+import { dirname, resolve, relative, sep } from 'path';
 import type { BrainEngine } from './engine.ts';
 import { clampSearchLimit } from './engine.ts';
 import type { GBrainConfig } from './config.ts';
 import type { PageType } from './types.ts';
 import { importFromContent } from './import-file.ts';
-import { withSourceWriterLease } from './source-writer-lease.ts';
+import {
+  assertSourceWriterLeaseAtCommit,
+  withSourceWriterLease,
+} from './source-writer-lease.ts';
 import { writePageThrough } from './write-through.ts';
 import { hybridSearch, hybridSearchCached, stampContentFlags } from './search/hybrid.ts';
 import { normalizeSearchDateWindow } from './search/date-window.ts';
@@ -330,8 +333,8 @@ export interface OperationContext {
    * through this field. put_page enforces it BEFORE the legacy
    * `wiki/agents/<id>/...` namespace check.
    *
-   * Trust comes from the SUBMITTER (subagent jobs are gated by
-   * PROTECTED_JOB_NAMES — MCP cannot submit them), not from `remote`.
+   * Trust comes from the server-owned cycle submission capability, not from
+   * caller-selected job names or from `remote`.
    * Every subagent tool call has `remote=true` for auto-link safety,
    * so basing trust on `remote` is incoherent (would always reject).
    *
@@ -410,29 +413,39 @@ export interface OperationContext {
  * engine call.
  *
  * Precedence:
- *  1. `ctx.auth?.allowedSources` (federated read, #876) → emits
+ *  1. Non-empty `ctx.auth?.allowedSources` (federated read, #876) → emits
  *     `{sourceIds: [...]}`. Federated semantics subsume the scalar case.
- *  2. `ctx.sourceId` (scalar) → emits `{sourceId: '...'}`.
- *  3. Neither set → emits `{}`. Local CLI callers (and tests that don't
- *     populate ctx) keep the pre-v0.34 unscoped behavior.
+ *  2. `ctx.sourceId` (scalar) → emits `{sourceId: '...'}` and is the
+ *     singleton remote grant when the federated list is absent or empty.
+ *  3. Neither set → trusted local CLI callers keep the pre-v0.34 unscoped
+ *     behavior; remote callers are rejected instead of widening to all sources.
  *
- * Both fields default to the engine's "no filter" behavior individually,
- * so unset values are safe — the engine sees the same shape it did
- * pre-v0.34. The leak this guards against is an authenticated MCP client
- * whose ctx.sourceId IS set but whose engine call was constructed without
- * threading it (operations.ts:968/1076/1092/935/1469/1471/2241 pre-fix).
+ * Trusted local callers may still omit both fields to request the engine's
+ * historical unfiltered behavior. Remote callers never receive that fallback.
+ * The leak this guards against is an authenticated MCP client whose
+ * ctx.sourceId IS set but whose engine call was constructed without threading
+ * it (operations.ts:968/1076/1092/935/1469/1471/2241 pre-fix).
  *
  * Helper rather than inline so every read-side handler routes through the
  * same precedence ladder — drift between sites is the bug class.
  */
+function effectiveRemoteSourceGrant(ctx: OperationContext): readonly string[] {
+  const allowed = ctx.auth?.allowedSources;
+  if (allowed && allowed.length > 0) return allowed;
+  return ctx.sourceId ? [ctx.sourceId] : [];
+}
+
 export function sourceScopeOpts(ctx: OperationContext): { sourceId?: string; sourceIds?: string[] } {
   const allowed = ctx.auth?.allowedSources;
-  // Treat an empty `allowedSources: []` as "no federated read scope" — the
-  // op-handler defers to scalar `ctx.sourceId` below. An attacker-controlled
-  // value of `[]` MUST NOT widen scope to "all sources" by being interpreted
-  // as "no filter."
   if (allowed && allowed.length > 0) return { sourceIds: allowed };
   if (ctx.sourceId) return { sourceId: ctx.sourceId };
+  if (ctx.remote !== false) {
+    throw new OperationError(
+      'permission_denied',
+      'No source in scope for this request.',
+      'Check the caller source grant.',
+    );
+  }
   return {};
 }
 
@@ -474,8 +487,10 @@ export function linkReadScopeOpts(ctx: OperationContext): { sourceId?: string; s
  *       trusted local (remote === false) → `{}` (spans the whole brain)
  *       remote                           → the caller's grant (sourceScopeOpts)
  *   - explicit `source_id`:
- *       remote + federated grant that doesn't include it → permission_denied
+ *       remote + effective grant that doesn't include it → permission_denied
  *       otherwise                                        → `{ sourceId }`
+ *     A non-empty federated list is exact. When it is absent/empty, the
+ *     transport-resolved scalar `ctx.sourceId` is the effective singleton grant.
  *   - neither → the caller's grant (sourceScopeOpts).
  *
  * `code_traversal_cache_clear` is intentionally NOT a caller — it is localOnly
@@ -491,8 +506,7 @@ export function resolveRequestedScope(
     return ctx.remote === false ? {} : sourceScopeOpts(ctx);
   }
   if (sourceIdParam !== undefined) {
-    const allowed = ctx.auth?.allowedSources;
-    if (ctx.remote !== false && allowed && allowed.length > 0 && !allowed.includes(sourceIdParam)) {
+    if (ctx.remote !== false && !effectiveRemoteSourceGrant(ctx).includes(sourceIdParam)) {
       throw new OperationError(
         'permission_denied',
         `source '${sourceIdParam}' is outside your granted sources`,
@@ -797,8 +811,8 @@ const put_page: Operation = {
       const allowList = ctx.allowedSlugPrefixes;
       if (allowList && allowList.length > 0) {
         // Trusted-workspace path: explicit allow-list bounds writes.
-        // Set only by cycle.ts (synthesize/patterns) which submits subagent
-        // jobs under PROTECTED_JOB_NAMES — MCP cannot reach this branch.
+        // Set only by cycle.ts (synthesize/patterns) when it creates a bounded
+        // trusted-workspace subagent; remote callers cannot set the allow-list.
         if (!matchesSlugAllowList(slug, allowList)) {
           throw new OperationError(
             'permission_denied',
@@ -815,6 +829,12 @@ const put_page: Operation = {
     }
 
     if (ctx.dryRun) return { dry_run: true, action: 'put_page', slug: p.slug };
+    const operationSourceId = ctx.sourceId ?? 'default';
+    // Keep one canonical writer lease alive across the DB import, filesystem
+    // write-through, projections, and queue receipts. Previously
+    // importFromContent acquired and released its own lease before these
+    // follow-on mutations, allowing a successor writer to interleave them.
+    return withSourceWriterLease(ctx.engine, operationSourceId, async writerLease => {
     // Skip embedding when the AI gateway has no embedding provider configured.
     // Checks all auth env vars for the resolved provider, not just OPENAI_API_KEY,
     // so Gemini / Ollama / Voyage brains don't silently drop embeddings (Codex C2).
@@ -861,6 +881,7 @@ const put_page: Operation = {
       source_kind: provenanceKind,
       source_uri: provenanceUri,
       ingested_via: provenanceVia,
+      writerLease,
     });
 
     // v0.39 T13 — auto-prompt on first unknown-type write.
@@ -1105,6 +1126,7 @@ const put_page: Operation = {
       ...(chronicleQueued ? { chronicle_backstop: chronicleQueued } : {}),
       ...(writeThrough ? { write_through: writeThrough } : {}),
     };
+    });
   },
   cliHints: { name: 'put', positional: ['slug'], stdin: 'content' },
 };
@@ -1313,19 +1335,23 @@ const delete_page: Operation = {
     // (engine.deletePage) is now reserved for purgeDeletedPages and explicit
     // tests. softDeletePage returns null when the slug is unknown OR already
     // soft-deleted (idempotent-as-null) — preserve that as a clean no-op shape.
-    return withSourceWriterLease(ctx.engine, sourceId, async () => {
-      const result = await ctx.engine.softDeletePage(slug, sourceOpts);
-      if (result === null) {
-        // Distinguish "not found" from "already soft-deleted" so the agent gets a
-        // clear signal. Probe once with include_deleted to disambiguate.
-        const existing = await ctx.engine.getPage(slug, { includeDeleted: true, ...sourceOpts });
-        if (!existing) {
-          throw new OperationError('page_not_found', `Page not found: ${slug}`, 'Check the slug.');
+    return withSourceWriterLease(ctx.engine, sourceId, writerLease =>
+      ctx.engine.transaction(async tx => {
+        const result = await tx.softDeletePage(slug, sourceOpts);
+        if (result === null) {
+          // Distinguish "not found" from "already soft-deleted" so the agent gets a
+          // clear signal. Probe in the same fenced transaction.
+          const existing = await tx.getPage(slug, { includeDeleted: true, ...sourceOpts });
+          if (!existing) {
+            throw new OperationError('page_not_found', `Page not found: ${slug}`, 'Check the slug.');
+          }
+          await assertSourceWriterLeaseAtCommit(writerLease, tx, sourceId);
+          return { status: 'already_soft_deleted', slug, deleted_at: existing.deleted_at };
         }
-        return { status: 'already_soft_deleted', slug, deleted_at: existing.deleted_at };
-      }
-      return { status: 'soft_deleted', slug, recoverable_until: 'now + 72h via restore_page' };
-    });
+        await assertSourceWriterLeaseAtCommit(writerLease, tx, sourceId);
+        return { status: 'soft_deleted', slug, recoverable_until: 'now + 72h via restore_page' };
+      }),
+    );
   },
   cliHints: { name: 'delete', positional: ['slug'] },
 };
@@ -1344,18 +1370,22 @@ const restore_page: Operation = {
     // v0.31.8 (D7): thread ctx.sourceId.
     const sourceId = ctx.sourceId ?? 'default';
     const sourceOpts = { sourceId };
-    return withSourceWriterLease(ctx.engine, sourceId, async () => {
-      const ok = await ctx.engine.restorePage(slug, sourceOpts);
-      if (!ok) {
-        // Distinguish "not found" from "already active" (idempotent-as-false).
-        const existing = await ctx.engine.getPage(slug, { includeDeleted: true, ...sourceOpts });
-        if (!existing) {
-          throw new OperationError('page_not_found', `Page not found: ${slug}`, 'Check the slug.');
+    return withSourceWriterLease(ctx.engine, sourceId, writerLease =>
+      ctx.engine.transaction(async tx => {
+        const ok = await tx.restorePage(slug, sourceOpts);
+        if (!ok) {
+          // Distinguish "not found" from "already active" in the same fence.
+          const existing = await tx.getPage(slug, { includeDeleted: true, ...sourceOpts });
+          if (!existing) {
+            throw new OperationError('page_not_found', `Page not found: ${slug}`, 'Check the slug.');
+          }
+          await assertSourceWriterLeaseAtCommit(writerLease, tx, sourceId);
+          return { status: 'already_active', slug };
         }
-        return { status: 'already_active', slug };
-      }
-      return { status: 'restored', slug };
-    });
+        await assertSourceWriterLeaseAtCommit(writerLease, tx, sourceId);
+        return { status: 'restored', slug };
+      }),
+    );
   },
   cliHints: { name: 'restore', positional: ['slug'] },
 };
@@ -2207,6 +2237,168 @@ const get_timeline: Operation = {
   cliHints: { name: 'timeline', positional: ['slug'] },
 };
 
+interface SourceStatsSnapshot {
+  source_id: string;
+  page_count: number;
+  chunk_count: number;
+  embedded_count: number;
+  link_count: number;
+  tag_count: number;
+  timeline_entry_count: number;
+  pages_by_type: Record<string, number>;
+}
+
+/**
+ * Source-confined operational counters for agent runtimes. Unlike get_stats,
+ * this never returns whole-brain aggregates and never exposes source names,
+ * repository paths, page slugs, or other tenants' topology.
+ */
+async function buildSourceStatsSnapshot(
+  engine: BrainEngine,
+  sourceId: string,
+): Promise<SourceStatsSnapshot> {
+  const [row] = await engine.executeRaw<{
+    page_count: number | string;
+    chunk_count: number | string;
+    embedded_count: number | string;
+    link_count: number | string;
+    tag_count: number | string;
+    timeline_entry_count: number | string;
+  }>(
+    `WITH scoped_pages AS (
+       SELECT id
+         FROM pages
+        WHERE source_id = $1 AND deleted_at IS NULL
+     )
+     SELECT
+       (SELECT COUNT(*) FROM scoped_pages) AS page_count,
+       (SELECT COUNT(*) FROM content_chunks c JOIN scoped_pages p ON p.id = c.page_id) AS chunk_count,
+       (SELECT COUNT(*) FROM content_chunks c JOIN scoped_pages p ON p.id = c.page_id
+         WHERE c.embedded_at IS NOT NULL) AS embedded_count,
+       (SELECT COUNT(*) FROM links l
+         JOIN scoped_pages f ON f.id = l.from_page_id
+         JOIN scoped_pages t ON t.id = l.to_page_id) AS link_count,
+       (SELECT COUNT(DISTINCT t.tag) FROM tags t JOIN scoped_pages p ON p.id = t.page_id) AS tag_count,
+       (SELECT COUNT(*) FROM timeline_entries te JOIN scoped_pages p ON p.id = te.page_id) AS timeline_entry_count`,
+    [sourceId],
+  );
+  const typeRows = await engine.executeRaw<{ type: string; count: number | string }>(
+    `SELECT type, COUNT(*) AS count
+       FROM pages
+      WHERE source_id = $1 AND deleted_at IS NULL
+      GROUP BY type
+      ORDER BY type`,
+    [sourceId],
+  );
+  const pagesByType: Record<string, number> = {};
+  for (const typeRow of typeRows) pagesByType[typeRow.type] = Number(typeRow.count);
+
+  return {
+    source_id: sourceId,
+    page_count: Number(row?.page_count ?? 0),
+    chunk_count: Number(row?.chunk_count ?? 0),
+    embedded_count: Number(row?.embedded_count ?? 0),
+    link_count: Number(row?.link_count ?? 0),
+    tag_count: Number(row?.tag_count ?? 0),
+    timeline_entry_count: Number(row?.timeline_entry_count ?? 0),
+    pages_by_type: pagesByType,
+  };
+}
+
+const get_source_stats: Operation = {
+  name: 'get_source_stats',
+  description: 'Source-confined page, chunk, embedding, link, tag, and timeline counters for routine agents.',
+  params: {},
+  scope: 'read',
+  handler: async (ctx) => buildSourceStatsSnapshot(ctx.engine, ctx.sourceId),
+};
+
+const get_source_health: Operation = {
+  name: 'get_source_health',
+  description: 'Source-confined health/freshness snapshot with one remediation action; never returns slugs or filesystem paths.',
+  params: {},
+  scope: 'read',
+  handler: async (ctx) => {
+    const startedAt = Date.now();
+    const sourceId = ctx.sourceId;
+    const stats = await buildSourceStatsSnapshot(ctx.engine, sourceId);
+    const [health] = await ctx.engine.executeRaw<{
+      source_exists: boolean;
+      stale_pages: number | string;
+      orphan_pages: number | string;
+      missing_embeddings: number | string;
+      last_successful_operation: Date | string | null;
+    }>(
+      `WITH scoped_pages AS (
+         SELECT id, updated_at
+           FROM pages
+          WHERE source_id = $1 AND deleted_at IS NULL
+       )
+       SELECT
+         EXISTS(SELECT 1 FROM sources WHERE id = $1) AS source_exists,
+         (SELECT COUNT(*) FROM scoped_pages p
+           WHERE p.updated_at < (
+             SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
+           )) AS stale_pages,
+         (SELECT COUNT(*) FROM scoped_pages p
+           WHERE NOT EXISTS (
+                   SELECT 1
+                     FROM links l
+                     JOIN scoped_pages other ON other.id = l.from_page_id
+                    WHERE l.to_page_id = p.id
+                 )
+             AND NOT EXISTS (
+                   SELECT 1
+                     FROM links l
+                     JOIN scoped_pages other ON other.id = l.to_page_id
+                    WHERE l.from_page_id = p.id
+                 )) AS orphan_pages,
+         (SELECT COUNT(*) FROM content_chunks c
+           JOIN scoped_pages p ON p.id = c.page_id
+          WHERE c.embedded_at IS NULL) AS missing_embeddings,
+         (SELECT MAX(created_at) FROM ingest_log WHERE source_id = $1) AS last_successful_operation`,
+      [sourceId],
+    );
+    const sourceExists = health?.source_exists === true;
+    const stalePages = Number(health?.stale_pages ?? 0);
+    const orphanPages = Number(health?.orphan_pages ?? 0);
+    const missingEmbeddings = Number(health?.missing_embeddings ?? 0);
+    const embedCoverage = stats.chunk_count === 0
+      ? 1
+      : stats.embedded_count / stats.chunk_count;
+    const lastOperationRaw = health?.last_successful_operation ?? null;
+    const lastSuccessfulOperation = lastOperationRaw === null
+      ? null
+      : new Date(lastOperationRaw).toISOString();
+    const status = !sourceExists
+      ? 'missing'
+      : (missingEmbeddings > 0 || stalePages > 0 ? 'degraded' : 'healthy');
+    const remediation = !sourceExists
+      ? 'Configure GBRAIN_SOURCE to an existing source.'
+      : missingEmbeddings > 0
+        ? 'Run source-scoped stale embedding maintenance from the supervised operator profile.'
+        : stalePages > 0
+          ? 'Run source-scoped stale extraction from the supervised operator profile.'
+          : 'none';
+
+    return {
+      component: 'gbrain',
+      version: VERSION,
+      source_id: sourceId,
+      status,
+      freshness: lastSuccessfulOperation,
+      latency_ms: Date.now() - startedAt,
+      last_successful_operation: lastSuccessfulOperation,
+      remediation,
+      page_count: stats.page_count,
+      embed_coverage: embedCoverage,
+      stale_pages: stalePages,
+      orphan_pages: orphanPages,
+      missing_embeddings: missingEmbeddings,
+    };
+  },
+};
+
 // --- Admin ---
 
 const get_stats: Operation = {
@@ -2738,7 +2930,6 @@ const file_upload: Operation = {
   handler: async (ctx, p) => {
     if (ctx.dryRun) return { dry_run: true, action: 'file_upload', path: p.path };
 
-    const { readFileSync } = await import('fs');
     const { basename, extname } = await import('path');
 
     const filePath = p.path as string;
@@ -2749,7 +2940,7 @@ const file_upload: Operation = {
     // can upload from anywhere on the filesystem (loose) — the user owns the machine.
     // Default is strict when ctx.remote is undefined (defense-in-depth).
     const strict = ctx.remote !== false;
-    validateUploadPath(filePath, process.cwd(), strict);
+    const resolvedFilePath = validateUploadPath(filePath, process.cwd(), strict);
     if (pageSlug) validatePageSlug(pageSlug);
     const filename = basename(filePath);
     validateFilename(filename);
@@ -2761,7 +2952,16 @@ const file_upload: Operation = {
       );
     }
 
-    const content = readFileSync(filePath);
+    // Validation and byte acquisition must not be two pathname-following
+    // operations. Snapshot the canonical path through O_NOFOLLOW and bind the
+    // bytes to stable inode metadata across the read.
+    const { readRedirectOriginalSnapshotWithinRoot } = await import('../commands/files.ts');
+    const stableRoot = realpathSync(strict ? process.cwd() : dirname(resolvedFilePath));
+    const stableRelativePath = relative(stableRoot, resolvedFilePath);
+    const content = readRedirectOriginalSnapshotWithinRoot(
+      stableRoot,
+      stableRelativePath,
+    ).content;
     const hash = sha256Hex(content);
     const logicalPath = pageSlug ? `${pageSlug}/${filename}` : `unsorted/${hash.slice(0, 8)}-${filename}`;
 
@@ -2833,7 +3033,7 @@ const file_url: Operation = {
 
 const submit_job: Operation = {
   name: 'submit_job',
-  description: 'Submit a background job to the Minions queue. Built-in types: sync, embed, lint, import, extract, backlinks, autopilot-cycle. The `shell` type is CLI-only and rejected over MCP.',
+  description: 'Submit a background job to the local Minions queue. Maintenance job submission is host-local only and is never exposed over MCP.',
   params: {
     name: { type: 'string', required: true, description: 'Job type (sync, embed, lint, import, extract, backlinks, autopilot-cycle; shell is CLI-only)' },
     data: { type: 'object', description: 'Job payload (JSON)' },
@@ -2845,34 +3045,46 @@ const submit_job: Operation = {
   },
   mutating: true,
   scope: 'admin',
+  localOnly: true,
   handler: async (ctx, p) => {
     const name = typeof p.name === 'string' ? p.name.trim() : '';
+
+    // Generic queue submission is a host-maintenance capability: even an
+    // admin-scoped remote principal must not choose handlers, server-local
+    // paths, trust flags, or worker payloads. localOnly removes the tool from
+    // MCP discovery; this handler guard is defense in depth for direct calls
+    // and future transports that forget the canonical filter.
+    if (ctx.remote !== false) {
+      throw new OperationError(
+        'permission_denied',
+        'submit_job is host-local only; remote callers must use a dedicated bounded operation',
+      );
+    }
     if (ctx.dryRun) return { dry_run: true, action: 'submit_job', name };
 
-    // Submit-side MCP guard: reject protected job names from untrusted callers
-    // BEFORE we touch the DB. This is the first of the two security layers
-    // (the second is MinionQueue.add's check). Independent of the worker-side
-    // GBRAIN_ALLOW_SHELL_JOBS env flag — even if that flag is on, MCP callers
-    // cannot submit protected-type jobs.
+    // Protected names retain their independent queue-level opt-in. The
+    // operation itself is already host-local, but the fourth argument prevents
+    // future in-process callers from accidentally enabling protected jobs.
     const { isProtectedJobName } = await import('./minions/protected-names.ts');
-    // F7b fail-closed: anything that is not strictly false (i.e., remote=true OR
-    // the field somehow leaks in undefined despite the required type) rejects
-    // protected job submissions. Closes the HTTP MCP shell-job RCE that surfaced
-    // when the HTTP transport's OperationContext literal forgot to set remote.
-    if (ctx.remote !== false && isProtectedJobName(name)) {
-      throw new OperationError('permission_denied', `'${name}' jobs cannot be submitted over MCP (CLI-only for security)`);
-    }
 
     const { MinionQueue } = await import('./minions/queue.ts');
     const queue = new MinionQueue(ctx.engine);
-    // Trusted flag fires ONLY for an explicit local CLI submission of a protected
-    // name. Strict `=== false` so an untyped/cast context can't escalate.
-    const trusted = ctx.remote === false && isProtectedJobName(name) ? { allowProtectedSubmit: true } : undefined;
+    // Both capabilities live outside caller-controlled job.data. The local
+    // ingest marker lets the worker distinguish trusted daemon/CLI events from
+    // network envelopes and stale pre-fix queue rows.
+    const trusted = {
+      ...(isProtectedJobName(name) ? { allowProtectedSubmit: true } : {}),
+      ...(name === 'ingest_capture' ? { allowTrustedLocalIngest: true } : {}),
+    };
 
     const requestedJobData = (p.data as Record<string, unknown>) || {};
     // Write attribution comes from the authenticated context, never an
     // untrusted job payload. Import/sync workers consume this exact value.
-    const jobData: Record<string, unknown> = { ...requestedJobData, sourceId: ctx.sourceId };
+    const jobData: Record<string, unknown> = {
+      ...requestedJobData,
+      sourceId: ctx.sourceId,
+      ...(name === 'ingest_capture' ? { remote: false } : {}),
+    };
 
     // v0.35.8.0: pre-enqueue shell-job validation, parity with the CLI submit
     // path. Closes the bug class where shell.ts handler-time validation ran
@@ -4727,16 +4939,16 @@ const schema_review_orphans: Operation = {
 
 const schema_apply_mutations: Operation = {
   name: 'schema_apply_mutations',
-  description: 'v0.40.7.0: batched schema pack mutation. ATOMIC: all mutations succeed or all roll back. Audit log records one batch_id. Admin scope; NOT localOnly so remote agents (your OpenClaw, etc.) can author packs over normal MCP. Mutation shape per ApplyMutationsRequest type — supports add_type / remove_type / update_type / add_alias / remove_alias / add_prefix / remove_prefix / add_link_type / remove_link_type / set_extractable / set_expert_routing.',
+  description: 'v0.40.7.0: serialized batched schema pack mutation. Mutations run in order under one exclusive pack lock; each successful mutation is durable, and a later failure returns partial_results (the batch is not rollback-atomic). Audit records share one batch_id. Admin scope; NOT localOnly so authenticated remote agents can author packs over normal MCP. Mutation shape per ApplyMutationsRequest type — supports add_type / remove_type / update_type / add_alias / remove_alias / add_prefix / remove_prefix / add_link_type / remove_link_type / set_extractable / set_expert_routing.',
   params: {
     pack: { type: 'string', required: true, description: 'Pack to mutate (must not be bundled)' },
     mutations: {
       type: 'array',
       required: true,
-      description: 'Array of {op, ...args} mutation records to apply atomically',
+      description: 'Ordered array of {op, ...args} mutation records; prior successes remain if a later mutation fails',
       items: { type: 'object' },
     },
-    force: { type: 'boolean', description: 'Steal stale per-pack lock' },
+    force: { type: 'boolean', description: 'Recover a lock only when its holder PID is confirmed dead; never steals a live holder' },
   },
   scope: 'admin',
   mutating: true,
@@ -4750,9 +4962,9 @@ const schema_apply_mutations: Operation = {
     const batchId = `batch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const actor = ctx.auth?.clientId ? `mcp:${ctx.auth.clientId.slice(0, 8)}` : 'cli';
     const sourceId = ctx.sourceId;  // codex C5: write-side scoping
-    // Compose every mutation inside ONE withPackLock so the batch is
-    // truly atomic. The withMutation skeleton handles audit / cache
-    // invalidation per operation; we orchestrate the lock + iteration.
+    // Compose every mutation inside ONE withPackLock so no other writer can
+    // interleave. Individual mutations remain sequential and durable; a later
+    // failure reports partial_results instead of rolling earlier writes back.
     const { withPackLock } = await import('./schema-pack/pack-lock.ts');
     const {
       addTypeToPack, removeTypeFromPack, updateTypeOnPack,
@@ -4766,7 +4978,6 @@ const schema_apply_mutations: Operation = {
       batchId,
       engine: ctx.engine,
       ...(sourceId ? { sourceId } : {}),
-      ...(force ? { force: true } : {}),
     };
     const results: unknown[] = [];
     try {
@@ -4775,12 +4986,9 @@ const schema_apply_mutations: Operation = {
       await withPackLock(pack, { force, lockDir: undefined }, async () => {
         for (let i = 0; i < mutations.length; i++) {
           const m = mutations[i]!;
-          // Each primitive acquires the lock internally; the outer
-          // withPackLock makes that re-entrant via fast-stale-detect
-          // (--force option for the inner call). To keep semantics
-          // simple, we pass {force:true} to the inner calls because
-          // they're nested inside our outer lock — we already own it.
-          const innerOpts = { ...baseMutateOpts, force: true };
+          // Each primitive acquires the lock internally. Async-context
+          // reentrancy reuses this outer owner; it never force-steals by PID.
+          const innerOpts = baseMutateOpts;
           let r: unknown;
           switch (m.op) {
             case 'add_type':
@@ -5390,6 +5598,8 @@ export const operations: Operation[] = [
   add_timeline_entry, get_timeline,
   // Admin
   get_stats, get_health, run_doctor, get_versions, revert_version,
+  // Source-confined routine-agent observability (no cross-source names/slugs/paths)
+  get_source_stats, get_source_health,
   // v0.31.1 (Issue #734): thin-client banner identity packet (read-scope, banner-only)
   get_brain_identity,
   // PR1: skill catalog over MCP — discover + fetch host-repo skills (read-scope)
@@ -5445,8 +5655,8 @@ export const operations: Operation[] = [
   code_traversal_cache_clear,
   // v0.40.6.0 Schema Cathedral v3: 9 new ops — 7 read + 2 admin (NOT
   // localOnly per D2 so remote agents (your OpenClaw, etc.) can author packs).
-  // schema_apply_mutations is batched per D10 — one MCP tool, N
-  // mutations applied atomically inside one withPackLock scope.
+  // schema_apply_mutations is batched per D10 — one MCP tool, N serialized
+  // mutations inside one withPackLock scope, with partial_results on failure.
   get_active_schema_pack, list_schema_packs,
   schema_stats, schema_lint, schema_graph, schema_explain_type,
   schema_review_orphans,

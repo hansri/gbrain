@@ -70,11 +70,16 @@ describe('deriveDirectUrl', () => {
     expect(deriveDirectUrl('postgresql://u:p@localhost:5432/db')).toBeNull();
   });
 
-  test('preserves query string', () => {
+  test('never invents a direct endpoint for an arbitrary port-6543 pooler', () => {
+    expect(deriveDirectUrl('postgresql://u:p@pgbouncer.internal:6543/db')).toBeNull();
+  });
+
+  test('preserves direct query options but removes the pooler-only prepare hint', () => {
     const direct = deriveDirectUrl(
-      'postgresql://postgres.ref:p@aws.pooler.supabase.com:6543/db?prepare=false'
+      'postgresql://postgres.ref:p@aws.pooler.supabase.com:6543/db?prepare=false&sslmode=require'
     );
-    expect(direct).toContain('?prepare=false');
+    expect(direct).not.toContain('prepare=false');
+    expect(direct).toContain('sslmode=require');
   });
 });
 

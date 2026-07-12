@@ -36,9 +36,13 @@ import { watch, type ChokidarOptions, type FSWatcher } from 'chokidar';
 // 20ms interval is deterministic and still fast. Production keeps native events.
 const pollingWatchFactory = (paths: string, opts: ChokidarOptions): FSWatcher =>
   watch(paths, { ...opts, usePolling: true, interval: 20, binaryInterval: 20 });
-import { makeIngestCaptureHandler } from '../../src/core/minions/handlers/ingest-capture.ts';
+import {
+  makeIngestCaptureHandler,
+  type IngestCaptureResult,
+} from '../../src/core/minions/handlers/ingest-capture.ts';
 import type { IngestionEvent } from '../../src/core/ingestion/types.ts';
 import type { MinionJobContext } from '../../src/core/minions/types.ts';
+import { TRUSTED_LOCAL_INGEST_MARKER } from '../../src/core/minions/ingest-boundary.ts';
 
 // Fake job-context constructor so we can drive the handler directly
 // from the dispatcher without spinning up a Minion worker.
@@ -46,7 +50,7 @@ function makeFakeJobCtx(data: Record<string, unknown>): MinionJobContext {
   return {
     id: Math.floor(Math.random() * 1_000_000),
     name: 'ingest_capture',
-    data,
+    data: { ...data, remote: false, [TRUSTED_LOCAL_INGEST_MARKER]: true },
     attempts_made: 1,
     signal: new AbortController().signal,
     shutdownSignal: new AbortController().signal,
@@ -75,6 +79,13 @@ afterAll(async () => {
 
 beforeEach(async () => {
   await resetPgliteState(engine);
+  await engine.executeRaw(
+    `INSERT INTO sources (id, name, config) VALUES
+       ('inbox-folder', 'inbox-folder', '{"federated": false}'::jsonb),
+       ('inbox-a', 'inbox-a', '{"federated": false}'::jsonb),
+       ('inbox-b', 'inbox-b', '{"federated": false}'::jsonb)
+     ON CONFLICT (id) DO NOTHING`,
+  );
   // 200ms grace period for the previous test's chokidar watchers to fully
   // release OS-level FSEvents handles on macOS. Without this, the second
   // test's watcher events queue behind the first test's pending cleanup
@@ -118,6 +129,7 @@ describe('ingestion roundtrip — inbox-folder → daemon → ingest_capture →
     const { logger } = captureLogger();
     const handler = makeIngestCaptureHandler(engine);
     const dispatchedEvents: IngestionEvent[] = [];
+    const completedIngestions: IngestCaptureResult[] = [];
 
     const daemon = new IngestionDaemon({
       engine,
@@ -127,7 +139,8 @@ describe('ingestion roundtrip — inbox-folder → daemon → ingest_capture →
         // Route the event into the handler directly. In production the
         // daemon would submit a Minion job and the worker would invoke
         // the handler; here we collapse that for test-loop efficiency.
-        await handler(makeFakeJobCtx({ event }));
+        const result = await handler(makeFakeJobCtx({ event }));
+        completedIngestions.push(result);
         return { kind: 'queued' };
       },
     });
@@ -155,18 +168,25 @@ describe('ingestion roundtrip — inbox-folder → daemon → ingest_capture →
     fs.writeFileSync(captured, '---\ntitle: Roundtrip\n---\n\nfull e2e flow');
 
     await daemon.start();
-    // Wait for the daemon to pick it up + dispatch + handler to write.
-    await waitFor(() => dispatchedEvents.length === 1, 15000);
+    // Wait for the handler receipt, not merely the start of dispatch. The
+    // dispatcher records the event before awaiting the handler, so observing
+    // dispatchedEvents alone can race the DB write under load.
+    await waitFor(() => completedIngestions.length === 1, 15000);
 
-    // Page is in the DB.
-    const page = await engine.getPage(dispatchedEvents[0]!.metadata!.slug as string ??
-      `inbox/${new Date().toISOString().slice(0, 10)}-${dispatchedEvents[0]!.content_hash.slice(0, 6)}`);
     // The handler defaults to inbox/<date>-<hash6> if no slug provided by
-    // the source. inbox-folder source doesn't set metadata.slug so the
-    // handler computes the default.
-    const expectedSlug = `inbox/${new Date().toISOString().slice(0, 10)}-${dispatchedEvents[0]!.content_hash.slice(0, 6)}`;
-    const fetched = await engine.getPage(expectedSlug);
+    // the source. Use the completed receipt as the canonical slug so this
+    // assertion cannot cross a UTC midnight between import and lookup.
+    const event = dispatchedEvents[0]!;
+    const receipt = completedIngestions[0]!;
+    expect(receipt.slug).toMatch(
+      new RegExp(`^inbox/\\d{4}-\\d{2}-\\d{2}-${event.content_hash.slice(0, 6)}$`),
+    );
+    // The source id is preserved through the durable envelope so one local
+    // producer cannot leak into the canonical default or a sibling source.
+    const fetched = await engine.getPage(receipt.slug, { sourceId: 'inbox-folder' });
     expect(fetched).not.toBeNull();
+    expect(fetched?.source_id).toBe('inbox-folder');
+    expect(await engine.getPage(receipt.slug, { sourceId: 'default' })).toBeNull();
     expect(fetched?.compiled_truth).toContain('full e2e flow');
 
     // File was archived after ingestion (the inbox-folder source's

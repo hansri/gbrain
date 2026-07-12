@@ -154,6 +154,24 @@ for i in {1..40}; do
   sleep 1
 done
 
+# Named Postgres volumes are intentionally warm across local runs, but schema
+# defaults and vector dimensions can change between releases. Start every gate
+# from an empty schema so prior code cannot poison otherwise-hermetic results.
+# The compose services are fixed to the literal test database; verify that
+# authority before the destructive reset and fail closed on any mismatch.
+echo "[ci-local] Resetting dedicated gbrain_test schemas..."
+for shard in 1 2 3 4; do
+  actual_db=$(docker compose -f "$COMPOSE_FILE" exec -T postgres-$shard \
+    psql -U postgres -d gbrain_test -At -c 'SELECT current_database()')
+  if [ "$actual_db" != "gbrain_test" ]; then
+    echo "[ci-local] ERROR: postgres-$shard resolved unexpected database '$actual_db'; refusing schema reset." >&2
+    exit 1
+  fi
+  docker compose -f "$COMPOSE_FILE" exec -T postgres-$shard \
+    psql -U postgres -d gbrain_test -v ON_ERROR_STOP=1 \
+    -c 'SET client_min_messages=warning; DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;' >/dev/null
+done
+
 # Step 3: smoke-test run-e2e.sh argv + shard handling.
 echo "[ci-local] Smoke: run-e2e.sh argv + shard..."
 SMOKE_NO_ARGS=$(bash scripts/run-e2e.sh --dry-run-list | wc -l | tr -d ' ')
@@ -178,8 +196,11 @@ fi
 echo "[ci-local] Smoke OK ($SMOKE_NO_ARGS files no-arg, 1 single-arg, ${SHARD_TOTAL}=4-shard total)."
 
 # Step 4: build the runner-side command.
-# Tier 1: 4-shard parallel UNIT + E2E. Each shard runs ~46 unit files + ~9
-# E2E files against postgres-N. Guards + typecheck run ONCE before fan-out.
+# Tier 1: 4 UNIT + E2E shards, with one shard process live at a time.
+# Each unit shard is further split into deterministic 20-file Bun processes;
+# this releases PGLite/WASM memory between batches instead of letting a
+# roughly 246-file process grow toward the runner's explicit 4 GiB ceiling.
+# Serial-only unit tests run once after fan-out. Guards + typecheck run ONCE.
 # --no-shard runs the legacy unsharded flow (debug aid).
 if [ "$NO_SHARD" = "1" ]; then
   if [ "$DIFF" = "1" ]; then
@@ -190,16 +211,21 @@ bash scripts/check-trailing-newline.sh
 bash scripts/check-wasm-embedded.sh
 bun run typecheck
 echo "[runner] unit (unsharded, DATABASE_URL unset)"
-env -u DATABASE_URL bash scripts/run-unit-shard.sh
+env -u DATABASE_URL bash scripts/run-unit-shard.sh --max-concurrency=1 --batch-size=20
+echo "[runner] serial unit tests (unsharded)"
+env -u DATABASE_URL bun run test:serial
 echo "[runner] e2e (unsharded, --diff selected)"
 SELECTED=$(bun run scripts/select-e2e.ts)
 if [ -z "$SELECTED" ]; then
   echo "[runner] selector emitted nothing (doc-only diff); skipping E2E."
 else
-  DATABASE_URL=postgresql://postgres:postgres@postgres-1:5432/gbrain_test \
-  GBRAIN_PGBOUNCER_URL=postgresql://postgres:postgres@pgbouncer:5432/gbrain_pgbouncer \
-  GBRAIN_PGBOUNCER_DIRECT_URL=postgresql://postgres:postgres@postgres-1:5432/gbrain_test \
-  echo "$SELECTED" | xargs bash scripts/run-e2e.sh
+  echo "$SELECTED" | xargs env \
+    DATABASE_URL=postgresql://postgres:postgres@postgres-1:5432/gbrain_test \
+    GBRAIN_TEST_DB=1 \
+    GBRAIN_PGBOUNCER_URL=postgresql://postgres:postgres@pgbouncer:5432/gbrain_test \
+    GBRAIN_PGBOUNCER_DIRECT_URL=postgresql://postgres:postgres@postgres-1:5432/gbrain_test \
+    GBRAIN_PGBOUNCER_WRONG_DIRECT_URL=postgresql://postgres:postgres@postgres-2:5432/gbrain_test \
+    bash scripts/run-e2e.sh
 fi'
   else
     RUN_PHASES_CMD='echo "[runner] guards + typecheck"
@@ -209,16 +235,20 @@ bash scripts/check-trailing-newline.sh
 bash scripts/check-wasm-embedded.sh
 bun run typecheck
 echo "[runner] unit (unsharded, DATABASE_URL unset)"
-env -u DATABASE_URL bash scripts/run-unit-shard.sh
+env -u DATABASE_URL bash scripts/run-unit-shard.sh --max-concurrency=1 --batch-size=20
+echo "[runner] serial unit tests (unsharded)"
+env -u DATABASE_URL bun run test:serial
 echo "[runner] e2e (unsharded)"
 DATABASE_URL=postgresql://postgres:postgres@postgres-1:5432/gbrain_test \
-GBRAIN_PGBOUNCER_URL=postgresql://postgres:postgres@pgbouncer:5432/gbrain_pgbouncer \
+GBRAIN_TEST_DB=1 \
+GBRAIN_PGBOUNCER_URL=postgresql://postgres:postgres@pgbouncer:5432/gbrain_test \
 GBRAIN_PGBOUNCER_DIRECT_URL=postgresql://postgres:postgres@postgres-1:5432/gbrain_test \
+GBRAIN_PGBOUNCER_WRONG_DIRECT_URL=postgresql://postgres:postgres@postgres-2:5432/gbrain_test \
 bash scripts/run-e2e.sh'
   fi
 else
   # Tier 1 sharded path. Each shard runs unit+E2E sequentially against its
-  # own postgres-N. Shards run in parallel via xargs -P4.
+  # own postgres-N. Shards run serially to stay below the 4 GiB runner cap.
   if [ "$DIFF" = "1" ]; then
     DIFF_E2E_PREP='SELECTED=$(bun run scripts/select-e2e.ts)
 if [ -z "$SELECTED" ]; then
@@ -246,14 +276,14 @@ export GBRAIN_PGLITE_SNAPSHOT=test/fixtures/pglite-snapshot.tar
 echo \"[runner] resolving E2E file selection (--diff aware)\"
 ${DIFF_E2E_PREP}
 mkdir -p /tmp/shard-logs
-echo \"[runner] Tier 1: 4-shard parallel unit + E2E (xargs -P4)\"
+echo \"[runner] Tier 1: 4 serial unit + E2E shards (xargs -P1, 20 files per Bun process)\"
 set +e
-printf '%s\\n' 1 2 3 4 | xargs -P4 -I{} sh -c '
+printf '%s\\n' 1 2 3 4 | xargs -P1 -I{} sh -c '
   shard=\$1
   log=/tmp/shard-logs/shard-\${shard}.log
   echo \"[shard \${shard}] start\" > \$log
   echo \"[shard \${shard}] unit phase (SHARD=\${shard}/4, DATABASE_URL unset)\" >> \$log
-  env -u DATABASE_URL SHARD=\${shard}/4 bash scripts/run-unit-shard.sh >> \$log 2>&1
+  env -u DATABASE_URL SHARD=\${shard}/4 bash scripts/run-unit-shard.sh --max-concurrency=1 --batch-size=20 >> \$log 2>&1
   unit_exit=\$?
   if [ \$unit_exit -ne 0 ]; then
     echo \"[shard \${shard}] UNIT FAILED (exit=\$unit_exit)\" >> \$log
@@ -263,14 +293,18 @@ printf '%s\\n' 1 2 3 4 | xargs -P4 -I{} sh -c '
   if [ -s /tmp/e2e-selected.txt ]; then
     SHARD=\${shard}/4 \\
     DATABASE_URL=postgresql://postgres:postgres@postgres-\${shard}:5432/gbrain_test \\
-    GBRAIN_PGBOUNCER_URL=postgresql://postgres:postgres@pgbouncer:5432/gbrain_pgbouncer \\
+    GBRAIN_TEST_DB=1 \\
+    GBRAIN_PGBOUNCER_URL=postgresql://postgres:postgres@pgbouncer:5432/gbrain_test \\
     GBRAIN_PGBOUNCER_DIRECT_URL=postgresql://postgres:postgres@postgres-1:5432/gbrain_test \\
+    GBRAIN_PGBOUNCER_WRONG_DIRECT_URL=postgresql://postgres:postgres@postgres-2:5432/gbrain_test \\
     xargs -a /tmp/e2e-selected.txt bash scripts/run-e2e.sh >> \$log 2>&1
   else
     SHARD=\${shard}/4 \\
     DATABASE_URL=postgresql://postgres:postgres@postgres-\${shard}:5432/gbrain_test \\
-    GBRAIN_PGBOUNCER_URL=postgresql://postgres:postgres@pgbouncer:5432/gbrain_pgbouncer \\
+    GBRAIN_TEST_DB=1 \\
+    GBRAIN_PGBOUNCER_URL=postgresql://postgres:postgres@pgbouncer:5432/gbrain_test \\
     GBRAIN_PGBOUNCER_DIRECT_URL=postgresql://postgres:postgres@postgres-1:5432/gbrain_test \\
+    GBRAIN_PGBOUNCER_WRONG_DIRECT_URL=postgresql://postgres:postgres@postgres-2:5432/gbrain_test \\
     bash scripts/run-e2e.sh >> \$log 2>&1
   fi
   e2e_exit=\$?
@@ -303,7 +337,9 @@ if [ \$shard_xargs_exit -ne 0 ]; then
   echo \"[runner] One or more shards failed (xargs exit=\$shard_xargs_exit). See SHARD LOGS above.\"
   exit \$shard_xargs_exit
 fi
-echo \"[runner] All 4 shards passed.\""
+echo \"[runner] All 4 shards passed.\"
+echo \"[runner] serial unit tests (single process, DATABASE_URL unset)\"
+env -u DATABASE_URL bun run test:serial"
 fi
 
 INNER_CMD=$(cat <<'EOF'

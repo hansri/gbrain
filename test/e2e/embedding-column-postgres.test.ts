@@ -20,8 +20,9 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import { quoteIdentifier } from '../../src/core/search/embedding-column.ts';
 import type { ResolvedColumn } from '../../src/core/types.ts';
+import { getPostgresTestUrl } from '../helpers/postgres-test-authority.ts';
 
-const dbUrl = process.env.DATABASE_URL;
+const dbUrl = getPostgresTestUrl();
 if (!dbUrl) {
   describe.skip('postgres E2E — embedding column (skipped: DATABASE_URL unset)', () => {
     test('skipped', () => { expect(true).toBe(true); });

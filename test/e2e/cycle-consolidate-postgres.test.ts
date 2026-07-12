@@ -13,17 +13,29 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { setupDB, teardownDB, hasDatabase, getEngine } from './helpers.ts';
 import { runPhaseConsolidate } from '../../src/core/cycle/phases/consolidate.ts';
-import { DEFAULT_EMBEDDING_DIMENSIONS } from '../../src/core/ai/defaults.ts';
+import { readFactsEmbeddingDim } from '../../src/core/embedding-dim-check.ts';
 
 const RUN = hasDatabase();
 const d = RUN ? describe : describe.skip;
+let factsEmbeddingDimensions: number | null = null;
 
-beforeAll(async () => { if (RUN) await setupDB(); });
+beforeAll(async () => {
+  if (!RUN) return;
+  const engine = await setupDB();
+  const factsColumn = await readFactsEmbeddingDim(engine);
+  if (!factsColumn.exists || factsColumn.dims == null) {
+    throw new Error('facts.embedding must be a dimensioned vector column for consolidate E2E');
+  }
+  factsEmbeddingDimensions = factsColumn.dims;
+});
 afterAll(async () => { if (RUN) await teardownDB(); });
 
 const oldDate = () => new Date(Date.now() - 30 * 60 * 60 * 1000).toISOString();
 function unitVec(): string {
-  const a = new Float32Array(DEFAULT_EMBEDDING_DIMENSIONS);
+  if (factsEmbeddingDimensions == null) {
+    throw new Error('setupDB() must resolve facts.embedding dimensions before seeding vectors');
+  }
+  const a = new Float32Array(factsEmbeddingDimensions);
   a[0] = 1.0;
   return '[' + Array.from(a).join(',') + ']';
 }

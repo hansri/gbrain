@@ -297,18 +297,34 @@ HANDLER TYPES (built in)
         process.exit(1);
       }
 
-      // The CLI path is a trusted submitter. Pass {allowProtectedSubmit: true}
-      // ONLY for protected names, not blanket-set for every submission, so any
-      // future protected name forces explicit opt-in at the call site.
+      // The CLI process is a trusted local submitter. Keep both capabilities
+      // out of caller-controlled --params JSON: protected names opt in
+      // explicitly, and ingest_capture receives the durable local marker only
+      // through MinionQueue.add's separate trusted argument.
       const { isProtectedJobName } = await import('../core/minions/protected-names.ts');
-      const trusted = isProtectedJobName(name) ? { allowProtectedSubmit: true } : undefined;
+      const jobName = name.trim();
+      const protectedJob = isProtectedJobName(jobName);
+      const localIngest = jobName === 'ingest_capture';
+      const trusted = protectedJob || localIngest
+        ? {
+            ...(protectedJob ? { allowProtectedSubmit: true } : {}),
+            ...(localIngest ? { allowTrustedLocalIngest: true } : {}),
+          }
+        : undefined;
+
+      // remote/local classification is also server-owned. A local operator
+      // does not need to remember an internal trust field, and --params cannot
+      // make this local CLI call look like the authenticated HTTP envelope.
+      if (localIngest) {
+        data = { ...data, remote: false };
+      }
 
       // v0.35.8.0: pre-enqueue shell-job validation. Validates `inherit:`
       // closed enum, rejects secret env-keys, fail-fasts on missing config.
       // Throws UnrecoverableError BEFORE `queue.add` so a bad payload never
       // lands in `minion_jobs.data`. Defense-in-depth re-validation happens
       // in the worker handler. See: src/core/minions/handlers/shell-validate.ts
-      if (name.trim() === 'shell') {
+      if (jobName === 'shell') {
         try {
           const { validateShellJobParams } = await import('../core/minions/handlers/shell-validate.ts');
           validateShellJobParams(data);

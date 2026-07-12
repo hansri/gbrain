@@ -39,9 +39,9 @@ import { existsSync, mkdirSync, appendFileSync } from 'fs';
 import { join } from 'path';
 
 import type { Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult } from './types.ts';
-import { loadConfig, toEngineConfig, gbrainPath } from '../../core/config.ts';
-import { createEngine } from '../../core/engine-factory.ts';
+import { gbrainPath } from '../../core/config.ts';
 import type { BrainEngine } from '../../core/engine.ts';
+import { openMigrationEngine } from './snapshot.ts';
 // Bug 3 — ledger writes moved to the runner (apply-migrations.ts).
 
 // Lazy: GBRAIN_HOME may be set after module load.
@@ -57,16 +57,8 @@ async function phaseAConnect(opts: OrchestratorOpts): Promise<{ result: Orchestr
     return { result: { name: 'connect', status: 'skipped', detail: 'dry-run' }, engine: null };
   }
   try {
-    const config = loadConfig();
-    if (!config) {
-      return {
-        result: { name: 'connect', status: 'skipped', detail: 'no brain configured (run gbrain init first)' },
-        engine: null,
-      };
-    }
-    const engine = await createEngine(toEngineConfig(config));
-    await engine.connect(toEngineConfig(config));
-    return { result: { name: 'connect', status: 'complete' }, engine };
+    const opened = await openMigrationEngine(opts);
+    return { result: { name: 'connect', status: 'complete' }, engine: opened.engine };
   } catch (e) {
     return {
       result: { name: 'connect', status: 'failed', detail: e instanceof Error ? e.message : String(e) },

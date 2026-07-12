@@ -214,9 +214,120 @@ reachable only over a filesystem path, set `GBRAIN_GIT_ALLOW_FILE_TRANSPORT=1`
 
 ## Upgrading an existing brain
 
-`gbrain upgrade` runs the v16 + v17 migrations automatically. Your
-existing pages all move under `source_id='default'`. Behavior is
-unchanged until you add a second source.
+The first hop from an older binary into v0.42.59.0 is a supervised cutover.
+Stop every GBrain service, sync/import writer, and scheduled migration. Take a
+matched recovery snapshot of the database and all GBrain state roots in use:
+the canonical `.gbrain` directory plus any legacy `$GBRAIN_HOME` or
+`$HOME/.gbrain` copies that still exist.
+
+Stage the new release in an immutable directory without starting it. The old
+binary does not contain `upgrade-preflight`, so do not treat its `gbrain
+upgrade` wrapper as the safety gate for this first hop. Run the staged **new**
+binary directly; replace the example path below with the actual release path:
+
+```bash
+/path/to/v0.42.59.0/gbrain upgrade-preflight --json
+```
+
+An `ok` result is the normal case. If conflicts are returned, identify the
+page genuinely owned by each file path and keep it explicitly:
+
+```bash
+/path/to/v0.42.59.0/gbrain upgrade-preflight repair \
+  --source <source-id> \
+  --path <repo-relative-path> \
+  --keep <legitimate-page-slug> \
+  --yes
+```
+
+This preserves every page and clears `source_path` only on the competing
+rows. Repeat the preflight until it exits 0 before applying migrations; the
+ownership migration deliberately refuses to guess.
+
+Postgres operators can use the equivalent read-only SQL for independent
+verification:
+
+```sql
+SELECT source_id,
+       source_path,
+       array_agg(slug ORDER BY slug) AS owners
+FROM pages
+WHERE source_path IS NOT NULL
+GROUP BY source_id, source_path
+HAVING COUNT(*) > 1
+ORDER BY source_id, source_path;
+```
+
+With services still stopped, apply and verify using only the staged new binary:
+
+```bash
+/path/to/v0.42.59.0/gbrain apply-migrations --yes --non-interactive
+/path/to/v0.42.59.0/gbrain doctor
+```
+
+Promote the immutable release and restart services only after both commands are
+green. Then run one `gbrain sync --all` reconciliation with the new binary.
+Once a host is already on this hardened upgrade handoff, later releases may use
+the normal `gbrain upgrade` flow unless their migration guide says otherwise.
+v0.42.59.0 itself remains prerelease-only and outside GitHub's normal `latest`
+channel because older updaters cannot consume its new local policy. Private/fork
+deployments use the same manual staged sequence above.
+
+The release stages file-object identity safely. Migration v123 adds the
+composite `(source_id, storage_path)` index, while source-qualified object keys
+prevent one source from overwriting another source's bytes. The legacy global
+`storage_path` constraint remains in place during the canary so the immediately
+previous binary's `ON CONFLICT(storage_path)` shape remains structurally
+available for a deliberate rollback. This is not permission for an old agent
+or service to keep serving or writing after promotion; all old processes stay
+stopped. The constraint temporarily means two sources cannot create the exact same
+logical `storage_path`; the second write fails closed. Retiring the legacy
+constraint and enabling that final case is a separate post-canary migration,
+after rollback evidence and source-qualified object-key adoption are green.
+
+### Rollback boundary
+
+When all migrations are complete and `gbrain doctor` is green, the legacy
+global conflict key provides structural rollback compatibility only. Do not run
+mixed versions or leave a previous-binary service online. Stop every writer
+before changing binaries, and use the previous binary only during a deliberate
+rollback that satisfies the state/database boundary below.
+
+If migration state is `partial`, `wedged`, `ambiguous`, or has an unresolved
+inflight fence, binary-only rollback is not supported. Restore the matched
+pre-upgrade database and canonical/legacy GBrain state snapshot together with
+the previous binary. Restoring only the executable can leave the migration
+ledger and database describing different realities.
+
+### Agent-facing stdio MCP profile
+
+`gbrain serve` now starts with a source-bound routine profile. It exposes only
+retrieval, chronology, link navigation, and the source-confined
+`get_source_health` / `get_source_stats` tools. Whole-brain `get_health`,
+`get_stats`, `get_status_snapshot`, and `get_brain_identity` are not present.
+Set `GBRAIN_SOURCE` in the launcher to the one source that agent may read. A
+caller-supplied `source_id` outside that source is rejected.
+
+Launchers may narrow the routine surface further with comma-separated exact
+names and scopes:
+
+```bash
+GBRAIN_SOURCE=example-source \
+GBRAIN_MCP_STDIO_ALLOWED_TOOLS=query,search,get_page,get_timeline,get_links,get_source_health,get_source_stats \
+GBRAIN_MCP_STDIO_ALLOWED_SCOPES=read \
+gbrain serve
+```
+
+Unknown tool names are a startup error so renamed tools cannot silently remove
+an intended capability. Startup logs the active profile, tool count, and a
+non-secret policy fingerprint for drift monitoring. Ambient recent-fact
+metadata is disabled by default; only explicitly set
+`GBRAIN_MCP_STDIO_HOT_MEMORY=true` when that extra context is wanted.
+
+The previous broad local MCP surface is available only through
+`GBRAIN_MCP_STDIO_PROFILE=unsafe-local-maintenance`. Do not use that profile in
+an always-on Hermes agent. Run destructive maintenance through a supervised
+local operator or the direct CLI instead.
 
 To add one:
 

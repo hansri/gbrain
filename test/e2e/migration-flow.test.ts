@@ -26,9 +26,12 @@ import {
 import { join } from 'path';
 import { tmpdir } from 'os';
 
-import { v0_11_0 } from '../../src/commands/migrations/v0_11_0.ts';
+import { __testing } from '../../src/commands/migrations/v0_11_0.ts';
 import { loadPreferences, loadCompletedMigrations } from '../../src/core/preferences.ts';
 import { hasDatabase } from './helpers.ts';
+import { migrationTestOpts } from '../helpers/migration-opts.ts';
+import { createEngine } from '../../src/core/engine-factory.ts';
+import { getOrCreateDatabaseInstanceId } from '../../src/core/database-instance-id.ts';
 
 const SKIP = !hasDatabase();
 const describeE2E = SKIP ? describe.skip : describe;
@@ -37,37 +40,21 @@ const DATABASE_URL = process.env.DATABASE_URL ?? '';
 let tmp: string;
 let origHome: string | undefined;
 let origGbrainHome: string | undefined;
-let origPath: string | undefined;
-let fakeBinDir: string;
 const CLI_PATH = join(import.meta.dir, '..', '..', 'src', 'cli.ts');
 
-// Module-level PATH shim. The orchestrator shells out to `gbrain init
-// --migrate-only` and `gbrain jobs smoke`. On source-install test envs
-// there's no `gbrain` on $PATH. Install a tiny bash shim that `exec`s
-// `bun run src/cli.ts` and prepend it to $PATH before any tests import
-// the orchestrator. Running at module-init (not beforeAll) guarantees
-// the shim exists before Bun's test runner loads described blocks.
-if (!SKIP) {
-  origPath = process.env.PATH;
-  fakeBinDir = mkdtempSync(join(tmpdir(), 'gbrain-e2e-bin-'));
-  const shim = join(fakeBinDir, 'gbrain');
-  writeFileSync(
-    shim,
-    `#!/usr/bin/env bash\nexec bun run "${CLI_PATH}" "$@"\n`,
-    { mode: 0o755 },
-  );
-  process.env.PATH = `${fakeBinDir}:${origPath ?? ''}`;
-  console.log('[migration-flow.e2e] shim installed at', shim, 'PATH prepended');
-}
+const runTestOrchestrator = (opts: typeof COMMON_OPTS) => __testing.orchestrator(opts, {
+  // Production resolves Bun.main to the immutable running release. Under
+  // `bun test`, Bun.main is this test file, so the explicit test seam points
+  // at the real source CLI without reintroducing PATH-based authority.
+  resolveSubprocessInvocation: args => [process.execPath, CLI_PATH, ...args],
+});
 
 function freshTempHome(label: string) {
   const dir = mkdtempSync(join(tmpdir(), `gbrain-e2e-migration-${label}-`));
-  // preferences.ts's gbrainDir() returns `$HOME/.gbrain` when GBRAIN_HOME
-  // is unset. Test fixtures write to `$dir/.gbrain/...`, so set HOME only
-  // and clear any inherited GBRAIN_HOME (which would route prefs to $dir
-  // directly, no .gbrain suffix).
+  // configDir()/preferences append `.gbrain` to GBRAIN_HOME. Pin both homes
+  // so no process-global developer config can leak into this E2E.
   process.env.HOME = dir;
-  delete process.env.GBRAIN_HOME;
+  process.env.GBRAIN_HOME = dir;
   // Seed config so Phase A's `gbrain init --migrate-only` has a target.
   mkdirSync(join(dir, '.gbrain'), { recursive: true });
   writeFileSync(
@@ -78,14 +65,25 @@ function freshTempHome(label: string) {
   return dir;
 }
 
-beforeAll(() => {
+beforeAll(async () => {
   if (SKIP) {
     console.log('[migration-flow.e2e] DATABASE_URL not set — skipping.');
     return;
   }
   origHome = process.env.HOME;
   origGbrainHome = process.env.GBRAIN_HOME;
-});
+
+  // This file must also pass when selected alone by ci:local:diff. Establish
+  // the real schema instead of relying on an alphabetically earlier E2E file.
+  const engineConfig = { engine: 'postgres' as const, database_url: DATABASE_URL };
+  const engine = await createEngine(engineConfig);
+  try {
+    await engine.connect(engineConfig);
+    await engine.initSchema();
+  } finally {
+    await engine.disconnect();
+  }
+}, 90_000);
 
 afterAll(() => {
   if (SKIP) return;
@@ -93,28 +91,37 @@ afterAll(() => {
   else process.env.HOME = origHome;
   if (origGbrainHome === undefined) delete process.env.GBRAIN_HOME;
   else process.env.GBRAIN_HOME = origGbrainHome;
-  if (origPath === undefined) delete process.env.PATH;
-  else process.env.PATH = origPath;
-  try { if (fakeBinDir) rmSync(fakeBinDir, { recursive: true, force: true }); } catch { /* best-effort */ }
 });
 
-beforeEach(() => {
+beforeEach(async () => {
   if (SKIP) return;
   try { if (tmp) rmSync(tmp, { recursive: true, force: true }); } catch { /* best-effort */ }
+  // Production apply-migrations binds every orchestrator to the UUID stored in
+  // the target database. The generic test helper deliberately cannot discover
+  // that asynchronous value, so bind this real-Postgres E2E explicitly instead
+  // of using the legacy route/URL hash.
+  const engineConfig = { engine: 'postgres' as const, database_url: DATABASE_URL };
+  const engine = await createEngine(engineConfig);
+  try {
+    await engine.connect(engineConfig);
+    COMMON_OPTS.brainId = await getOrCreateDatabaseInstanceId(engine);
+  } finally {
+    await engine.disconnect();
+  }
 });
 
-const COMMON_OPTS = {
+const COMMON_OPTS = migrationTestOpts({
   yes: true,
   mode: 'pain_triggered' as const,
   dryRun: false,
   hostDir: undefined,
   noAutopilotInstall: true, // critical: don't install launchd/systemd/crontab on CI
-};
+}, { engine: 'postgres', database_url: DATABASE_URL });
 
 describeE2E('E2E: v0.11.0 orchestrator against live Postgres', () => {
   test('fresh install flow: schema → smoke → prefs → host-rewrite → completed', async () => {
     tmp = freshTempHome('fresh');
-    const result = await v0_11_0.orchestrator(COMMON_OPTS);
+    const result = await runTestOrchestrator(COMMON_OPTS);
 
     // Orchestrator returns a structured result (status is `complete` when
     // no pending-host-work TODOs fired, `partial` otherwise).
@@ -146,10 +153,10 @@ describeE2E('E2E: v0.11.0 orchestrator against live Postgres', () => {
 
   test('idempotent rerun: second invocation is a safe no-op', async () => {
     tmp = freshTempHome('rerun');
-    const first = await v0_11_0.orchestrator(COMMON_OPTS);
+    const first = await runTestOrchestrator(COMMON_OPTS);
     expect(['complete', 'partial']).toContain(first.status);
 
-    const second = await v0_11_0.orchestrator(COMMON_OPTS);
+    const second = await runTestOrchestrator(COMMON_OPTS);
     expect(['complete', 'partial']).toContain(second.status);
 
     // Bug 3 (v0.14.2) — orchestrator does not write completed.jsonl, so
@@ -184,7 +191,7 @@ describeE2E('E2E: v0.11.0 orchestrator against live Postgres', () => {
       }, null, 2) + '\n',
     );
 
-    const result = await v0_11_0.orchestrator(COMMON_OPTS);
+    const result = await runTestOrchestrator(COMMON_OPTS);
 
     // Builtins rewritten in place; non-builtins left alone.
     const cronAfter = JSON.parse(readFileSync(join(claudeDir, 'cron', 'jobs.json'), 'utf-8'));
@@ -244,7 +251,7 @@ describeE2E('E2E: v0.11.0 orchestrator against live Postgres', () => {
     // record; host-rewrite runs its safe-skip pass). Per Bug 3 (v0.14.2),
     // the orchestrator itself doesn't append to completed.jsonl — the
     // runner does. The stopgap's partial entry stays unchanged here.
-    const result = await v0_11_0.orchestrator(COMMON_OPTS);
+    const result = await runTestOrchestrator(COMMON_OPTS);
     expect(['complete', 'partial']).toContain(result.status);
 
     const completed = loadCompletedMigrations();

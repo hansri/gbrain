@@ -27,7 +27,7 @@ let origHome: string | undefined;
 function run(args: string[]): { exitCode: number; stdout: string; stderr: string } {
   // Strip DATABASE_URL so doctor runs filesystem-only for these tests.
   // Half-migrated checks run in the filesystem section; no DB needed.
-  const env = { ...process.env, HOME: tmp } as Record<string, string | undefined>;
+  const env = { ...process.env, HOME: tmp, GBRAIN_HOME: tmp } as Record<string, string | undefined>;
   delete env.DATABASE_URL;
   delete env.GBRAIN_DATABASE_URL;
   try {
@@ -123,6 +123,19 @@ describe('gbrain doctor — half-migrated Minions detection', () => {
     }
   });
 
+  test('filesystem: malformed migration ledger is an explicit FAIL', () => {
+    const migrationsDir = join(tmp, '.gbrain', 'migrations');
+    mkdirSync(migrationsDir, { recursive: true });
+    writeFileSync(join(migrationsDir, 'completed.jsonl'), '{"version":"torn"');
+
+    const result = run(['doctor', '--fast', '--json']);
+    expect(result.exitCode).toBe(1);
+    const checks = JSON.parse(result.stdout).checks as Array<{ name: string; status: string; message: string }>;
+    const minions = checks.find(c => c.name === 'minions_migration');
+    expect(minions).toMatchObject({ status: 'fail' });
+    expect(minions!.message).toContain('unreadable or corrupt');
+  });
+
   test('regression: fresh install with schema-applied DB but no prefs must NOT fail', () => {
     // CI regression. `gbrain init` against Postgres applies schema v7 but
     // doesn't write preferences.json (the migration orchestrator does that
@@ -146,9 +159,8 @@ describe('gbrain doctor — half-migrated Minions detection', () => {
 
   test('filesystem: multiple versions each need their own complete entry', () => {
     // v0.10 is fully migrated but v0.11 is only partial. Doctor should
-    // flag v0.11 by name. The forward-progress override only kicks in
-    // when a NEWER version completed; v0.10 is older than v0.11 so the
-    // partial still stands.
+    // flag v0.11 by name. Completion is version-scoped, so v0.10 cannot
+    // prove that v0.11's independent host/schema work settled.
     const migrationsDir = join(tmp, '.gbrain', 'migrations');
     mkdirSync(migrationsDir, { recursive: true });
     writeFileSync(
@@ -168,18 +180,10 @@ describe('gbrain doctor — half-migrated Minions detection', () => {
     expect(minions!.message).not.toContain('0.10.0');
   });
 
-  test('filesystem: stale partial superseded by newer complete → NO warning (forward-progress override)', () => {
-    // v0.16.0 completed AFTER v0.11.0 went partial. The schema clearly
-    // advanced past v0.11.0, so the partial record is stale historical
-    // noise — not a real "MINIONS HALF-INSTALLED" condition.
-    //
-    // Without this override, every install that ever went through a
-    // v0.11.0 stopgap and then upgraded carries the FAIL flag forever,
-    // even on installs that have been at v0.22+ for months. Real cause:
-    // long-running gbrain installs accumulate partial entries from
-    // historical stopgap runs; a doctor flag with no time decay or
-    // forward-progress detection becomes meaningless once you've
-    // moved past those versions.
+  test('filesystem: newer-version complete does not resolve an older partial', () => {
+    // v0.16.0 completion proves only that version's own postconditions.
+    // It cannot prove that independent host/schema work left partial by
+    // v0.11.0 settled, so doctor must keep the older evidence visible.
     const migrationsDir = join(tmp, '.gbrain', 'migrations');
     mkdirSync(migrationsDir, { recursive: true });
     writeFileSync(
@@ -192,23 +196,17 @@ describe('gbrain doctor — half-migrated Minions detection', () => {
     );
 
     const result = run(['doctor', '--fast', '--json']);
-    // No FAIL on minions_migration — the v0.11.0 partials are stale
-    // because v0.16.0 (a newer release) completed.
-    const checks = JSON.parse(result.stdout).checks as Array<{ name: string; status: string }>;
+    expect(result.exitCode).toBe(1);
+    const checks = JSON.parse(result.stdout).checks as Array<{ name: string; status: string; message: string }>;
     const minions = checks.find(c => c.name === 'minions_migration');
-    if (minions) {
-      expect(minions.status).not.toBe('fail');
-    }
-    // Critically: the test fixture would have caused exit 1 under the old
-    // (no-override) logic because of the stale partial flag. Under the new
-    // logic, doctor exits 0 (or only warns about non-related checks).
-    expect(result.exitCode).toBe(0);
+    expect(minions).toMatchObject({ status: 'fail' });
+    expect(minions!.message).toContain('0.11.0');
+    expect(minions!.message).not.toContain('0.16.0');
   });
 
   test('filesystem: stale partial NOT superseded → still flagged', () => {
-    // The override only fires when a >= partial version has completed.
-    // Older completes (e.g. v0.10 complete + v0.16 partial) do NOT
-    // supersede the partial; the partial still indicates a real problem.
+    // Older completes (e.g. v0.10 complete + v0.16 partial) also cannot
+    // supersede another version's partial; the evidence remains unresolved.
     const migrationsDir = join(tmp, '.gbrain', 'migrations');
     mkdirSync(migrationsDir, { recursive: true });
     writeFileSync(

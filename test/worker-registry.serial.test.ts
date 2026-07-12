@@ -13,6 +13,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { execFileSync } from 'node:child_process';
 
 let home: string;
 const origHome = process.env.GBRAIN_HOME;
@@ -100,6 +101,13 @@ describe('pruning + guards', () => {
   });
 
   test('PID-reuse guard: live pid that started long after registration is skipped (Codex #8)', async () => {
+    // Minimal CI images may omit `ps`; without a start-time observation there
+    // is deliberately no safe reuse claim to assert.
+    try {
+      execFileSync('ps', ['-p', String(process.pid)], { stdio: 'ignore' });
+    } catch {
+      return;
+    }
     const { readWorkers, workerRegistryDir, currentBrainId } = await reg();
     const dir = workerRegistryDir();
     require('fs').mkdirSync(dir, { recursive: true });

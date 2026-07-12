@@ -5,12 +5,13 @@ import {
   fstatSync,
   lstatSync,
   openSync,
+  realpathSync,
   readSync,
   readdirSync,
 } from 'fs';
 import { execFileSync } from 'child_process';
 import { createHash } from 'crypto';
-import { dirname, join, relative, resolve } from 'path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'path';
 import { cpus, totalmem } from 'os';
 import type { BrainEngine } from '../core/engine.ts';
 import { DELETE_BATCH_SIZE } from '../core/engine-constants.ts';
@@ -48,7 +49,7 @@ import {
   type ImportConvergenceProof,
 } from '../core/import-checkpoint.ts';
 import { cleanInheritedGitEnvironment, gitAuthorityEnvironment } from '../core/git-environment.ts';
-import { computeBrainId } from '../core/upgrade-checkpoint.ts';
+import { databaseIdentity } from '../core/database-identity.ts';
 import {
   assertSourceWriterLease,
   assertSourceWriterLeaseAtCommit,
@@ -184,7 +185,10 @@ export function resolveImportCheckpointScope(
     // The checkout is not the brain: two databases can ingest the same repo.
     // Bind resume state to the credential-stable DB identity used by the
     // upgrade pipeline, while keeping the repo path as a separate axis.
-    brain: opts.brainIdentity ?? computeBrainId(cfg?.database_url),
+    brain: opts.brainIdentity ?? databaseIdentity({
+      database_url: cfg?.database_url,
+      database_path: cfg?.database_path,
+    }),
     repo: resolve(dir),
     source: opts.sourceId ?? 'default',
   };
@@ -278,6 +282,26 @@ async function loadImportDbProofs(
   // skip the path. Re-import will hit the normal ownership/collision checks.
   for (const path of ambiguous) out.delete(path);
   return out;
+}
+
+/**
+ * Capture one source-path proof under the exact writer acquisition. The row
+ * lock and final lease-row fence prevent an old file/blob authority from being
+ * paired with a successor writer's page revision between SELECT and banking.
+ */
+async function captureImportDbProof(
+  engine: BrainEngine,
+  sourceId: string,
+  path: string,
+  writerLease: SourceWriterLease,
+): Promise<ImportDbProof | undefined> {
+  assertSourceWriterLease(writerLease, engine, sourceId);
+  return engine.transaction(async tx => {
+    assertSourceWriterLease(writerLease, tx, sourceId);
+    const proof = (await loadImportDbProofs(tx, sourceId, [path], { lockRows: true })).get(path);
+    await assertSourceWriterLeaseAtCommit(writerLease, tx, sourceId);
+    return proof;
+  });
 }
 
 async function invalidImportConvergencePaths(
@@ -505,9 +529,53 @@ export async function finalizeImportConvergence(
 export function readBoundedFilesystemImportFile(
   filePath: string,
   relativePath: string,
+  importRoot: string,
   onRead?: (path: string) => void,
 ): Buffer {
-  const beforeOpen = lstatSync(filePath);
+  const canonicalRoot = realpathSync(resolve(importRoot));
+  const lexicalFile = resolve(importRoot, relativePath);
+  if (lexicalFile !== resolve(filePath)) {
+    throw new Error(`Import path/root mismatch: ${relativePath}`);
+  }
+  const contained = (candidate: string): boolean => {
+    const rel = relative(canonicalRoot, candidate);
+    return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+  };
+  const lexicalRelative = relative(resolve(importRoot), lexicalFile);
+  if (
+    lexicalRelative === '..'
+    || lexicalRelative.startsWith(`..${sep}`)
+    || isAbsolute(lexicalRelative)
+  ) {
+    throw new Error(`Import path escapes root: ${relativePath}`);
+  }
+  const assertNoNestedAncestorSymlink = (): void => {
+    const lexicalRoot = resolve(importRoot);
+    const parentRelative = relative(lexicalRoot, dirname(lexicalFile));
+    if (parentRelative === '') return;
+    let current = lexicalRoot;
+    for (const segment of parentRelative.split(sep)) {
+      if (!segment) continue;
+      current = join(current, segment);
+      const stat = lstatSync(current);
+      if (stat.isSymbolicLink()) {
+        throw new Error(`Import path uses a symlink ancestor: ${relativePath}`);
+      }
+      if (!stat.isDirectory()) {
+        throw new Error(`Import path has a non-directory ancestor: ${relativePath}`);
+      }
+    }
+  };
+  assertNoNestedAncestorSymlink();
+  // Resolve ancestors only. Resolving the selected leaf before lstat/open
+  // follows an in-root symlink and can import an excluded private file. The
+  // leaf itself must remain lexical and is opened with O_NOFOLLOW below.
+  const canonicalParent = realpathSync(dirname(lexicalFile));
+  if (!contained(canonicalParent)) {
+    throw new Error(`Import path escapes root through an ancestor symlink: ${relativePath}`);
+  }
+
+  const beforeOpen = lstatSync(lexicalFile);
   if (beforeOpen.isSymbolicLink()) throw new Error(`Skipping symlink: ${filePath}`);
   if (!beforeOpen.isFile()) throw new Error(`Skipping non-regular file: ${filePath}`);
   const maxBytes = isImageFilePath(relativePath)
@@ -518,12 +586,24 @@ export function readBoundedFilesystemImportFile(
   }
 
   const noFollow = typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0;
-  const fd = openSync(filePath, fsConstants.O_RDONLY | noFollow);
+  const fd = openSync(lexicalFile, fsConstants.O_RDONLY | noFollow);
   try {
     const beforeRead = fstatSync(fd);
     if (!beforeRead.isFile()) throw new Error(`Skipping non-regular file: ${filePath}`);
     if (beforeRead.dev !== beforeOpen.dev || beforeRead.ino !== beforeOpen.ino) {
       throw new Error(`File changed before read: ${relativePath}`);
+    }
+    assertNoNestedAncestorSymlink();
+    const postOpenParent = realpathSync(dirname(lexicalFile));
+    const postOpenPathStat = lstatSync(lexicalFile);
+    if (
+      postOpenParent !== canonicalParent ||
+      !contained(postOpenParent) ||
+      postOpenPathStat.dev !== beforeRead.dev ||
+      postOpenPathStat.ino !== beforeRead.ino ||
+      postOpenPathStat.isSymbolicLink()
+    ) {
+      throw new Error(`Import ancestor changed before read: ${relativePath}`);
     }
     if (beforeRead.size > maxBytes) {
       throw new Error(`File too large (${beforeRead.size} bytes, max ${maxBytes}): ${relativePath}`);
@@ -551,13 +631,21 @@ export function readBoundedFilesystemImportFile(
     }
     const bytes = bounded.subarray(0, bytesRead);
     const afterRead = fstatSync(fd);
+    assertNoNestedAncestorSymlink();
+    const afterReadParent = realpathSync(dirname(lexicalFile));
+    const afterReadPathStat = lstatSync(lexicalFile);
     if (
       afterRead.dev !== beforeRead.dev ||
       afterRead.ino !== beforeRead.ino ||
       afterRead.size !== beforeRead.size ||
       afterRead.mtimeMs !== beforeRead.mtimeMs ||
       afterRead.ctimeMs !== beforeRead.ctimeMs ||
-      bytesRead !== beforeRead.size
+      bytesRead !== beforeRead.size ||
+      afterReadParent !== canonicalParent ||
+      !contained(afterReadParent) ||
+      afterReadPathStat.dev !== afterRead.dev ||
+      afterReadPathStat.ino !== afterRead.ino ||
+      afterReadPathStat.isSymbolicLink()
     ) {
       throw new Error(`File changed while reading: ${relativePath}`);
     }
@@ -574,7 +662,11 @@ export function resolveImportCheckpointBrainIdentity(
   engine: BrainEngine,
   explicit?: string,
 ): string {
-  return explicit ?? engine.getDatabaseIdentity?.() ?? computeBrainId(loadConfig()?.database_url);
+  const config = loadConfig();
+  return explicit ?? engine.getDatabaseIdentity?.() ?? databaseIdentity({
+    database_url: config?.database_url,
+    database_path: config?.database_path,
+  });
 }
 
 export async function runImport(
@@ -893,6 +985,7 @@ export async function runImport(
         const bytes = readBoundedFilesystemImportFile(
           filePath,
           relativePath,
+          dir,
           opts._hooks?.onFilesystemRead,
         );
         sourceFingerprint = fingerprintImportBytes(bytes);
@@ -901,11 +994,12 @@ export async function runImport(
           // The initial batch proof is only a candidate. Re-read this exact row
           // at the skip boundary so a same-source writer that changed it after
           // checkpoint loading cannot be banked as converged.
-          const currentProof = (await loadImportDbProofs(
-            engine,
+          const currentProof = await captureImportDbProof(
+            eng,
             effectiveSourceId,
-            [relativePath],
-          )).get(relativePath);
+            relativePath,
+            opts.writerLease!,
+          );
           if (
             currentProof?.pageId === resumeProof.pageId
             && currentProof.slug === resumeProof.slug
@@ -943,7 +1037,9 @@ export async function runImport(
         console.error(`[gbrain phase] import.process_file slow ${_fileMs}ms ${relativePath}`);
       }
       if (result.status === 'imported') {
-        const dbProof = (await loadImportDbProofs(engine, effectiveSourceId, [relativePath])).get(relativePath);
+        const dbProof = await captureImportDbProof(
+          eng, effectiveSourceId, relativePath, opts.writerLease!,
+        );
         if (!dbProof) throw new Error(`Import convergence proof missing for ${effectiveSourceId}:${relativePath}`);
         if (dbProof.slug !== result.slug) {
           throw new Error(`Import convergence slug changed for ${effectiveSourceId}:${relativePath}`);
@@ -970,7 +1066,9 @@ export async function runImport(
           // Bug 9 — non-"unchanged" skips carry a real error reason.
           failures.push({ path: relativePath, error: result.error });
         } else {
-          const dbProof = (await loadImportDbProofs(engine, effectiveSourceId, [relativePath])).get(relativePath);
+          const dbProof = await captureImportDbProof(
+            eng, effectiveSourceId, relativePath, opts.writerLease!,
+          );
           if (!dbProof) throw new Error(`Import convergence proof missing for ${effectiveSourceId}:${relativePath}`);
           if (dbProof.slug !== result.slug) {
             throw new Error(`Import convergence slug changed for ${effectiveSourceId}:${relativePath}`);

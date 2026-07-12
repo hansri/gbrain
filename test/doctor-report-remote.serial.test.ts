@@ -12,6 +12,7 @@ import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { getOrCreateDatabaseInstanceId } from '../src/core/database-instance-id.ts';
 import { doctorReportRemote, computeDoctorReport, type DoctorReport, type Check } from '../src/commands/doctor.ts';
 
 let engine: PGLiteEngine;
@@ -29,6 +30,7 @@ beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
+  await getOrCreateDatabaseInstanceId(engine);
 });
 
 afterAll(async () => {
@@ -68,6 +70,13 @@ describe('doctorReportRemote', () => {
     expect(sv!.message.toLowerCase()).toContain('latest');
   });
 
+  test('critical multi-source ownership indexes are independently healthy', async () => {
+    const report = await doctorReportRemote(engine);
+    const ownership = report.checks.find(c => c.name === 'multi_source_ownership_indexes');
+    expect(ownership).toBeDefined();
+    expect(ownership!.status).toBe('ok');
+  });
+
   test('queue_health is informational on PGLite', async () => {
     const report = await doctorReportRemote(engine);
     const q = report.checks.find(c => c.name === 'queue_health');
@@ -82,6 +91,25 @@ describe('doctorReportRemote', () => {
     expect(report.status).toMatch(/healthy|warnings/);
     expect(report.health_score).toBeGreaterThanOrEqual(70);
   });
+});
+
+describe('doctorReportRemote ownership drift', () => {
+  test('dropped critical index is unhealthy even when schema version is at head', async () => {
+    const drifted = new PGLiteEngine();
+    await drifted.connect({});
+    try {
+      await drifted.initSchema();
+      await getOrCreateDatabaseInstanceId(drifted);
+      await drifted.executeRaw('DROP INDEX pages_source_path_owner_uniq');
+      const report = await doctorReportRemote(drifted);
+      const ownership = report.checks.find(c => c.name === 'multi_source_ownership_indexes');
+      expect(ownership?.status).toBe('fail');
+      expect(ownership?.message).toContain('pages_source_path_owner_uniq');
+      expect(report.status).toBe('unhealthy');
+    } finally {
+      await drifted.disconnect();
+    }
+  }, 60_000);
 });
 
 describe('computeDoctorReport — score + status math', () => {

@@ -16,27 +16,33 @@
  *                agent can walk through its plugin-contract work per
  *                skills/migrations/v0.11.0.md.
  *   F. Install — gbrain autopilot --install (env-aware).
- *   G. Record  — append completed.jsonl (status: complete unless any
- *                pending-host-work items remain).
+ *   G. Record  — append completed.jsonl (status: failed when any critical
+ *                phase failed, otherwise partial while host work remains).
  */
 
 import { existsSync, readFileSync, writeFileSync, mkdirSync, appendFileSync, lstatSync, statSync, realpathSync } from 'fs';
 import { join, resolve, dirname } from 'path';
-import { execSync } from 'child_process';
 import type { Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult } from './types.ts';
 import { savePreferences, loadPreferences } from '../../core/preferences.ts';
+import { gbrainPath } from '../../core/config.ts';
 // Bug 3 — appendCompletedMigration moved to the runner (apply-migrations.ts).
 import { promptLine } from '../../core/cli-util.ts';
 import { VERSION } from '../../version.ts';
+import { runSnapshotMigrateOnly } from './snapshot.ts';
+import { runGbrainSubprocess } from './in-process.ts';
 
 const BUILTIN_HANDLERS = new Set(['sync', 'embed', 'lint', 'import', 'extract', 'backlinks', 'autopilot-cycle']);
 const AGENTS_MD_MARKER = '<!-- gbrain:subagent-routing v0.11.0 -->';
 const CRON_MIGRATED_PROPERTY = '_gbrain_migrated_by';
 const MAX_HOST_FILE_BYTES = 1_000_000;
 
+interface OrchestratorRuntimeDeps {
+  /** Test-only same-release resolver; production always uses runtime authority. */
+  resolveSubprocessInvocation?: (args: readonly string[]) => string[];
+}
+
 function home(): string { return process.env.HOME || ''; }
-function gbrainDir(): string { return join(home(), '.gbrain'); }
-function pendingHostWorkPath(): string { return join(gbrainDir(), 'migrations', 'pending-host-work.jsonl'); }
+function pendingHostWorkPath(): string { return gbrainPath('migrations', 'pending-host-work.jsonl'); }
 
 export interface PendingHostWorkEntry {
   type: 'cron-handler-needs-host-registration' | 'agents-md-dispatcher-needs-host-review';
@@ -66,8 +72,7 @@ async function phaseASchema(opts: OrchestratorOpts): Promise<OrchestratorPhaseRe
     // connect) plus a PGLite-only in-process branch (which separately
     // deadlocked on the file lock, #1100). runMigrateOnlyCore is the single
     // in-process path for both engines.
-    const { runMigrateOnlyCore } = await import('./in-process.ts');
-    await runMigrateOnlyCore();
+    await runSnapshotMigrateOnly(opts);
     return { name: 'schema', status: 'complete' };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -79,10 +84,17 @@ async function phaseASchema(opts: OrchestratorOpts): Promise<OrchestratorPhaseRe
 // Phase B — Smoke
 // -----------------------------------------------------------------------
 
-function phaseBSmoke(opts: OrchestratorOpts): OrchestratorPhaseResult {
+async function phaseBSmoke(
+  opts: OrchestratorOpts,
+  deps: OrchestratorRuntimeDeps = {},
+): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) return { name: 'smoke', status: 'skipped', detail: 'dry-run' };
   try {
-    execSync('gbrain jobs smoke', { stdio: 'inherit', timeout: 30_000, env: process.env });
+    await runGbrainSubprocess(['jobs', 'smoke'], {
+      timeoutMs: 30_000, snapshot: opts, effect: 'mutating',
+    }, deps.resolveSubprocessInvocation
+      ? { resolveInvocation: deps.resolveSubprocessInvocation }
+      : {});
     return { name: 'smoke', status: 'complete' };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -255,12 +267,7 @@ function rewriteCronManifest(
 
   // Detect engine for --follow branch (PGLite needs --follow because its
   // worker daemon can't run; Postgres drops --follow + uses idempotency key).
-  // We load config lazily to avoid a hard dep.
-  let enginePglite = false;
-  try {
-    const cfg = JSON.parse(readFileSync(join(gbrainDir(), 'config.json'), 'utf-8'));
-    enginePglite = cfg?.engine === 'pglite';
-  } catch { /* best-effort */ }
+  const enginePglite = opts.gbrainConfig.engine === 'pglite';
 
   for (const rawEntry of entries) {
     if (!rawEntry || typeof rawEntry !== 'object') continue;
@@ -325,10 +332,14 @@ function rewriteCronManifest(
   let todosEmitted = 0;
   if (pendingEntries.length > 0 && !opts.dryRun) {
     const existingTodos = loadPendingHostWork();
-    const seen = new Set<string>(existingTodos.map(t => `${t.handler}::${t.manifest_path}`));
+    const seen = new Set<string>(
+      existingTodos
+        .map(pendingHostWorkEntryKey)
+        .filter((key): key is string => key !== null),
+    );
     for (const todo of pendingEntries) {
-      const key = `${todo.handler}::${todo.manifest_path}`;
-      if (seen.has(key)) continue;
+      const key = pendingHostWorkEntryKey(todo);
+      if (!key || seen.has(key)) continue;
       seen.add(key);
       appendPendingHostWork(todo);
       todosEmitted++;
@@ -352,6 +363,32 @@ export function loadPendingHostWork(): PendingHostWorkEntry[] {
   return out;
 }
 
+function pendingHostWorkEntryKey(entry: PendingHostWorkEntry): string | null {
+  if (entry.type === 'cron-handler-needs-host-registration') {
+    if (!entry.handler || !entry.manifest_path) return null;
+    return `cron::${entry.handler}::${entry.manifest_path}`;
+  }
+  if (entry.type === 'agents-md-dispatcher-needs-host-review') {
+    if (!entry.file) return null;
+    return `agents-md::${entry.file}`;
+  }
+  return null;
+}
+
+/**
+ * Collapse the append-only host-work journal by identity. The last row wins,
+ * so an appended `complete` receipt clears its earlier `pending` row while
+ * duplicate pending rows still count as one outstanding action.
+ */
+export function loadOutstandingPendingHostWork(): PendingHostWorkEntry[] {
+  const latest = new Map<string, PendingHostWorkEntry>();
+  for (const entry of loadPendingHostWork()) {
+    const key = pendingHostWorkEntryKey(entry);
+    if (key) latest.set(key, entry);
+  }
+  return [...latest.values()].filter(entry => entry.status === 'pending');
+}
+
 export function appendPendingHostWork(entry: PendingHostWorkEntry): void {
   mkdirSync(dirname(pendingHostWorkPath()), { recursive: true });
   appendFileSync(pendingHostWorkPath(), JSON.stringify(entry) + '\n');
@@ -368,19 +405,36 @@ async function phaseEHost(opts: OrchestratorOpts): Promise<{
 
   // AGENTS.md marker injection.
   for (const path of findAgentsMdFiles(opts)) {
-    const { injected, skipReason } = injectAgentsMdMarker(path, opts);
-    if (injected) filesTouched++;
-    if (skipReason && skipReason !== 'already has marker' && skipReason !== 'dry-run') {
-      warnings.push(`${path}: ${skipReason}`);
+    try {
+      const { injected, skipReason } = injectAgentsMdMarker(path, opts);
+      if (injected) filesTouched++;
+      if (skipReason && skipReason !== 'already has marker' && skipReason !== 'dry-run') {
+        warnings.push(`${path}: ${skipReason}`);
+      }
+    } catch (e) {
+      warnings.push(`${path}: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
   // Cron manifest rewrites.
   for (const path of findCronManifests(opts)) {
-    const { rewritten, todos_emitted, skipReason } = rewriteCronManifest(path, opts);
-    filesTouched += rewritten;
-    todosEmitted += todos_emitted;
-    if (skipReason) warnings.push(`${path}: ${skipReason}`);
+    try {
+      const { rewritten, todos_emitted, skipReason } = rewriteCronManifest(path, opts);
+      filesTouched += rewritten;
+      todosEmitted += todos_emitted;
+      if (skipReason) warnings.push(`${path}: ${skipReason}`);
+    } catch (e) {
+      warnings.push(`${path}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  let outstandingHostWork = 0;
+  try {
+    // Count durable state after all deduped appends. Counting only newly
+    // emitted rows would let an unchanged second run falsely report complete.
+    outstandingHostWork = loadOutstandingPendingHostWork().length;
+  } catch (e) {
+    warnings.push(`${pendingHostWorkPath()}: ${e instanceof Error ? e.message : String(e)}`);
   }
 
   if (warnings.length > 0) {
@@ -389,9 +443,13 @@ async function phaseEHost(opts: OrchestratorOpts): Promise<{
   }
 
   return {
-    phase: { name: 'host', status: 'complete', detail: `rewrote ${filesTouched} entries; ${todosEmitted} host-work TODOs emitted` },
+    phase: {
+      name: 'host',
+      status: warnings.length > 0 ? 'failed' : 'complete',
+      detail: `rewrote ${filesTouched} entries; ${todosEmitted} host-work TODOs emitted; ${outstandingHostWork} outstanding`,
+    },
     files_rewritten: filesTouched,
-    pending_host_work: todosEmitted,
+    pending_host_work: outstandingHostWork,
   };
 }
 
@@ -399,24 +457,43 @@ async function phaseEHost(opts: OrchestratorOpts): Promise<{
 // Phase F — Autopilot install
 // -----------------------------------------------------------------------
 
-function phaseFInstall(opts: OrchestratorOpts): OrchestratorPhaseResult {
+async function phaseFInstall(
+  opts: OrchestratorOpts,
+  deps: OrchestratorRuntimeDeps = {},
+): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) return { name: 'install', status: 'skipped', detail: 'dry-run' };
   if (opts.noAutopilotInstall) return { name: 'install', status: 'skipped', detail: '--no-autopilot-install' };
   try {
-    execSync('gbrain autopilot --install --yes', { stdio: 'inherit', timeout: 60_000, env: process.env });
+    await runGbrainSubprocess(['autopilot', '--install', '--yes'], {
+      timeoutMs: 60_000, snapshot: opts, effect: 'mutating',
+    }, deps.resolveSubprocessInvocation
+      ? { resolveInvocation: deps.resolveSubprocessInvocation }
+      : {});
     return { name: 'install', status: 'complete' };
   } catch (e) {
-    // Install is best-effort — log but don't fail the whole migration. User
-    // can re-run `gbrain autopilot --install` manually.
+    // A missing autopilot install means the advertised migration is not
+    // complete. The runner records a terminal failure receipt and a later
+    // explicit retry can safely replay this idempotent phase.
     return { name: 'install', status: 'failed', detail: e instanceof Error ? e.message : String(e) };
   }
+}
+
+function deriveMigrationStatus(
+  phases: OrchestratorPhaseResult[],
+  pendingHostWork: number,
+): OrchestratorResult['status'] {
+  if (phases.some(phase => phase.status === 'failed')) return 'failed';
+  return pendingHostWork > 0 ? 'partial' : 'complete';
 }
 
 // -----------------------------------------------------------------------
 // Orchestrator
 // -----------------------------------------------------------------------
 
-async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult> {
+async function orchestrator(
+  opts: OrchestratorOpts,
+  deps: OrchestratorRuntimeDeps = {},
+): Promise<OrchestratorResult> {
   const phases: OrchestratorPhaseResult[] = [];
 
   const a = await phaseASchema(opts);
@@ -426,7 +503,7 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
     return { version: '0.11.0', status: 'failed', phases };
   }
 
-  const b = phaseBSmoke(opts);
+  const b = await phaseBSmoke(opts, deps);
   phases.push(b);
   if (b.status === 'failed') {
     console.error(`Phase B (smoke) failed: ${b.detail}. Aborting; re-run after fixing.`);
@@ -446,13 +523,13 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
   const { phase: e, files_rewritten, pending_host_work } = await phaseEHost(opts);
   phases.push(e);
 
-  const f = phaseFInstall(opts);
+  const f = await phaseFInstall(opts, deps);
   phases.push(f);
 
   // Bug 3 — Phase G (record in completed.jsonl) moved to the runner. The
   // runner in apply-migrations.ts persists the result after orchestrator
   // returns, so we just decide the status here.
-  const status: 'complete' | 'partial' = (pending_host_work > 0) ? 'partial' : 'complete';
+  const status = deriveMigrationStatus(phases, pending_host_work);
   phases.push({ name: 'record', status: opts.dryRun ? 'skipped' : 'complete', detail: `status=${status} (ledger write in runner)` });
 
   // Post-run: print pending-host-work summary if anything needs host action.
@@ -503,5 +580,9 @@ export const __testing = {
   BUILTIN_HANDLERS,
   AGENTS_MD_MARKER,
   loadPendingHostWork,
+  loadOutstandingPendingHostWork,
+  appendPendingHostWork,
   pendingHostWorkPath,
+  deriveMigrationStatus,
+  orchestrator,
 };

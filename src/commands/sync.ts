@@ -1606,7 +1606,8 @@ export async function runBreakLock(
 
   // v0.41.13.0 (T4 / D-V3-4 / D-V4-mech-4) — --max-age path: route through
   // deleteLockRowIfStale which runs a single atomic DELETE keyed on
-  // (id, holder_pid, last_refreshed_at < NOW() - maxAge). Healthy refreshing
+  // (id, holder_pid, holder_token, last_refreshed_at < NOW() - maxAge).
+  // Healthy refreshing
   // holders survive by construction (their last_refreshed_at is recent).
   // Wedged-but-alive holders (JS interval stopped firing) get broken.
   // No TOCTOU between inspect + delete; the WHERE clause is the gate.
@@ -1628,7 +1629,7 @@ export async function runBreakLock(
       return 1;
     }
     const { deleted, lastRefreshedAt } = await deleteLockRowIfStale(
-      engine, lockKey, snap.holder_pid, opts.maxAgeSeconds,
+      engine, lockKey, snap.holder_pid, snap.holder_token, opts.maxAgeSeconds,
     );
     if (opts.json) {
       console.log(JSON.stringify({
@@ -1661,7 +1662,7 @@ export async function runBreakLock(
 
   // Force path: skip all guards, atomic DELETE, warn.
   if (opts.force) {
-    const { deleted } = await deleteLockRow(engine, lockKey, snap.holder_pid);
+    const { deleted } = await deleteLockRow(engine, lockKey, snap.holder_pid, snap.holder_token);
     if (opts.json) {
       console.log(JSON.stringify({
         status: deleted ? 'force_broken' : 'race_already_cleared',
@@ -1732,7 +1733,7 @@ export async function runBreakLock(
     return 1;
   }
 
-  const { deleted } = await deleteLockRow(engine, lockKey, snap.holder_pid);
+  const { deleted } = await deleteLockRow(engine, lockKey, snap.holder_pid, snap.holder_token);
   if (opts.json) {
     console.log(JSON.stringify({
       status: deleted ? 'broken' : 'race_already_cleared',
@@ -2541,39 +2542,49 @@ async function performSyncInner(
   ): Promise<void> => {
     const sourceId = opts.sourceId ?? DEFAULT_SOURCE_ID;
     const probePaths = [path, ...(retiredPath ? [retiredPath] : [])];
-    const rows = await engine.executeRaw<{
-      id: number;
-      slug: string;
-      source_path: string;
-      content_hash: string;
-    }>(
-      `SELECT id, slug, source_path, content_hash FROM pages
-        WHERE source_id = $1 AND source_path = ANY($2::text[]) AND deleted_at IS NULL`,
-      [sourceId, probePaths],
-    );
-    const owners = rows.filter(row => row.source_path === path);
-    const retiredOwners = retiredPath ? rows.filter(row => row.source_path === retiredPath) : [];
-    const blob = pinSnapshot.getBlob(path);
-    if (state === 'present') {
-      if (owners.length !== 1 || !blob || retiredOwners.length > 0) {
-        throw new Error(`Cannot bank unproven sync path ${sourceId}:${path}`);
+    const proof = await engine.transaction(async tx => {
+      assertSourceWriterLease(writerLease, tx, sourceId);
+      // Canonical page writers share this source lease. Present rows are also
+      // locked below; absence is provisional and is re-proved under the one
+      // final bookmark fence. A brain-wide table lock here would serialize
+      // unrelated sources once per path and defeat source-parallel sync.
+      const rows = await tx.executeRaw<{
+        id: number;
+        slug: string;
+        source_path: string;
+        content_hash: string;
+      }>(
+        `SELECT id, slug, source_path, content_hash FROM pages
+          WHERE source_id = $1 AND source_path = ANY($2::text[]) AND deleted_at IS NULL
+          FOR UPDATE`,
+        [sourceId, probePaths],
+      );
+      const owners = rows.filter(row => row.source_path === path);
+      const retiredOwners = retiredPath ? rows.filter(row => row.source_path === retiredPath) : [];
+      const blob = pinSnapshot.getBlob(path);
+      if (state === 'present') {
+        if (owners.length !== 1 || !blob || retiredOwners.length > 0) {
+          throw new Error(`Cannot bank unproven sync path ${sourceId}:${path}`);
+        }
+      } else if (owners.length !== 0 || blob !== null) {
+        throw new Error(`Cannot bank unproven sync tombstone ${sourceId}:${path}`);
       }
-    } else if (owners.length !== 0 || blob !== null) {
-      throw new Error(`Cannot bank unproven sync tombstone ${sourceId}:${path}`);
-    }
-    const proof = encodeSyncResumeProof({
-      v: 2,
-      path,
-      state,
-      ...(state === 'present'
-        ? {
-            blobOid: blob!.oid,
-            pageId: Number(owners[0]!.id),
-            slug: owners[0]!.slug,
-            contentHash: owners[0]!.content_hash,
-          }
-        : {}),
-      ...(retiredPath ? { retiredPath } : {}),
+      const encoded = encodeSyncResumeProof({
+        v: 2,
+        path,
+        state,
+        ...(state === 'present'
+          ? {
+              blobOid: blob!.oid,
+              pageId: Number(owners[0]!.id),
+              slug: owners[0]!.slug,
+              contentHash: owners[0]!.content_hash,
+            }
+          : {}),
+        ...(retiredPath ? { retiredPath } : {}),
+      });
+      await assertSourceWriterLeaseAtCommit(writerLease, tx, sourceId);
+      return encoded;
     });
     convergenceProofs.set(path, proof);
     completed.add(path);
@@ -2734,6 +2745,68 @@ async function performSyncInner(
   // re-resolving + re-deleting tens of thousands of already-gone pages).
   const deletesToDo = resumeFilter(filtered.deleted, [...completed]);
   if (deletesToDo.length > 0) {
+    class BatchDeleteNeedsFallback extends Error {
+      constructor(readonly batchError: unknown) {
+        super(batchError instanceof Error ? batchError.message : String(batchError));
+        this.name = 'BatchDeleteNeedsFallback';
+      }
+    }
+
+    const verifyDeletedPaths = async (tx: BrainEngine, batch: string[]): Promise<void> => {
+      const remaining = await tx.executeRaw<{ source_path: string }>(
+        `SELECT source_path FROM pages
+          WHERE source_id = $1 AND source_path = ANY($2::text[])`,
+        [deleteSourceId, batch],
+      );
+      if (remaining.length > 0) {
+        throw new Error(
+          `${remaining.length} file-backed page(s) remained after delete ` +
+          `(first source_path: ${remaining[0]!.source_path})`,
+        );
+      }
+    };
+
+    const deleteIndividuallyAfterRollback = async (
+      batch: string[],
+      batchError: unknown,
+    ): Promise<string[]> => {
+      // The failed Postgres DELETE aborts its transaction. Resolve and delete
+      // only after that transaction has rolled back; issuing deletePage on the
+      // aborted tx can never succeed. The source lease remains held across the
+      // fresh fenced transactions, and partial progress is safe/idempotent.
+      const slugs = await engine.transaction(async tx => {
+        assertSourceWriterLease(writerLease, tx, deleteSourceId);
+        const pathSlugMap = await tx.resolveSlugsByPaths(batch, deleteOpts);
+        await assertSourceWriterLeaseAtCommit(writerLease, tx, deleteSourceId);
+        return [...new Set(batch.flatMap(path => {
+          const slug = pathSlugMap.get(path);
+          return slug ? [slug] : [];
+        }))];
+      });
+      const deletedSlugs: string[] = [];
+      for (const slug of slugs) {
+        try {
+          await engine.transaction(async tx => {
+            assertSourceWriterLease(writerLease, tx, deleteSourceId);
+            await tx.deletePage(slug, deleteOpts);
+            await assertSourceWriterLeaseAtCommit(writerLease, tx, deleteSourceId);
+          });
+          deletedSlugs.push(slug);
+        } catch (perSlugError) {
+          throw new Error(
+            `delete failed for ${slug}: ${perSlugError instanceof Error ? perSlugError.message : String(perSlugError)} ` +
+            `(batch error: ${batchError instanceof Error ? batchError.message : String(batchError)})`,
+          );
+        }
+      }
+      await engine.transaction(async tx => {
+        assertSourceWriterLease(writerLease, tx, deleteSourceId);
+        await verifyDeletedPaths(tx, batch);
+        await assertSourceWriterLeaseAtCommit(writerLease, tx, deleteSourceId);
+      });
+      return deletedSlugs;
+    };
+
     progress.start('sync.deletes', deletesToDo.length);
     for (let i = 0; i < deletesToDo.length; i += DELETE_BATCH_SIZE) {
       if (opts.signal?.aborted) {
@@ -2742,58 +2815,36 @@ async function performSyncInner(
       }
       const batch = deletesToDo.slice(i, i + DELETE_BATCH_SIZE);
 
-      // Slug resolution is authoritative for custom/frontmatter-owned slugs.
-      // If it fails, deleting the path-derived fallback can leave the real row
-      // live while advancing last_commit, so this batch hard-blocks untouched.
-      let pathSlugMap: Map<string, string>;
       try {
-        pathSlugMap = await engine.resolveSlugsByPaths(batch, deleteOpts);
-      } catch (error) {
-        recordDeleteFailure(error);
-        progress.tick(batch.length, `delete-resolve-failed ${Math.min(i + DELETE_BATCH_SIZE, deletesToDo.length)}/${deletesToDo.length}`);
-        continue;
-      }
-      // Delete only rows proven to be owned by these source paths. Missing map
-      // entries are already-absent or manual/legacy rows and must not be guessed.
-      const slugs = [...new Set(batch.flatMap(p => {
-        const slug = pathSlugMap.get(p);
-        return slug ? [slug] : [];
-      }))];
-
-      try {
-        if (slugs.length > 0) {
-          try {
-            const deleted = await engine.deletePages(slugs, deleteOpts);
-            pagesAffected.push(...deleted);
-          } catch (batchError) {
-            for (const slug of slugs) {
+        let deletedInBatch: string[];
+        try {
+          deletedInBatch = await engine.transaction(async tx => {
+            assertSourceWriterLease(writerLease, tx, deleteSourceId);
+            // Slug resolution and deletion share one fenced transaction. A stale
+            // holder that lost its lease cannot autocommit destructive changes
+            // and discover the takeover only at final bookmark advancement.
+            const pathSlugMap = await tx.resolveSlugsByPaths(batch, deleteOpts);
+            const slugs = [...new Set(batch.flatMap(p => {
+              const slug = pathSlugMap.get(p);
+              return slug ? [slug] : [];
+            }))];
+            let deletedSlugs: string[] = [];
+            if (slugs.length > 0) {
               try {
-                await engine.deletePage(slug, deleteOpts);
-                pagesAffected.push(slug);
-              } catch (perSlugError) {
-                throw new Error(
-                  `delete failed for ${slug}: ${perSlugError instanceof Error ? perSlugError.message : String(perSlugError)} ` +
-                  `(batch error: ${batchError instanceof Error ? batchError.message : String(batchError)})`,
-                );
+                deletedSlugs = await tx.deletePages(slugs, deleteOpts);
+              } catch (batchError) {
+                throw new BatchDeleteNeedsFallback(batchError);
               }
             }
-          }
+            await verifyDeletedPaths(tx, batch);
+            await assertSourceWriterLeaseAtCommit(writerLease, tx, deleteSourceId);
+            return deletedSlugs;
+          });
+        } catch (error) {
+          if (!(error instanceof BatchDeleteNeedsFallback)) throw error;
+          deletedInBatch = await deleteIndividuallyAfterRollback(batch, error.batchError);
         }
-
-        // Verify by source_path, not guessed slug. This catches a missing map
-        // entry, custom slug, duplicate row, or a delete primitive that returned
-        // success without removing the authoritative file-backed row.
-        const remaining = await engine.executeRaw<{ source_path: string }>(
-          `SELECT source_path FROM pages
-            WHERE source_id = $1 AND source_path = ANY($2::text[])`,
-          [deleteSourceId, batch],
-        );
-        if (remaining.length > 0) {
-          throw new Error(
-            `${remaining.length} file-backed page(s) remained after delete ` +
-            `(first source_path: ${remaining[0]!.source_path})`,
-          );
-        }
+        pagesAffected.push(...deletedInBatch);
         for (const path of batch) {
           deletedPathsSucceeded.push(path);
           await markCompleted(path, 'absent');

@@ -1,7 +1,11 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { generateSystemdUnit } from '../src/commands/autopilot.ts';
+import {
+  generateSystemdUnit,
+  resolveAutopilotUpgradeInvocation,
+} from '../src/commands/autopilot.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 const AUTOPILOT_SRC = readFileSync(join(import.meta.dir, '../src/commands/autopilot.ts'), 'utf8');
 
@@ -28,9 +32,31 @@ describe('autopilot self-upgrade static-shape regressions', () => {
     expect(AUTOPILOT_SRC).not.toMatch(/execvp\s*\(/);
   });
   test('the silent channel does swap-only, never a blocking full post-upgrade in the tick', () => {
-    expect(AUTOPILOT_SRC).toContain("execSync('gbrain upgrade --swap-only'");
+    expect(AUTOPILOT_SRC).toContain('resolveAutopilotUpgradeInvocation(latestVersion)');
+    expect(AUTOPILOT_SRC).not.toContain("execSync('gbrain upgrade --swap-only'");
     // The tick must not invoke the (up-to-30-min) post-upgrade inline.
     expect(AUTOPILOT_SRC).not.toContain("execSync('gbrain post-upgrade'");
+  });
+  test('hostile PATH cannot replace the exact current-release upgrade argv', async () => {
+    await withEnv({ PATH: '/tmp/hostile-path-only' }, () => {
+      expect(resolveAutopilotUpgradeInvocation('0.42.58.0', {
+        execPath: '/trusted/release/gbrain',
+        main: '/ignored/source.ts',
+      })).toEqual([
+        '/trusted/release/gbrain', 'upgrade', '--swap-only', '--target', '0.42.58.0',
+      ]);
+      expect(resolveAutopilotUpgradeInvocation('0.42.58.0', {
+        execPath: '/trusted/runtime/bun',
+        main: '/trusted/release/src/cli.ts',
+      })).toEqual([
+        '/trusted/runtime/bun', '/trusted/release/src/cli.ts',
+        'upgrade', '--swap-only', '--target', '0.42.58.0',
+      ]);
+    });
+  });
+  test('silent channel consults the local supervised-release policy', () => {
+    expect(AUTOPILOT_SRC).toContain('resolveUpgradeReleasePolicy(latestVersion)');
+    expect(AUTOPILOT_SRC).toContain('releaseAllowsSilentUpgrade: releasePolicy.inlineAllowed');
   });
   test('boot reconciles the breadcrumb and the tick attempts the channel', () => {
     expect(AUTOPILOT_SRC).toContain('reconcileSelfUpgradeAtBoot()');

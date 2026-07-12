@@ -9,8 +9,9 @@ import {
 } from '../../src/core/file-storage-publish.ts';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import { LocalStorage } from '../../src/core/storage/local.ts';
+import { getPostgresTestUrl } from '../helpers/postgres-test-authority.ts';
 
-const DATABASE_URL = process.env.DATABASE_URL;
+const DATABASE_URL = getPostgresTestUrl();
 const skip = !DATABASE_URL;
 
 if (skip) {

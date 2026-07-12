@@ -792,7 +792,8 @@ CREATE TABLE IF NOT EXISTS files (
   size_bytes   BIGINT,
   content_hash TEXT   NOT NULL,
   metadata     JSONB  NOT NULL DEFAULT '{}',
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  CONSTRAINT files_storage_path_key UNIQUE(storage_path)
 );
 
 -- Migration: drop storage_url if it exists (renamed to storage_path only)

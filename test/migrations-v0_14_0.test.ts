@@ -14,9 +14,17 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync, readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { migrationTestOpts } from './helpers/migration-opts.ts';
 
 let tmpHome: string;
 const originalGbrainHome = process.env.GBRAIN_HOME;
+
+function opts(dryRun = false) {
+  return migrationTestOpts(
+    { dryRun },
+    { engine: 'pglite', database_path: join(tmpHome, 'brain-db') },
+  );
+}
 
 beforeEach(() => {
   tmpHome = mkdtempSync(join(tmpdir(), 'gbrain-v0_14_0-'));
@@ -43,15 +51,11 @@ describe('Bug 5 + Bug 8 — v0_14_0 module shape', () => {
     expect(source).not.toContain('appendCompletedMigration');
   });
 
-  test('orchestrator returns complete when phase A is skipped (no config)', async () => {
+  test('orchestrator returns complete when phase A skips a fresh schema', async () => {
     const { v0_14_0 } = await import('../src/commands/migrations/v0_14_0.ts');
-    // No loadConfig() backing → phaseASchema reports skipped (no brain).
-    // Phase B still emits the host-work ping.
-    const result = await v0_14_0.orchestrator({
-      yes: true,
-      dryRun: false,
-      noAutopilotInstall: true,
-    });
+    // The snapshotted fresh PGLite target has no minion_jobs table yet, so
+    // Phase A skips and Phase B still emits the host-work ping.
+    const result = await v0_14_0.orchestrator(opts());
     expect(['complete', 'partial']).toContain(result.status);
     expect(result.version).toBe('0.14.0');
     const hostWork = result.phases.find(p => p.name === 'host-work');
@@ -63,7 +67,7 @@ describe('Bug 5 — Phase B host-work entry dedup', () => {
   test('first run writes the entry, second run is a skip', async () => {
     const { v0_14_0 } = await import('../src/commands/migrations/v0_14_0.ts');
 
-    const first = await v0_14_0.orchestrator({ yes: true, dryRun: false, noAutopilotInstall: true });
+    const first = await v0_14_0.orchestrator(opts());
     const hostPath = join(tmpHome, '.gbrain', 'migrations', 'pending-host-work.jsonl');
     expect(existsSync(hostPath)).toBe(true);
 
@@ -71,7 +75,7 @@ describe('Bug 5 — Phase B host-work entry dedup', () => {
     expect(beforeLines).toBe(1);
 
     // Second run — Phase B should skip, not duplicate.
-    await v0_14_0.orchestrator({ yes: true, dryRun: false, noAutopilotInstall: true });
+    await v0_14_0.orchestrator(opts());
     const afterLines = readFileSync(hostPath, 'utf-8').split('\n').filter(l => l.trim()).length;
     expect(afterLines).toBe(1);
 
@@ -82,7 +86,7 @@ describe('Bug 5 — Phase B host-work entry dedup', () => {
 
   test('dry-run writes nothing', async () => {
     const { v0_14_0 } = await import('../src/commands/migrations/v0_14_0.ts');
-    await v0_14_0.orchestrator({ yes: true, dryRun: true, noAutopilotInstall: true });
+    await v0_14_0.orchestrator(opts(true));
     const hostPath = join(tmpHome, '.gbrain', 'migrations', 'pending-host-work.jsonl');
     expect(existsSync(hostPath)).toBe(false);
   });

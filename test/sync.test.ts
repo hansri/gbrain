@@ -765,7 +765,6 @@ describe('resolveSlugByPathOrSourcePath (CJK wave v0.32.7, codex F4)', () => {
 
   test('propagates ownership lookup errors so cleanup cannot advance stale rows', async () => {
     const { resolveSlugByPathOrSourcePath } = await import('../src/commands/sync.ts');
-    const original = pgEngine.resolveSlugsByPaths.bind(pgEngine);
     (pgEngine as any).resolveSlugsByPaths = async () => {
       throw new Error('ownership database unavailable');
     };
@@ -773,7 +772,7 @@ describe('resolveSlugByPathOrSourcePath (CJK wave v0.32.7, codex F4)', () => {
       await expect(resolveSlugByPathOrSourcePath(pgEngine, 'people/alice.md'))
         .rejects.toThrow('ownership database unavailable');
     } finally {
-      (pgEngine as any).resolveSlugsByPaths = original;
+      delete (pgEngine as any).resolveSlugsByPaths;
     }
   });
 
@@ -1391,22 +1390,26 @@ describe('#1970: unreachable last_commit bookmark recovery', () => {
     fixtureGit(repo, ['rm', 'people/alice.md']);
     fixtureGit(repo, ['commit', '-m', 'remove custom slug page']);
 
-    const originalResolve = engine.resolveSlugsByPaths.bind(engine);
-    (engine as any).resolveSlugsByPaths = async () => { throw new Error('resolver unavailable'); };
-    const resolverBlocked = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
-    expect(resolverBlocked.status).toBe('blocked_by_failures');
-    expect(await bookmark()).toBe(before);
-    expect(await engine.getPage('custom/alice')).not.toBeNull();
+    try {
+      (engine as any).resolveSlugsByPaths = async () => { throw new Error('resolver unavailable'); };
+      const resolverBlocked = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+      expect(resolverBlocked.status).toBe('blocked_by_failures');
+      expect(await bookmark()).toBe(before);
+      expect(await engine.getPage('custom/alice')).not.toBeNull();
 
-    // An empty/incorrect map must also fail verification instead of deleting a
-    // guessed path slug and advancing past the still-live custom row.
-    (engine as any).resolveSlugsByPaths = async () => new Map();
-    const verifyBlocked = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
-    expect(verifyBlocked.status).toBe('blocked_by_failures');
-    expect(await bookmark()).toBe(before);
-    expect(await engine.getPage('custom/alice')).not.toBeNull();
-
-    (engine as any).resolveSlugsByPaths = originalResolve;
+      // An empty/incorrect map must also fail verification instead of deleting a
+      // guessed path slug and advancing past the still-live custom row.
+      (engine as any).resolveSlugsByPaths = async () => new Map();
+      const verifyBlocked = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+      expect(verifyBlocked.status).toBe('blocked_by_failures');
+      expect(await bookmark()).toBe(before);
+      expect(await engine.getPage('custom/alice')).not.toBeNull();
+    } finally {
+      // Remove the instance seam so transaction-scoped engines inherit the
+      // prototype method with their own receiver. Restoring a bound root-engine
+      // function would query the root PGLite connection while its tx is open.
+      delete (engine as any).resolveSlugsByPaths;
+    }
     const resumed = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     expect(resumed.status).toBe('synced');
     expect(await engine.getPage('custom/alice')).toBeNull();

@@ -37,7 +37,13 @@
  */
 
 import postgres from 'postgres';
-import { resolvePrepare, resolveSessionTimeouts, resolvePoolSize, endPoolBounded } from './db.ts';
+import {
+  resolvePrepare,
+  resolveSessionTimeouts,
+  resolvePoolSize,
+  endPoolBounded,
+  isLikelyTransactionPoolerUrl,
+} from './db.ts';
 import { redactPgUrl } from './url-redact.ts';
 import { logConnectionEvent } from './connection-audit.ts';
 
@@ -48,7 +54,10 @@ export interface ConnectionManagerOpts {
   url: string;
   /**
    * Override for the direct URL. When set, takes precedence over auto-derivation.
-   * Sourced from GBRAIN_DIRECT_DATABASE_URL or explicit caller config.
+   * Sourced from GBRAIN_DIRECT_DATABASE_URL or explicit caller config. Schema
+   * mutation uses this authority even for non-Supabase transaction poolers;
+   * initSchema validates that it reaches the same public-owned database before
+   * any DDL. General read/bulk routing retains the existing Supabase boundary.
    */
   directUrl?: string | null;
   /**
@@ -135,7 +144,12 @@ export function deriveDirectUrl(url: string): string | null {
     const port = parsed.port;
     const hostname = parsed.hostname;
     const isPoolerHost = SUPABASE_POOLER_HOSTNAME_PATTERNS.some(re => re.test(hostname));
-    if (port !== '6543' && !isPoolerHost) return null;
+    // Port 6543 alone identifies transaction pooling, not a derivable direct
+    // host. Rewriting an arbitrary PgBouncer hostname to :5432 can silently
+    // point locks at the wrong/unreachable service. Only the documented
+    // Supabase hostname shape is derivable; other poolers require an explicit
+    // GBRAIN_DIRECT_DATABASE_URL.
+    if (!isPoolerHost) return null;
     // User part on Supabase pooler is typically `postgres.<project-ref>`.
     // Extract <project-ref> for the direct hostname.
     const user = parsed.username || '';
@@ -154,6 +168,10 @@ export function deriveDirectUrl(url: string): string | null {
     // Compose direct URL by swapping host + port. Preserve auth, db, query.
     parsed.hostname = directHost;
     parsed.port = '5432';
+    // `prepare=false` is a pooler client hint, not part of the direct endpoint
+    // authority. Keeping it would make the session-lock validator correctly
+    // reject the otherwise-direct derived URL as pooler-shaped.
+    parsed.searchParams.delete('prepare');
     // Reconstruct with the original scheme.
     const scheme = url.match(/^postgres(?:ql)?:\/\//i)?.[0] ?? 'postgres://';
     const auth = directUser
@@ -291,6 +309,34 @@ export class ConnectionManager {
       return this.getReadPool();
     }
     return this.getDirectPool();
+  }
+
+  /**
+   * Return the schema-mutation pool. An explicit/direct authority is honored
+   * for every Postgres topology, including local PgBouncer transaction mode;
+   * reserving a PgBouncer client is not the same as reserving one backend, so
+   * non-transactional DDL and its session search_path pin must run direct.
+   *
+   * This accessor is intentionally narrower than ddl()/bulk(): ordinary
+   * non-Supabase traffic keeps the historical single-pool behavior.
+   */
+  async schemaDdl(): Promise<Sql> {
+    if (this._killSwitch) {
+      if (isLikelyTransactionPoolerUrl(this.opts.url)) {
+        throw new Error(
+          'Refusing schema mutation through a transaction pooler while ' +
+          'GBRAIN_DISABLE_DIRECT_POOL is active. Unset the kill switch for the ' +
+          'schema phase, or configure the primary database URL as a direct/session endpoint.',
+        );
+      }
+      // The primary route is already session-safe, so preserve the operator's
+      // kill-switch intent without weakening the schema boundary.
+      return this.getReadPool();
+    }
+    if (this._directUrl) {
+      return this.getDirectPool();
+    }
+    return this.getReadPool();
   }
 
   /**

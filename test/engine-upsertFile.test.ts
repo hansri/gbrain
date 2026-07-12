@@ -5,6 +5,7 @@
 
 import { describe, expect, test, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import type { FileSpec } from '../src/core/engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 
 let engine: PGLiteEngine;
@@ -24,6 +25,19 @@ beforeEach(async () => {
 });
 
 describe('BrainEngine.upsertFile (Phase 3 + Eng-3E)', () => {
+  test('legacy callers without source_id remain scoped to default', async () => {
+    // Deliberately bypass the current TypeScript contract to emulate an older
+    // JavaScript client on the wire. New typed callers must provide source_id.
+    const result = await engine.upsertFile({
+      filename: 'legacy.jpg',
+      storage_path: 'legacy/legacy.jpg',
+      content_hash: 'sha256:legacy',
+    } as unknown as FileSpec);
+
+    expect(result.created).toBe(true);
+    expect((await engine.getFile('default', 'legacy/legacy.jpg'))?.source_id).toBe('default');
+  });
+
   test('happy path: inserts a new files row', async () => {
     const result = await engine.upsertFile({
       source_id: 'default',
@@ -134,7 +148,7 @@ describe('BrainEngine.upsertFile (Phase 3 + Eng-3E)', () => {
     expect(row).toBeNull();
   });
 
-  test('same storage path is isolated by source_id', async () => {
+  test('canary keeps legacy global path uniqueness until the rollback window closes', async () => {
     await engine.executeRaw(
       `INSERT INTO sources (id, name, config)
        VALUES ('source-a', 'source-a', '{}'::jsonb),
@@ -147,34 +161,28 @@ describe('BrainEngine.upsertFile (Phase 3 + Eng-3E)', () => {
       storage_path: 'photos/shared.jpg',
       content_hash: 'sha256:a-v1',
     });
-    const b = await engine.upsertFile({
+    expect(a.created).toBe(true);
+    expect((await engine.getFile('source-a', 'photos/shared.jpg'))?.content_hash).toBe('sha256:a-v1');
+    await expect(engine.upsertFile({
       source_id: 'source-b',
       filename: 'shared.jpg',
       storage_path: 'photos/shared.jpg',
       content_hash: 'sha256:b-v1',
-    });
+    })).rejects.toThrow();
+  });
 
-    expect(a.created).toBe(true);
-    expect(b.created).toBe(true);
-    expect(b.id).not.toBe(a.id);
-    expect((await engine.getFile('source-a', 'photos/shared.jpg'))?.content_hash).toBe('sha256:a-v1');
-    expect((await engine.getFile('source-b', 'photos/shared.jpg'))?.content_hash).toBe('sha256:b-v1');
-
-    const updated = await engine.upsertFile({
-      source_id: 'source-a',
-      filename: 'shared.jpg',
-      storage_path: 'photos/shared.jpg',
-      content_hash: 'sha256:a-v2',
-    });
-    expect(updated.id).toBe(a.id);
-    expect(updated.created).toBe(false);
-    expect((await engine.getFile('source-a', 'photos/shared.jpg'))?.content_hash).toBe('sha256:a-v2');
-    expect((await engine.getFile('source-b', 'photos/shared.jpg'))?.content_hash).toBe('sha256:b-v1');
-
-    const rows = await engine.executeRaw<{ source_id: string }>(
-      `SELECT source_id FROM files WHERE storage_path = $1 ORDER BY source_id`,
-      ['photos/shared.jpg'],
+  test('previous binary ON CONFLICT(storage_path) writer remains compatible', async () => {
+    await engine.executeRaw(
+      `INSERT INTO files (source_id, filename, storage_path, content_hash, metadata)
+       VALUES ('default', 'legacy.jpg', 'legacy/rollback.jpg', 'sha256:v1', '{}'::jsonb)
+       ON CONFLICT (storage_path) DO UPDATE SET content_hash = EXCLUDED.content_hash`,
     );
-    expect(rows.map(row => row.source_id)).toEqual(['source-a', 'source-b']);
+    await engine.executeRaw(
+      `INSERT INTO files (source_id, filename, storage_path, content_hash, metadata)
+       VALUES ('default', 'legacy.jpg', 'legacy/rollback.jpg', 'sha256:v2', '{}'::jsonb)
+       ON CONFLICT (storage_path) DO UPDATE SET content_hash = EXCLUDED.content_hash`,
+    );
+
+    expect((await engine.getFile('default', 'legacy/rollback.jpg'))?.content_hash).toBe('sha256:v2');
   });
 });

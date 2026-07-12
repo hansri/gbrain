@@ -4,12 +4,15 @@
  * redirected to a tmp dir; installCron:false so the suite never touches launchd.
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, statSync, chmodSync, mkdirSync } from 'fs';
+import {
+  mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, statSync,
+  chmodSync, mkdirSync, symlinkSync, linkSync,
+} from 'fs';
 import { join, dirname } from 'path';
 import { devNull, tmpdir } from 'os';
 import { execFileSync } from 'child_process';
 import {
-  hardenBrainRepo, unhardenBrainRepo, acceptPat,
+  hardenBrainRepo, unhardenBrainRepo, acceptPat, renderManagedBlock,
 } from '../src/core/brain-repo-durability.ts';
 
 const PAT = 'ghp_TESTSECRETTOKEN0123456789abcdef';
@@ -146,12 +149,68 @@ describe('hardenBrainRepo', () => {
     expect(git(work, 'ls-tree', '-r', '--name-only', 'HEAD')).not.toContain('scripts/brain-commit-push.sh');
   });
 
+  test('rejects a checkout-controlled legacy-helper ancestor before any host mutation', async () => {
+    const outside = join(root, 'outside-scripts');
+    const sentinel = join(outside, 'brain-commit-push.sh');
+    mkdirSync(outside);
+    writeFileSync(sentinel, 'outside sentinel — must remain byte-identical\n');
+    symlinkSync(outside, join(work, 'scripts'));
+
+    await expect(harden()).rejects.toThrow(/checkout-controlled ancestor/);
+
+    expect(readFileSync(sentinel, 'utf8')).toBe('outside sentinel — must remain byte-identical\n');
+    expect(existsSync(join(work, '.git', 'hooks', 'post-commit'))).toBe(false);
+    expect(existsSync(join(process.env.GBRAIN_HOME!, 'git-credentials'))).toBe(false);
+  });
+
   test('D3 — patches RESOLVER.md when it exists, not AGENTS.md', async () => {
     writeFileSync(join(work, 'RESOLVER.md'), '# my resolver\n\nuser content\n');
     git(work, 'add', 'RESOLVER.md'); git(work, 'commit', '-qm', 'resolver');
     await harden();
     expect(readFileSync(join(work, 'RESOLVER.md'), 'utf-8')).toContain('BEGIN gbrain-brain-durability');
     expect(existsSync(join(work, 'AGENTS.md'))).toBe(false);
+  });
+
+  for (const resolverName of ['RESOLVER.md', 'AGENTS.md'] as const) {
+    test(`rejects a checkout-controlled ${resolverName} symlink before host mutation`, async () => {
+      const outside = join(root, `${resolverName}.outside`);
+      const sentinel = 'outside sentinel — must remain byte-identical\n';
+      writeFileSync(outside, sentinel);
+      symlinkSync(outside, join(work, resolverName));
+
+      await expect(harden()).rejects.toThrow(`resolver symlink: ${resolverName}`);
+
+      expect(readFileSync(outside, 'utf8')).toBe(sentinel);
+      expect(existsSync(join(work, '.git', 'hooks', 'post-commit'))).toBe(false);
+      expect(existsSync(join(process.env.GBRAIN_HOME!, 'git-credentials'))).toBe(false);
+    });
+  }
+
+  test('shell-quotes a hostile remote URL in generated agent commands', () => {
+    const sentinel = join(root, 'remote-url-command-injection');
+    const hostile = `https://example.com/repo/'$(touch$IFS${sentinel})';echo`;
+    const block = renderManagedBlock(hostile);
+    const pull = block.match(/Run `(gbrain sources pull[^`]+)` at/)?.[1];
+    expect(pull).toBeDefined();
+
+    const bin = join(root, 'capture-bin');
+    const capture = join(root, 'captured-argv');
+    mkdirSync(bin);
+    const shim = join(bin, 'gbrain');
+    writeFileSync(shim, '#!/bin/sh\nprintf "%s\\n" "$@" > "$CAPTURE"\n');
+    chmodSync(shim, 0o755);
+
+    execFileSync('bash', ['-n', '-c', pull!]);
+    execFileSync('bash', ['-c', pull!], {
+      cwd: work,
+      env: { PATH: `${bin}:/usr/bin:/bin`, CAPTURE: capture },
+      stdio: 'ignore',
+    });
+
+    expect(existsSync(sentinel)).toBe(false);
+    expect(readFileSync(capture, 'utf8').trim().split('\n')).toEqual([
+      'sources', 'pull', '--path', '.', '--expected-remote', hostile,
+    ]);
   });
 
   test('AGENTS block patch preserves user content above and below', async () => {
@@ -174,6 +233,26 @@ describe('hardenBrainRepo', () => {
     expect(cfg(work, 'credential.helper')).toBe('');
     expect(cfg(work, 'gbrain.durability.managedcredential')).toBe('true');
   });
+
+  for (const unsafeStore of ['symlink', 'hardlink', 'loose'] as const) {
+    test(`D11 — refuses an unsafe ${unsafeStore} credential store without changing its target`, async () => {
+      const home = process.env.GBRAIN_HOME!;
+      mkdirSync(home, { recursive: true, mode: 0o700 });
+      const store = join(home, 'git-credentials');
+      const outside = join(root, `credential-${unsafeStore}-outside`);
+      const sentinel = 'outside credential sentinel — never overwrite\n';
+      writeFileSync(outside, sentinel, { mode: unsafeStore === 'loose' ? 0o644 : 0o600 });
+      if (unsafeStore === 'symlink') symlinkSync(outside, store);
+      else if (unsafeStore === 'hardlink') linkSync(outside, store);
+      else writeFileSync(store, sentinel, { mode: 0o644 });
+
+      await expect(harden()).rejects.toThrow(/credential store/);
+
+      expect(readFileSync(outside, 'utf8')).toBe(sentinel);
+      expect(readFileSync(store, 'utf8')).toBe(sentinel);
+      expect(cfg(work, 'gbrain.durability.managedcredential')).toBe('');
+    });
+  }
 
   test('D11 — ignores an existing repo credential.helper and uses the trusted store', async () => {
     git(work, 'config', 'credential.helper', 'osxkeychain');
@@ -365,6 +444,31 @@ describe('acceptPat (D8)', () => {
     const r = acceptPat({ patFile: p });
     expect(r?.token).toBe(PAT);
     expect(r?.warnings.length).toBeGreaterThan(0);
+  });
+  test('rejects a symlink without reading the target as a token', () => {
+    const outside = join(root, 'outside-pat.txt');
+    const p = join(root, 'pat-link.txt');
+    writeFileSync(outside, PAT, { mode: 0o600 });
+    symlinkSync(outside, p);
+    expect(() => acceptPat({ patFile: p })).toThrow(/PAT file/);
+    expect(readFileSync(outside, 'utf8')).toBe(PAT);
+  });
+  test('rejects a multiply-linked PAT file', () => {
+    const outside = join(root, 'outside-hardlink-pat.txt');
+    const p = join(root, 'hardlink-pat.txt');
+    writeFileSync(outside, PAT, { mode: 0o600 });
+    linkSync(outside, p);
+    expect(() => acceptPat({ patFile: p })).toThrow(/hard link/);
+  });
+  test('rejects multi-line file content instead of sending unrelated bytes as auth', () => {
+    const p = join(root, 'multiline-pat.txt');
+    writeFileSync(p, `${PAT}\nsecond-secret-line\n`, { mode: 0o600 });
+    expect(() => acceptPat({ patFile: p })).toThrow(/exactly one token line/);
+  });
+  test('rejects a PAT file larger than the bounded fd-read limit', () => {
+    const p = join(root, 'oversized-pat.txt');
+    writeFileSync(p, 'x'.repeat((64 * 1024) + 1), { mode: 0o600 });
+    expect(() => acceptPat({ patFile: p })).toThrow(/exceeds 65536 bytes/);
   });
   test('falls back to GBRAIN_GITHUB_PAT env', () => {
     const old = process.env.GBRAIN_GITHUB_PAT;

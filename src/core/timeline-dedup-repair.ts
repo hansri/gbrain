@@ -46,14 +46,14 @@ function parseIndexColumns(indexdef: string): string[] {
 
 export async function checkTimelineDedupIndex(engine: BrainEngine): Promise<TimelineDedupStatus> {
   const tbl = await engine.executeRaw<{ reg: string | null }>(
-    `SELECT to_regclass('timeline_entries')::text AS reg`,
+    `SELECT to_regclass('public.timeline_entries')::text AS reg`,
   );
   const tablePresent = !!tbl[0]?.reg;
   if (!tablePresent) {
     return { tablePresent: false, indexPresent: false, columns: [], needsRepair: false };
   }
   const rows = await engine.executeRaw<{ indexdef: string }>(
-    `SELECT indexdef FROM pg_indexes WHERE indexname = $1`,
+    `SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1`,
     [INDEX_NAME],
   );
   const indexPresent = rows.length > 0;
@@ -93,10 +93,10 @@ export async function repairTimelineDedupIndex(engine: BrainEngine): Promise<Tim
   // a physical tuple location that can preserve an arbitrary duplicate.
   const del = await engine.executeRaw<{ n: string }>(
     `WITH d AS (
-       DELETE FROM timeline_entries t
+       DELETE FROM public.timeline_entries t
        USING (
          SELECT page_id, date, summary, source, MIN(id) AS keep
-           FROM timeline_entries
+           FROM public.timeline_entries
           GROUP BY page_id, date, summary, source
          HAVING COUNT(*) > 1
        ) dup
@@ -111,10 +111,10 @@ export async function repairTimelineDedupIndex(engine: BrainEngine): Promise<Tim
   );
   const collapsedDuplicates = parseInt(del[0]?.n ?? '0', 10);
 
-  await engine.executeRaw(`DROP INDEX IF EXISTS ${INDEX_NAME}`);
+  await engine.executeRaw(`DROP INDEX IF EXISTS public.${INDEX_NAME}`);
   await engine.executeRaw(
     `CREATE UNIQUE INDEX IF NOT EXISTS ${INDEX_NAME}
-       ON timeline_entries(page_id, date, summary, source)`,
+       ON public.timeline_entries(page_id, date, summary, source)`,
   );
   return { repaired: true, before: status.columns, collapsedDuplicates, reason: 'rebuilt' };
 }

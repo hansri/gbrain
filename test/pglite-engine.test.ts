@@ -1498,8 +1498,10 @@ describe('PGLiteEngine: v0.13.1 error-wrap on connect() (#223)', () => {
     // as a cause (that was conflating #218 and #223 — migrations run AFTER
     // create()).
     // #2084 wrapped the create call in preservingProcessExitCode (Emscripten
-    // exitCode containment); the try/catch + error wrap around it is unchanged.
-    expect(src).toContain('this._db = await preservingProcessExitCode(() =>');
+    // exitCode containment). The result first lives in `createdDb` so an
+    // authority-check failure can close it before the engine publishes it.
+    expect(src).toContain('createdDb = await preservingProcessExitCode(() =>');
+    expect(src).toContain('this._db = createdDb;');
     expect(src).toContain('PGlite.create({');
     expect(src).toContain('https://github.com/garrytan/gbrain/issues/223');
     expect(src).toContain('gbrain doctor');
@@ -1507,9 +1509,10 @@ describe('PGLiteEngine: v0.13.1 error-wrap on connect() (#223)', () => {
     // Regression guard: the user-visible error MESSAGE must not re-introduce
     // the misleading "missing migrations" hint. (A source comment explaining
     // *why* we removed it is fine — match only inside the wrapped Error body.)
-    const wrapStart = src.indexOf('const wrapped = new Error(');
+    const wrapStart = src.indexOf('export function buildPgliteInitErrorMessage(');
     expect(wrapStart).toBeGreaterThan(-1);
-    const wrapEnd = src.indexOf(');', wrapStart);
+    const wrapEnd = src.indexOf('\n}\n', wrapStart);
+    expect(wrapEnd).toBeGreaterThan(wrapStart);
     const errBody = src.slice(wrapStart, wrapEnd);
     expect(errBody).not.toContain('missing migrations');
     expect(errBody).not.toContain('apply-migrations');

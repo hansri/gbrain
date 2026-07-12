@@ -5,8 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { performSync } from '../../src/commands/sync.ts';
 import { PostgresEngine } from '../../src/core/postgres-engine.ts';
+import { getPostgresTestUrl } from '../helpers/postgres-test-authority.ts';
 
-const DATABASE_URL = process.env.DATABASE_URL;
+const DATABASE_URL = getPostgresTestUrl();
 
 describe.skipIf(!DATABASE_URL)('Postgres incremental unsyncable convergence', () => {
   let engine: PostgresEngine;

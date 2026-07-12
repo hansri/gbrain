@@ -20,6 +20,7 @@ import { join } from 'path';
 
 import { migrations, getMigration } from '../src/commands/migrations/index.ts';
 import { v0_13_1 } from '../src/commands/migrations/v0_13_1.ts';
+import { migrationTestOpts } from './helpers/migration-opts.ts';
 
 // ---------------------------------------------------------------------------
 // Registry shape
@@ -47,9 +48,8 @@ describe('migrations registry', () => {
 // Orchestrator behavior
 // ---------------------------------------------------------------------------
 //
-// The orchestrator reads config via loadConfig() which reads from
-// ~/.gbrain/config.json. We can't easily stand that up in a test, so the
-// test below validates the pieces we CAN test without the config flow:
+// The orchestrator receives an immutable runner snapshot. The test below
+// validates the no-connect dry-run path plus registry integration:
 // registry integration + shape of the migration module. Full end-to-end
 // with a real engine + config is in test/e2e/migration-flow.test.ts.
 //
@@ -72,7 +72,7 @@ describe('v0_13_1 orchestrator — dry-run path', () => {
   });
 
   test('dryRun skips the connect phase', async () => {
-    const result = await v0_13_1.orchestrator({ yes: true, dryRun: true, noAutopilotInstall: true });
+    const result = await v0_13_1.orchestrator(migrationTestOpts({ yes: true, dryRun: true, noAutopilotInstall: true }));
     const connectPhase = result.phases.find(p => p.name === 'connect');
     expect(connectPhase?.status).toBe('skipped');
     expect(connectPhase?.detail).toBe('dry-run');

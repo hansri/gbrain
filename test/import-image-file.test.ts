@@ -28,6 +28,9 @@ beforeAll(async () => {
   engine = new PGLiteEngine();
   await engine.connect({});
   await engine.initSchema();
+  // Exercise the post-canary multi-source path while the shipped schema keeps
+  // legacy global uniqueness for binary rollback compatibility.
+  await engine.executeRaw('ALTER TABLE files DROP CONSTRAINT IF EXISTS files_storage_path_key');
   tmpDir = mkdtempSync(join(tmpdir(), 'gbrain-img-test-'));
 });
 

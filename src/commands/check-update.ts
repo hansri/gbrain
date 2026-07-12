@@ -36,12 +36,10 @@ interface CheckUpdateResult {
 }
 
 function upgradeCommandForMethod(method: string): string {
-  switch (method) {
-    case 'bun': return 'bun update gbrain';
-    case 'clawhub': return 'clawhub update gbrain';
-    case 'binary': return 'gbrain self-upgrade';
-    default: return 'gbrain upgrade';
-  }
+  void method;
+  // One authority resolves, policy-checks, pins, and verifies the exact target.
+  // Direct package-manager "latest" commands bypass that release boundary.
+  return 'gbrain upgrade';
 }
 
 /**

@@ -14,6 +14,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 const SOURCE_SCRIPT = resolve(import.meta.dir, '../../scripts/run-e2e.sh');
+const CI_LOCAL_SCRIPT = resolve(import.meta.dir, '../../scripts/ci-local.sh');
+const RESET_POSTGRES_SCRIPT = resolve(import.meta.dir, '../../scripts/reset-e2e-postgres.ts');
 const roots: string[] = [];
 
 interface Sandbox {
@@ -52,7 +54,7 @@ shift
 exec "$@"
 `);
   executable(join(bin, 'bun'), `#!/usr/bin/env bash
-printf '%s\t%s\t%s\n' "$HOME" "$GBRAIN_HOME" "${'${@: -1}'}" >> "$E2E_RUNNER_OBSERVED"
+printf '%s\t%s\t%s\t%s\t%s\n' "$HOME" "$GBRAIN_HOME" "${'${@: -1}'}" "$GBRAIN_TEST_DB" "${'${GBRAIN_SOURCE-<unset>}'}" >> "$E2E_RUNNER_OBSERVED"
 if [ -n "${'${E2E_BREACH_TARGET:-}'}" ]; then
   printf 'changed-by-fixture\n' > "$E2E_BREACH_TARGET"
 fi
@@ -112,5 +114,80 @@ describe('run-e2e.sh HOME isolation', () => {
     expect(result.status).toBe(2);
     expect(result.stderr).toContain('ERROR: HOME isolation breach detected.');
     expect(result.stderr).toContain('config md5 changed during run');
+  });
+
+  it('retains the hard-gated test DB topology flag but scrubs operator overrides', () => {
+    const sb = makeSandbox();
+    const result = run(sb, {
+      GBRAIN_TEST_DB: '1',
+      GBRAIN_SOURCE: 'must-not-leak',
+    });
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+
+    const rows = readFileSync(sb.observed, 'utf8').trim().split('\n').map((line) => line.split('\t'));
+    expect(rows.every((row) => row[3] === '1')).toBe(true);
+    expect(rows.every((row) => row[4] === '<unset>')).toBe(true);
+  });
+});
+
+describe('ci-local.sh destructive test-database authorization', () => {
+  it('opts every non-local gbrain_test E2E invocation into the hard-gated reset', () => {
+    const lines = readFileSync(CI_LOCAL_SCRIPT, 'utf8').split('\n');
+    let invocations = 0;
+
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index].trim();
+      if (!line.startsWith('DATABASE_URL=postgresql://postgres:postgres@postgres-') ||
+          !line.includes(':5432/gbrain_test')) {
+        continue;
+      }
+      invocations += 1;
+      expect(lines[index + 1]?.trim()).toMatch(/^GBRAIN_TEST_DB=1 /);
+    }
+
+    expect(invocations).toBe(4);
+  });
+
+  it('verifies the literal test authority before resetting warm schemas', () => {
+    const script = readFileSync(CI_LOCAL_SCRIPT, 'utf8');
+    expect(script).toContain("SELECT current_database()");
+    expect(script).toContain('if [ "$actual_db" != "gbrain_test" ]');
+    expect(script).toContain("SET client_min_messages=warning; DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;");
+  });
+
+  it('applies the test DB environment to xargs children in no-shard diff mode', () => {
+    const script = readFileSync(CI_LOCAL_SCRIPT, 'utf8');
+    const noShardDiff = script.slice(
+      script.indexOf('e2e (unsharded, --diff selected)'),
+      script.indexOf("echo \"[runner] e2e (unsharded)\""),
+    );
+    expect(noShardDiff).toContain('echo "$SELECTED" | xargs env \\');
+    expect(noShardDiff).toMatch(/xargs env \\\n\s+DATABASE_URL=.*gbrain_test \\\n\s+GBRAIN_TEST_DB=1/);
+    expect(noShardDiff).not.toMatch(/GBRAIN_TEST_DB=1 \\\n\s+.*echo "\$SELECTED" \| xargs bash/);
+  });
+
+  it('passes only the guarded gbrain_test base authority to PgBouncer E2E', () => {
+    const script = readFileSync(CI_LOCAL_SCRIPT, 'utf8');
+    const assignments = script.match(/GBRAIN_PGBOUNCER_URL=[^\s]+\/gbrain_test/g) ?? [];
+    expect(assignments).toHaveLength(4);
+    expect(script).not.toMatch(/GBRAIN_PGBOUNCER_URL=[^\s]+\/gbrain_pgbouncer/);
+  });
+});
+
+describe('run-e2e.sh Postgres schema isolation', () => {
+  it('resets the guarded test schema before each Bun test process', () => {
+    const wrapper = readFileSync(SOURCE_SCRIPT, 'utf8');
+    const resetCall = wrapper.indexOf('bun run scripts/reset-e2e-postgres.ts');
+    const testCall = wrapper.indexOf('bun test --timeout=60000 "$f"');
+    expect(resetCall).toBeGreaterThan(0);
+    expect(testCall).toBeGreaterThan(resetCall);
+  });
+
+  it('uses the shared fail-closed authority guard and removes all prior schema state', () => {
+    const reset = readFileSync(RESET_POSTGRES_SCRIPT, 'utf8');
+    expect(reset).toContain('requirePostgresTestUrl()');
+    expect(reset).toContain('pg_terminate_backend');
+    expect(reset).toContain('DROP SCHEMA IF EXISTS public CASCADE');
+    expect(reset).toContain('CREATE SCHEMA public');
   });
 });
