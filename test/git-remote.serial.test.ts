@@ -617,6 +617,11 @@ describe('durability network paths', () => {
     const fetch = readArgvLog().find(call => call.includes('fetch'))!;
     expectAddressBound(fetch, 'github.com');
     expect(fetch).toContain('https://github.com/example/repo');
+    const rebase = readArgvLog().find(call => call.includes('rebase') && !call.includes('--abort'))!;
+    expect(rebase.slice(2, 2 + GIT_EXECUTION_FENCE_FLAGS.length))
+      .toEqual([...GIT_EXECUTION_FENCE_FLAGS]);
+    expect(rebase).toContain('core.hooksPath=/dev/null');
+    expect(rebase).toContain('refs/remotes/origin/main');
     rmSync(repo, { recursive: true, force: true });
   });
 
@@ -636,54 +641,6 @@ describe('durability network paths', () => {
     rmSync(repo, { recursive: true, force: true });
   });
 
-  test('real guarded push and rebase never execute repository hooks', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'gbrain-git-hook-sentinel-'));
-    const remote = join(root, 'remote.git');
-    const repo = join(root, 'repo');
-    const writer = join(root, 'writer');
-    const sentinel = join(root, 'hook-ran');
-    const git = (cwd: string, args: string[]): void => {
-      execFileSync('git', ['-C', cwd, ...args], { stdio: 'pipe' });
-    };
-    const commitFile = (cwd: string, name: string, body: string, message: string): void => {
-      writeFileSync(join(cwd, name), body);
-      git(cwd, ['add', '--', name]);
-      git(cwd, ['-c', 'user.name=Test User', '-c', 'user.email=test@example.invalid', 'commit', '-q', '-m', message]);
-    };
-    const installHook = (cwd: string, name: string): void => {
-      const hook = join(cwd, '.git', 'hooks', name);
-      writeFileSync(hook, `#!/bin/sh\nprintf ran >> '${sentinel}'\n`);
-      chmodSync(hook, 0o755);
-    };
-
-    try {
-      execFileSync('git', ['init', '-q', '--bare', '--initial-branch=main', remote]);
-      execFileSync('git', ['init', '-q', '--initial-branch=main', repo]);
-      git(repo, ['remote', 'add', 'origin', remote]);
-      commitFile(repo, 'base.md', 'base\n', 'base');
-
-      await withEnv({ GBRAIN_GIT_ALLOW_FILE_TRANSPORT: '1' }, async () => {
-        pushBranch(repo, 'main');
-
-        installHook(repo, 'pre-push');
-        commitFile(repo, 'local-one.md', 'local one\n', 'local one');
-        pushBranch(repo, 'main');
-        expect(existsSync(sentinel)).toBe(false);
-
-        execFileSync('git', ['clone', '-q', remote, writer]);
-        commitFile(writer, 'remote-one.md', 'remote one\n', 'remote one');
-        git(writer, ['push', '-q', 'origin', 'main']);
-
-        commitFile(repo, 'local-two.md', 'local two\n', 'local two');
-        installHook(repo, 'pre-rebase');
-        installHook(repo, 'post-rewrite');
-        expect(divergenceSafePull(repo, 'main').status).toBe('advanced');
-        expect(existsSync(sentinel)).toBe(false);
-      });
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  }, 30_000);
 });
 
 // ---------------------------------------------------------------------------

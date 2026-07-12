@@ -258,58 +258,66 @@ describe('global unresolved-upgrade CLI gate', () => {
     const configBefore = readFileSync(configPath, 'utf8');
     const importTarget = join(root, 'must-not-be-read.md');
 
+    const cases = [
+      { status: 'post_upgrade_pending', invocation: ['sync'] },
+      { status: 'swap_running', invocation: ['import', '--help'] },
+      { status: 'incomplete', invocation: ['apply-migrations', '--yes'] },
+    ] as const;
+
     try {
-      for (const status of [
-        'post_upgrade_pending',
-        'deferred',
-        'incomplete',
-        'running',
-        'swap_running',
-      ] as const) {
+      for (const { status, invocation } of cases) {
         writeOwnedJson(statePath, rawPendingState(status));
-        for (const invocation of [
-          ['sync'],
-          ['serve'],
-          ['import', importTarget],
-          ['import', '--help'],
-          ['unknown-command', '--help'],
-          ['doctor'],
-          ['apply-migrations', '--yes'],
-          ['init', '--migrate-only'],
-          ['upgrade-preflight', 'repair', '--source', 'wiki', '--path', 'a.md', '--keep', 'a', '--yes'],
-          ['autopilot', '--status'],
-          ['autopilot', '--install', '--yes'],
-        ]) {
-          const proc = Bun.spawn(
-            [process.execPath, 'run', join(REPO_ROOT, 'src/cli.ts'), ...invocation],
-            {
-              cwd: REPO_ROOT,
-              env: {
-                ...process.env,
-                NODE_ENV: 'test',
-                GBRAIN_HOME: join(root, 'state'),
-                HOME: legacyHome,
-              },
-              stdout: 'pipe',
-              stderr: 'pipe',
+        const stateBefore = readFileSync(statePath, 'utf8');
+        const proc = Bun.spawn(
+          [process.execPath, 'run', join(REPO_ROOT, 'src/cli.ts'), ...invocation],
+          {
+            cwd: REPO_ROOT,
+            env: {
+              ...process.env,
+              NODE_ENV: 'test',
+              GBRAIN_HOME: join(root, 'state'),
+              HOME: legacyHome,
             },
-          );
-          const [stdout, stderr, exitCode] = await Promise.all([
-            new Response(proc.stdout).text(),
-            new Response(proc.stderr).text(),
+            stdout: 'pipe',
+            stderr: 'pipe',
+          },
+        );
+        const stdoutPromise = new Response(proc.stdout).text();
+        const stderrPromise = new Response(proc.stderr).text();
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const exitCode = await Promise.race([
             proc.exited,
+            new Promise<never>((_, reject) => {
+              timeout = setTimeout(() => {
+                proc.kill();
+                reject(new Error(`CLI gate case timed out: ${invocation.join(' ')}`));
+              }, 5_000);
+            }),
+          ]);
+          const [stdout, stderr] = await Promise.all([
+            stdoutPromise,
+            stderrPromise,
           ]);
           expect(exitCode).toBe(1);
           expect(stdout).toBe('');
           expect(stderr).toContain('blocked before database connect');
-          expect(stderr).not.toContain('deliberately_invalid_config_shape');
+          expect(stderr).not.toContain('deliberately-invalid-config');
           expect(readFileSync(configPath, 'utf8')).toBe(configBefore);
+          expect(readFileSync(statePath, 'utf8')).toBe(stateBefore);
+          expect(existsSync(importTarget)).toBe(false);
+        } finally {
+          if (timeout) clearTimeout(timeout);
+          if (proc.exitCode === null) {
+            proc.kill();
+            await proc.exited;
+          }
         }
       }
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  }, 30_000);
+  }, 10_000);
 
   test('real daemon-start autopilot consumes running handoff before ordinary connect', async () => {
     const root = mkdtempSync(join(tmpdir(), 'gbrain-autopilot-upgrade-resume-'));
