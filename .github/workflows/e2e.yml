@@ -119,7 +119,11 @@ jobs:
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/gbrain_test
           GBRAIN_TEST_DB: '1'
-        run: bun test test/e2e/op-checkpoint-jsonb-parity.test.ts test/e2e/jsonb-roundtrip.test.ts
+        run: |
+          # Both files own the same process-global DB helper. Running them in
+          # one Bun invocation lets teardown in one file disconnect the other.
+          bun test test/e2e/op-checkpoint-jsonb-parity.test.ts
+          bun test test/e2e/jsonb-roundtrip.test.ts
 
   tier1:
     name: Tier 1 (Mechanical)
