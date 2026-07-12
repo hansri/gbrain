@@ -11,8 +11,15 @@ import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'fs';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { estimateDeltaTokens, estimateInlineNewTokens } from '../src/commands/sync.ts';
+import {
+  estimateDeltaTokens,
+  estimateInlineNewTokens,
+  estimateSourceTreeTokens,
+  inlineCostReportFields,
+  labelEstimate,
+} from '../src/commands/sync.ts';
 import { CHUNKER_VERSION } from '../src/core/chunkers/code.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 const CURRENT = String(CHUNKER_VERSION);
 let repo: string;
@@ -47,6 +54,83 @@ describe('estimateInlineNewTokens — ladder', () => {
     writeFileSync(join(repo, 'topics/a.md'), 'body content');
     commitAll('base');
     expect(estimateDeltaTokens(repo, ['topics/a.md'], 'f'.repeat(40))).toBeNull();
+    expect(estimateSourceTreeTokens(repo, 'markdown', 'f'.repeat(40))).toBeNull();
+  });
+
+  test('missing committed authority is explicit in human and JSON reports', () => {
+    const unavailable = estimateInlineNewTokens(
+      [{
+        local_path: join(repo, 'missing-repository'),
+        config: {},
+        last_commit: null,
+        chunker_version: CURRENT,
+      }],
+      CURRENT,
+    );
+
+    expect(unavailable.estimateAvailable).toBe(false);
+    expect(unavailable.ceilingReasons).toContain('git_snapshot_unavailable');
+    expect(labelEstimate(unavailable)).toContain('estimate unavailable');
+    expect(labelEstimate(unavailable)).not.toContain('<=0');
+    expect(inlineCostReportFields(unavailable, 0)).toEqual({
+      newTokens: null,
+      estimateAvailable: false,
+      estimateKind: 'ceiling',
+      ceilingReasons: unavailable.ceilingReasons,
+      costUsd: null,
+    });
+  });
+
+  test('cost preview refuses an origin that violates the remote URL policy', () => {
+    writeFileSync(join(repo, 'topics/a.md'), 'body content');
+    commitAll('base');
+    execSync('git remote add origin file:///tmp/untrusted-brain.git', { cwd: repo, stdio: 'pipe' });
+
+    const unavailable = estimateInlineNewTokens(
+      [src({ last_commit: null, chunker_version: CURRENT })],
+      CURRENT,
+    );
+
+    expect(unavailable.estimateAvailable).toBe(false);
+    expect(unavailable.ceilingReasons).toContain('git_snapshot_unavailable');
+  });
+
+  test('changed multimodal files fail closed instead of being decoded as cheap UTF-8', async () => {
+    await withEnv({ GBRAIN_EMBEDDING_MULTIMODAL: 'true' }, async () => {
+      writeFileSync(join(repo, 'topics/a.md'), 'body');
+      const base = commitAll('base');
+      writeFileSync(join(repo, 'topics/large.png'), Buffer.alloc(6 * 1024 * 1024, 0xff));
+      commitAll('image');
+
+      const unavailable = estimateInlineNewTokens([
+        src({
+          last_commit: base,
+          chunker_version: CURRENT,
+          config: { strategy: 'auto' },
+        }),
+      ], CURRENT);
+
+      expect(unavailable.estimateAvailable).toBe(false);
+      expect(unavailable.ceilingReasons).toContain('multimodal_cost_unavailable');
+      expect(inlineCostReportFields(unavailable, 0).costUsd).toBeNull();
+    });
+  });
+
+  test('full-tree ceiling reads the immutable commit, not mutable checkout bytes', () => {
+    writeFileSync(join(repo, 'topics/a.md'), 'committed authority content');
+    const head = commitAll('base');
+    const committed = estimateSourceTreeTokens(repo, 'markdown', head);
+    expect(committed).not.toBeNull();
+    rmSync(join(repo, 'topics/a.md'));
+    writeFileSync(join(repo, 'topics/untracked.md'), 'x'.repeat(50_000));
+
+    const r = estimateInlineNewTokens(
+      [src({ last_commit: null, chunker_version: CURRENT })],
+      CURRENT,
+    );
+    expect(r.estimateAvailable).toBe(true);
+    expect(r.tokens).toBe(committed!.tokens);
+    expect(r.tokens).toBeGreaterThan(0);
   });
   test('chunker drift → full-tree ceiling even with an empty git delta', () => {
     writeFileSync(join(repo, 'topics/a.md'), 'some body content here');

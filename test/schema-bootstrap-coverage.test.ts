@@ -168,6 +168,9 @@ const REQUIRED_BOOTSTRAP_COVERAGE: ForwardReference[] = [
   // SCHEMA_SQL replay creates the index. Powers `gbrain extract --stale` + the
   // `links_extraction_lag` doctor check.
   { kind: 'column', table: 'pages', column: 'links_extracted_at' },
+  // v126 — forward-referenced by idx_timeline_managed_page. Existing
+  // timeline_entries tables do not gain CREATE TABLE body columns on replay.
+  { kind: 'column', table: 'timeline_entries', column: 'managed_by' },
 ];
 
 test('applyForwardReferenceBootstrap covers every forward reference declared in REQUIRED_BOOTSTRAP_COVERAGE', async () => {
@@ -253,6 +256,9 @@ test('applyForwardReferenceBootstrap covers every forward reference declared in 
       ALTER TABLE pages DROP COLUMN IF EXISTS generation;
       ALTER TABLE pages DROP COLUMN IF EXISTS contextual_retrieval_mode;
       ALTER TABLE pages DROP COLUMN IF EXISTS corpus_generation;
+
+      DROP INDEX IF EXISTS idx_timeline_managed_page;
+      ALTER TABLE timeline_entries DROP COLUMN IF EXISTS managed_by;
     `);
 
     // Note: we don't strip sources.archived* here because they're inline in the
@@ -636,6 +642,42 @@ test('every CREATE INDEX column in PGLITE_SCHEMA_SQL is covered by CREATE TABLE 
     );
   }
 }, 30000);
+
+test('v126 managed_by index requires bootstrap even when latest CREATE TABLE contains the column', async () => {
+  // CREATE TABLE IF NOT EXISTS is a no-op for an existing legacy table. A
+  // migration-added column referenced by the latest schema blob therefore
+  // must be present in the forward bootstrap; counting only the current
+  // CREATE TABLE body produced the v126 false green.
+  const { extractAddedColumnsFromMigrations } = await import('./helpers/extract-added-columns.ts');
+  const { readFileSync } = await import('fs');
+  const { resolve: resolvePath } = await import('path');
+  const { PGLITE_SCHEMA_SQL } = await import('../src/core/pglite-schema.ts');
+
+  const engineSrc = readFileSync(
+    resolvePath(process.cwd(), 'src/core/pglite-engine.ts'),
+    'utf-8',
+  );
+  const bootstrapAdds = parseAlterAddColumns(engineSrc);
+  const indexRefs = parseIndexColumnReferences(PGLITE_SCHEMA_SQL);
+  const migrationAdds = extractAddedColumnsFromMigrations();
+  const managedBy = { table: 'timeline_entries', column: 'managed_by' };
+  expect(migrationAdds).toContainEqual(managedBy);
+  expect(indexRefs).toContainEqual(managedBy);
+  expect(bootstrapAdds).toContainEqual(managedBy);
+  const managedByCovered = bootstrapAdds.some(add =>
+    add.table === managedBy.table && add.column === managedBy.column,
+  );
+  expect(managedByCovered).toBe(true);
+  expect(
+    parseBaseTableColumns(PGLITE_SCHEMA_SQL).get('timeline_entries')?.has('managed_by'),
+  ).toBe(true);
+  // The assertion above deliberately does not count as bootstrap coverage:
+  // it models the latest CREATE TABLE body, which is a no-op on a v125 table.
+  expect(bootstrapAdds).toContainEqual({
+    table: 'timeline_entries',
+    column: 'managed_by',
+  });
+});
 
 // ─────────────────────────────────────────────────────────────────
 // v0.36+ — MIGRATIONS introspection: catch the column-only forward-ref class.

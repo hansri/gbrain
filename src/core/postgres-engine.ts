@@ -2,6 +2,7 @@ import postgres from 'postgres';
 import type {
   BrainEngine,
   BatchOpts,
+  TransactionOpts,
   LinkBatchInput, TimelineBatchInput,
   ReservedConnection,
   DreamVerdict, DreamVerdictInput,
@@ -22,6 +23,7 @@ import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
 import { deriveResolutionTuple, finalizeScorecard } from './takes-resolution.ts';
 import { normalizeWeightForStorage } from './takes-fence.ts';
 import { executeRawJsonb } from './sql-query.ts';
+import { databaseIdentity } from './database-identity.ts';
 import { sanitizeForJsonb, buildLinkRows, buildTimelineRows, buildTakeRows } from './batch-rows.ts';
 import { runMigrations } from './migrate.ts';
 import { SCHEMA_SQL } from './schema-embedded.ts';
@@ -99,11 +101,39 @@ export function getPostgresSchema(
 // See TODOS.md item: "err.code-based connection-error matching" for the
 // follow-up that will reintroduce a typed retry mechanism.
 
+const TRANSACTION_SCOPED_ENGINE = Symbol('gbrain.transaction-scoped-engine');
+
 export class PostgresEngine implements BrainEngine {
   readonly kind = 'postgres' as const;
   private _sql: ReturnType<typeof postgres> | null = null;
   /** Saved config for reconnection. */
   private _savedConfig: (EngineConfig & { poolSize?: number; parentConnectionManager?: ConnectionManager }) | null = null;
+  private _databaseIdentity: string | null = null;
+
+  getDatabaseIdentity(): string {
+    if (!this._databaseIdentity) {
+      throw new Error('Postgres database identity is unavailable before connect() succeeds');
+    }
+    return this._databaseIdentity;
+  }
+
+  async createWorkerEngine(poolSize: number): Promise<BrainEngine> {
+    const saved = this._savedConfig;
+    if (!saved?.database_url || !this._databaseIdentity) {
+      throw new Error('Cannot create Postgres worker before the parent engine is connected');
+    }
+    const worker = new PostgresEngine();
+    await worker.connect({
+      database_url: saved.database_url,
+      poolSize,
+      parentConnectionManager: this.connectionManager ?? saved.parentConnectionManager,
+    });
+    if (worker.getDatabaseIdentity() !== this._databaseIdentity) {
+      await worker.disconnect().catch(() => {});
+      throw new Error('Worker database identity differs from its parent engine');
+    }
+    return worker;
+  }
   /** Whether a reconnect is in progress (prevents concurrent reconnects). */
   private _reconnecting = false;
   /**
@@ -166,7 +196,11 @@ export class PostgresEngine implements BrainEngine {
 
   // Lifecycle
   async connect(config: EngineConfig & { poolSize?: number; parentConnectionManager?: ConnectionManager }): Promise<void> {
-    this._savedConfig = config;
+    // Snapshot the candidate authority. Callers often pass the process-wide
+    // config object; retaining it by reference would let a later mutation
+    // silently redirect reconnects or import workers. Publish only after the
+    // connection probe succeeds, preserving the prior good authority on error.
+    const savedConfig = { ...config };
     const url = config.database_url;
     if (config.poolSize) {
       // Instance-level connection for worker isolation. resolvePoolSize lets
@@ -235,6 +269,8 @@ export class PostgresEngine implements BrainEngine {
         this.connectionManager.setReadPool(db.getConnection());
       }
     }
+    this._databaseIdentity = databaseIdentity(config);
+    this._savedConfig = savedConfig;
   }
 
   async disconnect(): Promise<void> {
@@ -430,6 +466,8 @@ export class PostgresEngine implements BrainEngine {
       sources_archived_exists: boolean;
       sources_archived_at_exists: boolean;
       sources_archive_expires_at_exists: boolean;
+      timeline_entries_exists: boolean;
+      timeline_managed_by_exists: boolean;
     }[]>`
       SELECT
         EXISTS (SELECT 1 FROM information_schema.tables
@@ -511,7 +549,11 @@ export class PostgresEngine implements BrainEngine {
         EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema = current_schema() AND table_name = 'pages' AND column_name = 'embedding_signature') AS pages_embedding_signature_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_schema = current_schema() AND table_name = 'pages' AND column_name = 'links_extracted_at') AS pages_links_extracted_at_exists
+                WHERE table_schema = current_schema() AND table_name = 'pages' AND column_name = 'links_extracted_at') AS pages_links_extracted_at_exists,
+        EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema = current_schema() AND table_name = 'timeline_entries') AS timeline_entries_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = 'timeline_entries' AND column_name = 'managed_by') AS timeline_managed_by_exists
     `;
     const probe = probeRows[0]!;
 
@@ -588,6 +630,8 @@ export class PostgresEngine implements BrainEngine {
       pages_generation_exists?: boolean;
       pages_embedding_signature_exists?: boolean;
       pages_links_extracted_at_exists?: boolean;
+      timeline_entries_exists?: boolean;
+      timeline_managed_by_exists?: boolean;
     };
     const needsContextualRetrievalColumns = (probe.pages_exists
         && (!probeCr.pages_cr_mode_exists || !probeCr.pages_corpus_generation_exists))
@@ -607,6 +651,12 @@ export class PostgresEngine implements BrainEngine {
     // SCHEMA_SQL replay creates the index. v112 runs later via runMigrations
     // and is idempotent.
     const needsPagesLinksExtractedAt = probe.pages_exists && !probeCr.pages_links_extracted_at_exists;
+    // v126: idx_timeline_managed_page is replayed from the latest schema blob
+    // before numbered migrations run. CREATE TABLE IF NOT EXISTS cannot add
+    // managed_by to an existing timeline_entries table, so upgrades must add
+    // the column before schema replay reaches that index.
+    const needsTimelineManagedBy = probeCr.timeline_entries_exists
+      && !probeCr.timeline_managed_by_exists;
 
     if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
         && !needsPagesDeletedAt && !needsMcpLogBootstrap && !needsSubagentProviderId
@@ -617,7 +667,8 @@ export class PostgresEngine implements BrainEngine {
         && !needsPagesProvenance
         && !needsContextualRetrievalColumns && !needsPagesGeneration
         && !needsPagesEmbeddingSignature
-        && !needsPagesLinksExtractedAt) return;
+        && !needsPagesLinksExtractedAt
+        && !needsTimelineManagedBy) return;
 
     process.stderr.write('  Pre-v0.21 brain detected, applying forward-reference bootstrap\n');
 
@@ -864,17 +915,50 @@ export class PostgresEngine implements BrainEngine {
         ALTER TABLE pages ADD COLUMN IF NOT EXISTS links_extracted_at TIMESTAMPTZ;
       `);
     }
+
+    if (needsTimelineManagedBy) {
+      // v126 performs the ownership-aware dedup and index creation later.
+      // Bootstrap adds only the forward-referenced nullable column so the
+      // latest schema blob is replay-safe on a legacy table.
+      await conn.unsafe(`
+        ALTER TABLE timeline_entries ADD COLUMN IF NOT EXISTS managed_by TEXT;
+      `);
+    }
   }
 
-  async transaction<T>(fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
-    const conn = this.sql;
-    return conn.begin(async (tx) => {
-      // Create a scoped engine with tx as its connection, no shared state mutation
+  async transaction<T>(
+    fn: (engine: BrainEngine) => Promise<T>,
+    opts: TransactionOpts = {},
+  ): Promise<T> {
+    // Join an already-active transaction. This is deliberately NOT a nested
+    // savepoint: a failure from either callback aborts the one outer unit.
+    // Import helpers open their own transaction, so rename can safely compose
+    // updateSlug + import without allocating a second connection/transaction.
+    if ((this as unknown as Record<symbol, boolean>)[TRANSACTION_SCOPED_ENGINE]) {
+      return fn(this);
+    }
+    const runAttempt = () => this.sql.begin(async (tx) => {
+      // Create a scoped engine with tx as its connection, no shared state mutation.
       const txEngine = Object.create(this) as PostgresEngine;
       Object.defineProperty(txEngine, 'sql', { get: () => tx });
       Object.defineProperty(txEngine, '_sql', { value: tx as unknown as ReturnType<typeof postgres>, writable: false });
+      Object.defineProperty(txEngine, TRANSACTION_SCOPED_ENGINE, { value: true });
       return fn(txEngine);
     }) as Promise<T>;
+
+    if (!opts.retryOnConnectionError) return runAttempt();
+    const retry = this.getBulkRetryOpts();
+    return withRetry(runAttempt, {
+      maxRetries: retry.maxRetries,
+      delayMs: retry.delayMs,
+      delayMaxMs: retry.delayMaxMs,
+      jitter: BULK_RETRY_OPTS.jitter,
+      signal: opts.signal,
+      // This hook runs only AFTER postgres.js has rejected begin(), which
+      // means the failed transaction attempt is out of scope. Never reconnect
+      // from a tx-scoped batch primitive itself.
+      reconnect: (ctx) => this.reconnect(ctx),
+    });
   }
 
   async withReservedConnection<T>(fn: (conn: ReservedConnection) => Promise<T>): Promise<T> {
@@ -1065,7 +1149,16 @@ export class PostgresEngine implements BrainEngine {
        WHERE source_path = ANY(${paths}::text[]) AND source_id = ${opts.sourceId}
     `;
     const m = new Map<string, string>();
-    for (const r of rows) m.set(r.source_path, r.slug);
+    for (const r of rows) {
+      const prior = m.get(r.source_path);
+      if (prior && prior !== r.slug) {
+        throw new Error(
+          `Ambiguous source_path ownership for ${opts.sourceId}:${r.source_path} ` +
+          `(owners: ${prior}, ${r.slug}). Run the v124 duplicate preflight and repair the data before syncing.`,
+        );
+      }
+      m.set(r.source_path, r.slug);
+    }
     return m;
   }
 
@@ -2046,6 +2139,13 @@ export class PostgresEngine implements BrainEngine {
     fn: () => Promise<T>,
     batchSize: number,
   ): Promise<T> {
+    // A statement error aborts the surrounding Postgres transaction. Retrying
+    // the statement on that same tx can only produce 25P02, and reconnecting
+    // here would escape the transaction boundary. Let transaction() roll the
+    // attempt back; opted-in callers retry the whole callback on a fresh tx.
+    if ((this as unknown as Record<symbol, boolean>)[TRANSACTION_SCOPED_ENGINE]) {
+      return fn();
+    }
     const opts = this.getBulkRetryOpts();
     let prevDelay = 0;
     try {
@@ -2787,6 +2887,7 @@ export class PostgresEngine implements BrainEngine {
     name: string,
     dirPrefix?: string,
     minSimilarity: number = 0.55,
+    opts?: { sourceId?: string },
   ): Promise<{ slug: string; similarity: number } | null> {
     const sql = this.sql;
     // Use the `similarity()` function directly with an explicit threshold
@@ -2800,11 +2901,15 @@ export class PostgresEngine implements BrainEngine {
     // same winner when multiple pages score equally (prevents churn
     // in put_page auto-link reconciliation).
     const prefixPattern = dirPrefix ? `${dirPrefix}/%` : '%';
+    const sourceCondition = opts?.sourceId
+      ? sql`AND source_id = ${opts.sourceId}`
+      : sql``;
     const rows = await sql`
       SELECT slug, similarity(title, ${name}) AS sim
       FROM pages
       WHERE similarity(title, ${name}) >= ${minSimilarity}
         AND slug LIKE ${prefixPattern}
+        ${sourceCondition}
       ORDER BY sim DESC, slug ASC
       LIMIT 1
     `;
@@ -3417,10 +3522,10 @@ export class PostgresEngine implements BrainEngine {
     const rows = buildTimelineRows(entries);
     const result = await executeRawJsonb(
       this,
-      `INSERT INTO timeline_entries (page_id, date, source, summary, detail)
-       SELECT p.id, v.date::date, v.source, v.summary, v.detail
+      `INSERT INTO timeline_entries (page_id, date, source, summary, detail, managed_by)
+       SELECT p.id, v.date::date, v.source, v.summary, v.detail, v.managed_by
        FROM jsonb_to_recordset(($1::jsonb)->'rows')
-         AS v(slug text, date text, source text, summary text, detail text, source_id text)
+         AS v(slug text, date text, source text, summary text, detail text, source_id text, managed_by text)
        JOIN pages p ON p.slug = v.slug AND p.source_id = v.source_id
        ON CONFLICT (page_id, date, summary, source) DO NOTHING
        RETURNING 1`,
@@ -3780,12 +3885,11 @@ export class PostgresEngine implements BrainEngine {
   // different content_hash overwrites in place.
   async upsertFile(spec: FileSpec): Promise<{ id: number; created: boolean }> {
     const sql = this.sql;
-    const sourceId = spec.source_id ?? 'default';
     const metadata = (spec.metadata ?? {}) as Parameters<typeof sql.json>[0];
     const rows = await sql<Array<{ id: number; created: boolean }>>`
       INSERT INTO files (source_id, page_slug, page_id, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
-      VALUES (${sourceId}, ${spec.page_slug ?? null}, ${spec.page_id ?? null}, ${spec.filename}, ${spec.storage_path}, ${spec.mime_type ?? null}, ${spec.size_bytes ?? null}, ${spec.content_hash}, ${sql.json(metadata)})
-      ON CONFLICT (storage_path) DO UPDATE SET
+      VALUES (${spec.source_id}, ${spec.page_slug ?? null}, ${spec.page_id ?? null}, ${spec.filename}, ${spec.storage_path}, ${spec.mime_type ?? null}, ${spec.size_bytes ?? null}, ${spec.content_hash}, ${sql.json(metadata)})
+      ON CONFLICT (source_id, storage_path) DO UPDATE SET
         page_slug = EXCLUDED.page_slug,
         page_id = EXCLUDED.page_id,
         filename = EXCLUDED.filename,
@@ -5100,13 +5204,127 @@ export class PostgresEngine implements BrainEngine {
 
   // Sync
   async updateSlug(oldSlug: string, newSlug: string, opts?: { sourceId?: string }): Promise<void> {
+    oldSlug = validateSlug(oldSlug);
     newSlug = validateSlug(newSlug);
-    const sql = this.sql;
     const sourceId = opts?.sourceId ?? 'default';
-    // Source-qualify so a rename in source A doesn't sweep up same-slug rows
-    // in sources B/C/D (which would either rename them all OR fail the
-    // (source_id, slug) UNIQUE if the new slug already exists in another source).
-    await sql`UPDATE pages SET slug = ${newSlug}, updated_at = now() WHERE slug = ${oldSlug} AND source_id = ${sourceId}`;
+    // A same-slug request is already converged. Entering the rename
+    // transaction would copy aliases onto themselves and then delete them,
+    // while also needlessly touching every dependent table. It is still an
+    // identity assertion, though: resolve the selected source and require the
+    // origin row exactly as the mutating path does. A missing origin must not
+    // be reported as a successful rename merely because both inputs normalize
+    // to the same slug.
+    if (newSlug === oldSlug) {
+      await this.transaction(async (tx) => {
+        const origin = await tx.executeRaw<{ id: number }>(
+          `SELECT id FROM pages
+            WHERE slug = $1 AND source_id = $2
+            FOR UPDATE`,
+          [oldSlug, sourceId],
+        );
+        if (origin.length !== 1) {
+          throw new Error(
+            `updateSlug expected exactly one row for ${sourceId}:${oldSlug}; found ${origin.length}`,
+          );
+        }
+      });
+      return;
+    }
+    await this.transaction(async (tx) => {
+      if (newSlug !== oldSlug) {
+        // Reserve the destination in the alias namespace before moving the
+        // page. The unique key serializes concurrent claims; an existing
+        // redirect to this origin is safe and is retired as a self-alias at
+        // the end of the transaction.
+        await tx.executeRaw(
+          `INSERT INTO slug_aliases (source_id, alias_slug, canonical_slug)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (source_id, alias_slug) DO NOTHING`,
+          [sourceId, newSlug, oldSlug],
+        );
+        const destinationAliases = await tx.executeRaw<{ canonical_slug: string }>(
+          `SELECT canonical_slug FROM slug_aliases
+            WHERE source_id = $1 AND alias_slug = $2
+            FOR UPDATE`,
+          [sourceId, newSlug],
+        );
+        const conflictingAlias = destinationAliases.find(
+          row => row.canonical_slug !== oldSlug,
+        );
+        if (conflictingAlias) {
+          throw new Error(
+            `updateSlug destination alias collision: ${sourceId}:${newSlug} ` +
+            `already redirects to ${conflictingAlias.canonical_slug}`,
+          );
+        }
+      }
+      const moved = await tx.executeRaw<{ id: number }>(
+        `UPDATE pages SET slug = $1, updated_at = now()
+          WHERE slug = $2 AND source_id = $3
+          RETURNING id`,
+        [newSlug, oldSlug, sourceId],
+      );
+      if (moved.length !== 1) {
+        throw new Error(
+          `updateSlug expected exactly one row for ${sourceId}:${oldSlug}; moved ${moved.length}`,
+        );
+      }
+      await tx.executeRaw(
+        `INSERT INTO page_aliases (source_id, alias_norm, slug, created_at)
+         SELECT source_id, alias_norm, $1, created_at
+           FROM page_aliases WHERE source_id = $2 AND slug = $3
+         ON CONFLICT (source_id, alias_norm, slug) DO NOTHING`,
+        [newSlug, sourceId, oldSlug],
+      );
+      await tx.executeRaw(
+        `DELETE FROM page_aliases WHERE source_id = $1 AND slug = $2`,
+        [sourceId, oldSlug],
+      );
+      await tx.executeRaw(
+        `UPDATE files SET page_slug = $1
+          WHERE source_id = $2 AND page_slug = $3`,
+        [newSlug, sourceId, oldSlug],
+      );
+      // Facts are migration-created and may not exist while the earliest
+      // upgrade handlers call updateSlug. Probe before moving their two exact
+      // slug keys; all writes still share this transaction.
+      const factsTable = await tx.executeRaw<{ present: boolean }>(
+        `SELECT to_regclass('public.facts') IS NOT NULL AS present`,
+      );
+      if (factsTable[0]?.present) {
+        await tx.executeRaw(
+          `UPDATE facts
+              SET entity_slug = CASE WHEN entity_slug = $1 THEN $2 ELSE entity_slug END,
+                  source_markdown_slug = CASE
+                    WHEN source_markdown_slug = $1 THEN $2
+                    ELSE source_markdown_slug
+                  END
+            WHERE source_id = $3
+              AND (entity_slug = $1 OR source_markdown_slug = $1)`,
+          [oldSlug, newSlug, sourceId],
+        );
+      }
+      await tx.executeRaw(
+        `UPDATE take_proposals SET page_slug = $1
+          WHERE source_id = $2 AND page_slug = $3`,
+        [newSlug, sourceId, oldSlug],
+      );
+      await tx.executeRaw(
+        `UPDATE context_volunteer_events SET slug = $1
+          WHERE source_id = $2 AND slug = $3`,
+        [newSlug, sourceId, oldSlug],
+      );
+      await tx.executeRaw(
+        `DELETE FROM slug_aliases
+          WHERE source_id = $1 AND alias_slug = $2 AND canonical_slug = $3`,
+        [sourceId, newSlug, oldSlug],
+      );
+      await tx.executeRaw(
+        `UPDATE slug_aliases SET canonical_slug = $1
+          WHERE source_id = $2 AND canonical_slug = $3`,
+        [newSlug, sourceId, oldSlug],
+      );
+    });
   }
 
   async rewriteLinks(_oldSlug: string, _newSlug: string): Promise<void> {
@@ -5183,15 +5401,27 @@ export class PostgresEngine implements BrainEngine {
   }
 
   async setPageAliases(slug: string, sourceId: string, aliasNorms: string[]): Promise<void> {
-    const sql = this.sql;
     const uniq = Array.from(new Set(aliasNorms.filter(a => a.length > 0)));
-    await sql.begin(async tx => {
-      await tx`DELETE FROM page_aliases WHERE source_id = ${sourceId} AND slug = ${slug}`;
+    await this.transaction(async tx => {
+      // Imports are intentionally compatible with brains that have not yet
+      // reached migration v110. Probe before referencing the table: catching
+      // 42P01 after DELETE would be too late because PostgreSQL has already
+      // aborted the importer's surrounding transaction.
+      const table = await tx.executeRaw<{ present: boolean }>(
+        `SELECT to_regclass('public.page_aliases') IS NOT NULL AS present`,
+      );
+      if (!table[0]?.present) return;
+      await tx.executeRaw(
+        `DELETE FROM page_aliases WHERE source_id = $1 AND slug = $2`,
+        [sourceId, slug],
+      );
       if (uniq.length === 0) return;
-      await tx`
-        INSERT INTO page_aliases (source_id, alias_norm, slug)
-        SELECT ${sourceId}, a, ${slug} FROM unnest(${uniq}::text[]) AS a
-        ON CONFLICT (source_id, alias_norm, slug) DO NOTHING`;
+      await tx.executeRaw(
+        `INSERT INTO page_aliases (source_id, alias_norm, slug)
+        SELECT $1, a, $2 FROM unnest($3::text[]) AS a
+        ON CONFLICT (source_id, alias_norm, slug) DO NOTHING`,
+        [sourceId, slug, uniq],
+      );
     });
   }
 

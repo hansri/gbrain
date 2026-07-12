@@ -4,13 +4,15 @@ import {
   buildAutoEmbedArgs,
   buildGitInvocation,
   formatSyncSentinelRemediation,
+  resolvedIntegritySentinelPaths,
 } from '../src/commands/sync.ts';
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync, symlinkSync } from 'fs';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync, mkdirSync, renameSync, symlinkSync } from 'fs';
 import { join } from 'path';
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import { tmpdir } from 'os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
+import { gitAuthorityEnvironment } from '../src/core/git-environment.ts';
 
 describe('buildSyncManifest', () => {
   test('parses A/M/D entries from single commit', () => {
@@ -418,6 +420,128 @@ describe('performSync dry-run never writes', () => {
     expect(bookmarkAfterDry).toBe(bookmarkAfterReal);
   });
 
+  test('incremental dry-run does not delete a page that became unsyncable', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const real = await performSync(engine, {
+      repoPath,
+      noPull: true,
+      noEmbed: true,
+      noExtract: true,
+    });
+    expect(real.status).toBe('first_sync');
+    const bookmarkBefore = await engine.getConfig('sync.last_commit');
+    const aliceBefore = await engine.getPage('people/alice', { sourceId: 'default' });
+    expect(aliceBefore).not.toBeNull();
+
+    writeFileSync(
+      join(repoPath, 'people/alice.md'),
+      readFileSync(join(repoPath, 'people/alice.md'), 'utf-8') + '\nA committed update.\n',
+    );
+    execSync('git add -A && git commit -m "modify alice"', { cwd: repoPath, stdio: 'pipe' });
+
+    const result = await performSync(engine, {
+      repoPath,
+      strategy: 'code',
+      dryRun: true,
+      noPull: true,
+      noEmbed: true,
+      noExtract: true,
+    });
+
+    expect(result.status).toBe('dry_run');
+    expect(await engine.getPage('people/alice', { sourceId: 'default' }))
+      .toEqual(aliceBefore);
+    expect(await engine.getConfig('sync.last_commit')).toBe(bookmarkBefore);
+  });
+
+  for (const mixed of [false, true]) {
+    test(`incremental unsyncable cleanup absence proof blocks ${mixed ? 'mixed' : 'zero-change'} anchor on hostile restore`, async () => {
+      const { performSync } = await import('../src/commands/sync.ts');
+      await performSync(engine, {
+        repoPath, noPull: true, noEmbed: true, noExtract: true,
+      });
+      const beforeRows = await engine.executeRaw<{ last_commit: string | null }>(
+        `SELECT last_commit FROM sources WHERE id = 'default'`,
+      );
+      const before = beforeRows[0]?.last_commit ?? null;
+
+      writeFileSync(
+        join(repoPath, 'people/alice.md'),
+        readFileSync(join(repoPath, 'people/alice.md'), 'utf8') + '\nChanged.\n',
+      );
+      if (mixed) {
+        mkdirSync(join(repoPath, 'src'), { recursive: true });
+        writeFileSync(join(repoPath, 'src', 'worker.ts'), 'export const worker = 1;\n');
+      }
+      execSync('git add -A && git commit -m "unsyncable delta"', { cwd: repoPath, stdio: 'pipe' });
+
+      await expect(performSync(engine, {
+        repoPath,
+        strategy: 'code',
+        noPull: true,
+        noEmbed: true,
+        noExtract: true,
+        _hooks: {
+          afterUnsyncableCleanup: async tx => {
+            await tx.executeRaw(
+              `INSERT INTO pages
+                 (source_id, slug, type, title, compiled_truth, timeline, frontmatter, content_hash, source_path)
+               VALUES
+                 ('default', 'hostile-restore', 'person', 'Hostile restore', 'restored', '', '{}'::jsonb, 'hostile', 'people/alice.md')`,
+            );
+          },
+        },
+      })).rejects.toThrow(/cleanup absence proof failed/);
+
+      const afterRows = await engine.executeRaw<{ last_commit: string | null }>(
+        `SELECT last_commit FROM sources WHERE id = 'default'`,
+      );
+      expect(afterRows[0]?.last_commit ?? null).toBe(before);
+      expect(await engine.getPage('people/alice', { sourceId: 'default' })).not.toBeNull();
+      expect(await engine.getPage('hostile-restore', { sourceId: 'default' })).toBeNull();
+    });
+  }
+
+  test('default-source cleanup ignores a foreign same-slug page during verification', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const first = await performSync(engine, {
+      repoPath,
+      noPull: true,
+      noEmbed: true,
+      noExtract: true,
+    });
+    expect(first.status).toBe('first_sync');
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path, config)
+       VALUES ('overlap-source', 'overlap-source', NULL, '{}'::jsonb)`,
+    );
+    await engine.putPage('people/alice', {
+      type: 'person',
+      title: 'Foreign Alice',
+      compiled_truth: 'Foreign source authority.',
+      source_path: 'foreign/alice.md',
+    }, { sourceId: 'overlap-source' });
+
+    writeFileSync(
+      join(repoPath, 'people/alice.md'),
+      readFileSync(join(repoPath, 'people/alice.md'), 'utf-8') + '\nA committed update.\n',
+    );
+    execSync('git add -A && git commit -m "modify alice"', { cwd: repoPath, stdio: 'pipe' });
+
+    const result = await performSync(engine, {
+      repoPath,
+      strategy: 'code',
+      noPull: true,
+      noEmbed: true,
+      noExtract: true,
+    });
+
+    expect(result.status).toBe('up_to_date');
+    expect(await engine.getPage('people/alice', { sourceId: 'default' })).toBeNull();
+    expect((await engine.getPage('people/alice', { sourceId: 'overlap-source' }))?.title)
+      .toBe('Foreign Alice');
+  });
+
   test('source sync refreshes last_sync_at when HEAD is unchanged', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
     const sourceId = 'stale-source';
@@ -632,11 +756,25 @@ describe('resolveSlugByPathOrSourcePath (CJK wave v0.32.7, codex F4)', () => {
     expect(slug).toBe('projects/launch');
   });
 
-  test('falls back to resolveSlugForPath when no source_path matches', async () => {
+  test('returns null when no source_path matches (never authorizes a guessed mutation)', async () => {
     const { resolveSlugByPathOrSourcePath } = await import('../src/commands/sync.ts');
-    // No row seeded — fallback returns the path-derived slug.
+    // No row seeded: a coincidentally path-shaped manual page is not file-owned.
     const slug = await resolveSlugByPathOrSourcePath(pgEngine, 'concepts/hello-world.md');
-    expect(slug).toBe('concepts/hello-world');
+    expect(slug).toBeNull();
+  });
+
+  test('propagates ownership lookup errors so cleanup cannot advance stale rows', async () => {
+    const { resolveSlugByPathOrSourcePath } = await import('../src/commands/sync.ts');
+    const original = pgEngine.resolveSlugsByPaths.bind(pgEngine);
+    (pgEngine as any).resolveSlugsByPaths = async () => {
+      throw new Error('ownership database unavailable');
+    };
+    try {
+      await expect(resolveSlugByPathOrSourcePath(pgEngine, 'people/alice.md'))
+        .rejects.toThrow('ownership database unavailable');
+    } finally {
+      (pgEngine as any).resolveSlugsByPaths = original;
+    }
   });
 
   test('scoped by source_id when provided', async () => {
@@ -659,6 +797,25 @@ describe('resolveSlugByPathOrSourcePath (CJK wave v0.32.7, codex F4)', () => {
     );
     expect(await resolveSlugByPathOrSourcePath(pgEngine, '🚀.md', 'source-a')).toBe('slug-a/page');
     expect(await resolveSlugByPathOrSourcePath(pgEngine, '🚀.md', 'source-b')).toBe('slug-b/page');
+  });
+
+  test('legacy undefined scope means default only, never another source', async () => {
+    const { resolveSlugByPathOrSourcePath } = await import('../src/commands/sync.ts');
+    await pgEngine.executeRaw(
+      `INSERT INTO sources (id, name) VALUES ('source-b', 'B') ON CONFLICT DO NOTHING`,
+    );
+    await pgEngine.executeRaw(
+      `INSERT INTO pages (source_id, slug, type, title, compiled_truth, page_kind, source_path)
+       VALUES ('default', 'shared/page', 'note', 'Manual default', 'manual', 'markdown', NULL)`,
+    );
+    await pgEngine.executeRaw(
+      `INSERT INTO pages (source_id, slug, type, title, compiled_truth, page_kind, source_path)
+       VALUES ('source-b', 'shared/page', 'note', 'File B', 'b', 'markdown', 'shared/page.md')`,
+    );
+
+    expect(await resolveSlugByPathOrSourcePath(pgEngine, 'shared/page.md')).toBeNull();
+    expect(await resolveSlugByPathOrSourcePath(pgEngine, 'shared/page.md', 'source-b'))
+      .toBe('shared/page');
   });
 });
 
@@ -713,6 +870,21 @@ describe('sync sentinel remediation', () => {
     expect(message).toContain('slug/path collision');
     expect(message).toContain('pin current HEAD');
   });
+
+  test('a clean rerun resolves an old head sentinel instead of leaving a permanent ledger block', () => {
+    expect(resolvedIntegritySentinelPaths({
+      headFailed: false,
+      renameFailed: false,
+      deleteFailed: false,
+      snapshotAuthorityFailed: false,
+    })).toContain('<head>');
+    expect(resolvedIntegritySentinelPaths({
+      headFailed: true,
+      renameFailed: false,
+      deleteFailed: false,
+      snapshotAuthorityFailed: false,
+    })).not.toContain('<head>');
+  });
 });
 
 describe('sync auto-embed arguments', () => {
@@ -741,6 +913,27 @@ describe('sync auto-embed arguments', () => {
 describe('#1970: unreachable last_commit bookmark recovery', () => {
   let engine: PGLiteEngine;
   const repos: string[] = [];
+  const FIXTURE_GIT_CONFIG = [
+    'core.hooksPath=/dev/null',
+    'commit.gpgSign=false',
+    'tag.gpgSign=false',
+    'user.useConfigOnly=true',
+    'user.name=GBrain Sync Fixture',
+    'user.email=gbrain-sync-fixture@example.invalid',
+  ];
+
+  function fixtureGit(repoPath: string, args: string[]): string {
+    return execFileSync(
+      'git',
+      buildGitInvocation(repoPath, args, FIXTURE_GIT_CONFIG),
+      {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 30_000,
+        env: gitAuthorityEnvironment(),
+      },
+    ).trim();
+  }
 
   beforeAll(async () => {
     engine = new PGLiteEngine();
@@ -771,14 +964,13 @@ describe('#1970: unreachable last_commit bookmark recovery', () => {
   function mkRepo(files: Record<string, string>): string {
     const dir = mkdtempSync(join(tmpdir(), 'gbrain-1970-'));
     repos.push(dir);
-    execSync('git init', { cwd: dir, stdio: 'pipe' });
-    execSync('git config user.email "test@test.com"', { cwd: dir, stdio: 'pipe' });
-    execSync('git config user.name "Test"', { cwd: dir, stdio: 'pipe' });
+    fixtureGit(dir, ['init', '--initial-branch=main']);
     for (const [rel, content] of Object.entries(files)) {
       mkdirSync(join(dir, rel, '..'), { recursive: true });
       writeFileSync(join(dir, rel), content);
     }
-    execSync('git add -A && git commit -m "initial"', { cwd: dir, stdio: 'pipe' });
+    fixtureGit(dir, ['add', '-A']);
+    fixtureGit(dir, ['commit', '-m', 'initial']);
     return dir;
   }
 
@@ -838,12 +1030,13 @@ describe('#1970: unreachable last_commit bookmark recovery', () => {
     // Rewrite history: amend the only commit (adds delta.md). The previous tip
     // is now orphaned but still on disk — cat-file succeeds, is-ancestor fails.
     writeFileSync(join(repo, 'people/carol.md'), personMd('Carol', 'Carol joins.'));
-    execSync('git add -A && git commit --amend -m "amended with carol"', { cwd: repo, stdio: 'pipe' });
+    fixtureGit(repo, ['add', '-A']);
+    fixtureGit(repo, ['commit', '--amend', '-m', 'amended with carol']);
 
     // Sanity: the stored bookmark is present but no longer an ancestor of HEAD.
-    expect(execSync(`git cat-file -t ${orphan}`, { cwd: repo }).toString().trim()).toBe('commit');
+    expect(fixtureGit(repo, ['cat-file', '-t', orphan!])).toBe('commit');
     let isAncestor = true;
-    try { execSync(`git merge-base --is-ancestor ${orphan} HEAD`, { cwd: repo, stdio: 'pipe' }); }
+    try { fixtureGit(repo, ['merge-base', '--is-ancestor', orphan!, 'HEAD']); }
     catch { isAncestor = false; }
     expect(isAncestor).toBe(false);
 
@@ -857,7 +1050,7 @@ describe('#1970: unreachable last_commit bookmark recovery', () => {
     // Bookmark advanced off the orphan onto the rewritten HEAD.
     const advanced = await bookmark();
     expect(advanced).not.toBe(orphan);
-    expect(advanced).toBe(execSync('git rev-parse HEAD', { cwd: repo }).toString().trim());
+    expect(advanced).toBe(fixtureGit(repo, ['rev-parse', 'HEAD']));
   });
 
   test('orphan-absent (object gc\'d): falls back to a full reconcile', async () => {
@@ -871,7 +1064,8 @@ describe('#1970: unreachable last_commit bookmark recovery', () => {
       ['deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'],
     );
     writeFileSync(join(repo, 'people/bob.md'), personMd('Bob', 'Bob is a person.'));
-    execSync('git add -A && git commit -m "add bob"', { cwd: repo, stdio: 'pipe' });
+    fixtureGit(repo, ['add', '-A']);
+    fixtureGit(repo, ['commit', '-m', 'add bob']);
 
     const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     // Object absent → authoritative full reconcile.
@@ -890,9 +1084,10 @@ describe('#1970: unreachable last_commit bookmark recovery', () => {
     expect(await engine.getPage('people/bob')).not.toBeNull();
 
     // Rewrite the tip: drop bob, edit alice. Orphans the prior tip (still on disk).
-    execSync('git rm people/bob.md', { cwd: repo, stdio: 'pipe' });
+    fixtureGit(repo, ['rm', 'people/bob.md']);
     writeFileSync(join(repo, 'people/alice.md'), personMd('Alice', 'Alice was corrected.'));
-    execSync('git add -A && git commit --amend -m "drop bob, edit alice"', { cwd: repo, stdio: 'pipe' });
+    fixtureGit(repo, ['add', '-A']);
+    fixtureGit(repo, ['commit', '--amend', '-m', 'drop bob, edit alice']);
 
     const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     expect(result.status).toBe('synced');
@@ -910,8 +1105,8 @@ describe('#1970: unreachable last_commit bookmark recovery', () => {
     // git mv keeps content identical → classified as a 100% rename (R100).
     // The destination .txt is unsyncable, so without the F-C fix the old page
     // would linger (the rename drops out of both `renamed` and `deleted`).
-    execSync('git mv people/carol.md people/carol.txt', { cwd: repo, stdio: 'pipe' });
-    execSync('git commit -m "rename carol to txt"', { cwd: repo, stdio: 'pipe' });
+    fixtureGit(repo, ['mv', 'people/carol.md', 'people/carol.txt']);
+    fixtureGit(repo, ['commit', '-m', 'rename carol to txt']);
 
     const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     expect(result.status).toBe('synced');
@@ -926,11 +1121,265 @@ describe('#1970: unreachable last_commit bookmark recovery', () => {
 
     rmSync(join(repo, 'people/alice.md'));
     symlinkSync('../outside.md', join(repo, 'people/alice.md'));
-    execSync('git add -A && git commit -m "regular to symlink"', { cwd: repo, stdio: 'pipe' });
+    fixtureGit(repo, ['add', '-A']);
+    fixtureGit(repo, ['commit', '-m', 'regular to symlink']);
 
     const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     expect(result.status).toBe('synced');
     expect(await engine.getPage('people/alice')).toBeNull();
+  });
+
+  test('[CRITICAL] absent source_path mapping never deletes a guessed manual/legacy slug', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({ 'people/alice.md': personMd('Alice', 'Legacy row.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    await engine.executeRaw(
+      `UPDATE pages SET source_path = NULL WHERE source_id = 'default' AND slug = 'people/alice'`,
+    );
+    fixtureGit(repo, ['rm', 'people/alice.md']);
+    fixtureGit(repo, ['commit', '-m', 'remove unowned path']);
+
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(result.status).toBe('synced');
+    expect(await engine.getPage('people/alice', { sourceId: 'default' })).not.toBeNull();
+  });
+
+  test('[CRITICAL] frontmatter-fallback rename never calls updateSlug with an empty slug', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const fallbackPage = [
+      '---', 'type: project', 'title: Launch', 'slug: projects/launch', '---', '',
+      'Committed launch context.',
+    ].join('\n');
+    const repo = mkRepo({ '🚀.md': fallbackPage });
+    const first = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(first.status).toBe('first_sync');
+    expect(await engine.getPage('projects/launch', { sourceId: 'default' })).not.toBeNull();
+
+    renameSync(join(repo, '🚀.md'), join(repo, 'شروع.md'));
+    fixtureGit(repo, ['add', '-A']);
+    fixtureGit(repo, ['commit', '-m', 'rename fallback path']);
+
+    const renamed = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(renamed.status).toBe('synced');
+    const rows = await engine.executeRaw<{ slug: string; source_path: string | null }>(
+      `SELECT slug, source_path FROM pages WHERE source_id = 'default' AND slug = 'projects/launch'`,
+    );
+    expect(rows).toEqual([{ slug: 'projects/launch', source_path: 'شروع.md' }]);
+  });
+
+  test('[CRITICAL] atomic markdown rename preserves identity, graph, history, and slug metadata', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const page = [
+      '---',
+      'type: person',
+      'title: Alice',
+      'aliases:',
+      '  - Alice Alpha',
+      'tags:',
+      '  - keeper',
+      '---',
+      '',
+      'Canonical Alice context.',
+    ].join('\n');
+    const repo = mkRepo({ 'people/alice.md': page });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+
+    const oldPage = await engine.getPage('people/alice', { sourceId: 'default' });
+    expect(oldPage).not.toBeNull();
+    await engine.putPage('notes/reference', {
+      type: 'note', title: 'Reference', compiled_truth: 'Points to Alice.',
+    }, { sourceId: 'default' });
+    await engine.addLink(
+      'notes/reference', 'people/alice', 'manual relationship', 'mentions', 'manual',
+      undefined, undefined,
+      { fromSourceId: 'default', toSourceId: 'default', originSourceId: 'default' },
+    );
+    await engine.addTag('people/alice', 'manual-enrichment', { sourceId: 'default' });
+    await engine.addTimelineEntry('people/alice', {
+      date: '2026-01-02', source: 'manual', summary: 'Manual milestone',
+    }, { sourceId: 'default' });
+    await engine.createVersion('people/alice', { sourceId: 'default' });
+    await engine.executeRaw(
+      `INSERT INTO slug_aliases (source_id, alias_slug, canonical_slug)
+       VALUES ('default', 'people/legacy-alice', 'people/alice')`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO facts
+         (source_id, entity_slug, fact, source, source_markdown_slug, row_num)
+       VALUES
+         ('default', 'people/alice', 'self fact', 'test', 'people/alice', 1),
+         ('default', 'people/alice', 'referenced fact', 'test', 'notes/reference', 1)`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO take_proposals
+         (source_id, page_slug, content_hash, prompt_version, proposal_run_id,
+          status, claim_text, kind, holder, weight, model_id)
+       VALUES
+         ('default', 'people/alice', 'proposal-hash', 'v1', 'rename-run',
+          'pending', 'pending claim', 'belief', 'alice', 0.5, 'test-model')`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO context_volunteer_events
+         (source_id, slug, confidence, match_arm, rationale)
+       VALUES ('default', 'people/alice', 0.9, 'test', 'rename coverage')`,
+    );
+    await engine.upsertFile({
+      source_id: 'default',
+      page_slug: 'people/alice',
+      page_id: oldPage!.id,
+      filename: 'alice.bin',
+      storage_path: 'attachments/alice.bin',
+      content_hash: 'fixture-hash',
+    });
+    const versionsBefore = await engine.getVersions('people/alice', { sourceId: 'default' });
+
+    fixtureGit(repo, ['mv', 'people/alice.md', 'people/alice-renamed.md']);
+    fixtureGit(repo, ['commit', '-m', 'rename alice atomically']);
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+
+    expect(result.status).toBe('synced');
+    expect(await engine.getPage('people/alice', { sourceId: 'default' })).toBeNull();
+    const renamed = await engine.getPage('people/alice-renamed', { sourceId: 'default' });
+    expect(renamed?.id).toBe(oldPage!.id);
+    expect((await engine.getBacklinks('people/alice-renamed', { sourceId: 'default' }))[0]?.from_slug)
+      .toBe('notes/reference');
+    expect(await engine.getTags('people/alice-renamed', { sourceId: 'default' }))
+      .toEqual(expect.arrayContaining(['keeper', 'manual-enrichment']));
+    expect((await engine.getTimeline('people/alice-renamed', { sourceId: 'default' }))[0]?.summary)
+      .toBe('Manual milestone');
+    expect((await engine.getVersions('people/alice-renamed', { sourceId: 'default' })).length)
+      .toBeGreaterThan(versionsBefore.length);
+
+    const aliasRows = await engine.executeRaw<{ slug: string }>(
+      `SELECT slug FROM page_aliases
+        WHERE source_id = 'default' AND alias_norm = 'alice alpha'
+        ORDER BY slug`,
+    );
+    expect(aliasRows).toEqual([{ slug: 'people/alice-renamed' }]);
+    expect(await engine.resolveSlugWithAlias('people/legacy-alice', 'default'))
+      .toBe('people/alice-renamed');
+    const factKeys = await engine.executeRaw<{
+      entity_slug: string | null;
+      source_markdown_slug: string | null;
+    }>(
+      `SELECT entity_slug, source_markdown_slug FROM facts
+        WHERE source_id = 'default' ORDER BY fact`,
+    );
+    expect(factKeys).toEqual([
+      // Entity identity and Markdown provenance are independent foreign keys:
+      // an entity rename migrates entity_slug even when another page supplied
+      // the evidence, while preserving that source page's provenance slug.
+      { entity_slug: 'people/alice-renamed', source_markdown_slug: 'notes/reference' },
+      { entity_slug: 'people/alice-renamed', source_markdown_slug: 'people/alice-renamed' },
+    ]);
+    expect((await engine.executeRaw<{ page_slug: string }>(
+      `SELECT page_slug FROM take_proposals WHERE proposal_run_id = 'rename-run'`,
+    ))).toEqual([{ page_slug: 'people/alice-renamed' }]);
+    expect((await engine.executeRaw<{ slug: string }>(
+      `SELECT slug FROM context_volunteer_events WHERE rationale = 'rename coverage'`,
+    ))).toEqual([{ slug: 'people/alice-renamed' }]);
+    const file = await engine.getFile('default', 'attachments/alice.bin');
+    expect(file?.page_slug).toBe('people/alice-renamed');
+    expect(file?.page_id).toBe(oldPage!.id);
+  });
+
+  test('[CRITICAL] rename commit replays cleanly after crash before sync checkpoint', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const { importFileContent } = await import('../src/core/import-file.ts');
+    const repo = mkRepo({ 'people/old.md': personMd('Old', 'Replay-safe body.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    const before = await bookmark();
+    const oldId = (await engine.getPage('people/old', { sourceId: 'default' }))!.id;
+
+    fixtureGit(repo, ['mv', 'people/old.md', 'people/new.md']);
+    fixtureGit(repo, ['commit', '-m', 'rename before simulated checkpoint crash']);
+    const committed = await importFileContent(
+      engine,
+      readFileSync(join(repo, 'people/new.md'), 'utf8'),
+      'people/new.md',
+      {
+        noEmbed: true,
+        sourceId: 'default',
+        forceRechunk: true,
+        renameFromSlug: 'people/old',
+        renameFromSourcePath: 'people/old.md',
+      },
+    );
+    expect(committed.status).toBe('imported');
+    expect(await bookmark()).toBe(before);
+    expect((await engine.getPage('people/new', { sourceId: 'default' }))?.id).toBe(oldId);
+
+    const resumed = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    expect(resumed.status).toBe('synced');
+    expect((await engine.getPage('people/new', { sourceId: 'default' }))?.id).toBe(oldId);
+    expect(await bookmark()).toBe(fixtureGit(repo, ['rev-parse', 'HEAD']));
+  });
+
+  test('[CRITICAL] failed rename import rolls the old canonical slug back', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const explicitSlugPage = [
+      '---', 'type: person', 'title: Alice', 'slug: people/alice', '---', '',
+      'Canonical Alice context.',
+    ].join('\n');
+    const repo = mkRepo({ 'people/alice.md': explicitSlugPage });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    const before = await bookmark();
+
+    // The committed destination is invalid until its explicit slug is also
+    // changed. The importer must block without leaving the DB half-renamed.
+    fixtureGit(repo, ['mv', 'people/alice.md', 'people/bob.md']);
+    fixtureGit(repo, ['commit', '-m', 'rename without updating explicit slug']);
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+
+    expect(result.status).toBe('blocked_by_failures');
+    expect(await bookmark()).toBe(before);
+    expect(await engine.getPage('people/alice', { sourceId: 'default' })).not.toBeNull();
+    expect(await engine.getPage('people/bob', { sourceId: 'default' })).toBeNull();
+  });
+
+  test('[CRITICAL] unrelated destination collision leaves both canonical pages untouched', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({ 'people/old.md': personMd('Old', 'Original source page.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    await engine.putPage('people/new', {
+      type: 'person', title: 'Unrelated New', compiled_truth: 'Do not overwrite.',
+    }, { sourceId: 'default' });
+    const before = await bookmark();
+
+    fixtureGit(repo, ['mv', 'people/old.md', 'people/new.md']);
+    fixtureGit(repo, ['commit', '-m', 'rename into occupied slug']);
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+
+    expect(result.status).toBe('blocked_by_failures');
+    expect(await bookmark()).toBe(before);
+    expect((await engine.getPage('people/old', { sourceId: 'default' }))?.compiled_truth)
+      .toContain('Original source page.');
+    expect((await engine.getPage('people/new', { sourceId: 'default' }))?.compiled_truth)
+      .toBe('Do not overwrite.');
+  });
+
+  test('[CRITICAL] rename destination alias collision preserves canonical ownership', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({ 'people/old.md': personMd('Old', 'Original source page.') });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    await engine.putPage('people/other', {
+      type: 'person', title: 'Other', compiled_truth: 'Alias owner.',
+    }, { sourceId: 'default' });
+    await engine.executeRaw(
+      `INSERT INTO slug_aliases (source_id, alias_slug, canonical_slug)
+       VALUES ('default', 'people/new', 'people/other')`,
+    );
+    const before = await bookmark();
+
+    fixtureGit(repo, ['mv', 'people/old.md', 'people/new.md']);
+    fixtureGit(repo, ['commit', '-m', 'rename into alias collision']);
+    const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+
+    expect(result.status).toBe('blocked_by_failures');
+    expect(await bookmark()).toBe(before);
+    expect(await engine.getPage('people/old', { sourceId: 'default' })).not.toBeNull();
+    expect(await engine.getPage('people/new', { sourceId: 'default' })).toBeNull();
+    expect(await engine.resolveSlugWithAlias('people/new', 'default')).toBe('people/other');
   });
 
   test('[CRITICAL] custom-slug delete blocks on resolver failure or unverified fallback', async () => {
@@ -939,10 +1388,8 @@ describe('#1970: unreachable last_commit bookmark recovery', () => {
     await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     await engine.updateSlug('people/alice', 'custom/alice', { sourceId: 'default' });
     const before = await bookmark();
-    execSync('git rm people/alice.md && git commit -m "remove custom slug page"', {
-      cwd: repo,
-      stdio: 'pipe',
-    });
+    fixtureGit(repo, ['rm', 'people/alice.md']);
+    fixtureGit(repo, ['commit', '-m', 'remove custom slug page']);
 
     const originalResolve = engine.resolveSlugsByPaths.bind(engine);
     (engine as any).resolveSlugsByPaths = async () => { throw new Error('resolver unavailable'); };
@@ -963,33 +1410,7 @@ describe('#1970: unreachable last_commit bookmark recovery', () => {
     const resumed = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     expect(resumed.status).toBe('synced');
     expect(await engine.getPage('custom/alice')).toBeNull();
-    expect(await bookmark()).toBe(execSync('git rev-parse HEAD', { cwd: repo }).toString().trim());
-  });
-
-  test('[CRITICAL] rename errors hard-block and preserve the bookmark for retry', async () => {
-    const { performSync } = await import('../src/commands/sync.ts');
-    const repo = mkRepo({ 'people/old.md': personMd('Old', 'Original page.') });
-    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
-    const before = await bookmark();
-
-    execSync('git mv people/old.md people/new.md', { cwd: repo, stdio: 'pipe' });
-    execSync('git commit -m "rename page"', { cwd: repo, stdio: 'pipe' });
-    const originalUpdateSlug = engine.updateSlug.bind(engine);
-    (engine as any).updateSlug = async () => { throw new Error('simulated rename collision'); };
-    let blocked: Awaited<ReturnType<typeof performSync>> | undefined;
-    try {
-      blocked = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
-    } finally {
-      (engine as any).updateSlug = originalUpdateSlug;
-    }
-    expect(blocked!.status).toBe('blocked_by_failures');
-    expect(await bookmark()).toBe(before);
-    expect(await engine.getPage('people/new')).toBeNull();
-
-    const resumed = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
-    expect(resumed.status).toBe('synced');
-    expect(await engine.getPage('people/new')).not.toBeNull();
-    expect(await bookmark()).toBe(execSync('git rev-parse HEAD', { cwd: repo }).toString().trim());
+    expect(await bookmark()).toBe(fixtureGit(repo, ['rev-parse', 'HEAD']));
   });
 
   test('F-A: full reconcile purges stale file-backed pages but spares manual + metafile pages', async () => {
@@ -1011,8 +1432,8 @@ describe('#1970: unreachable last_commit bookmark recovery', () => {
     }, { sourceId: 'default' });
 
     // Delete bob's backing file, then force a full reconcile.
-    execSync('git rm people/bob.md', { cwd: repo, stdio: 'pipe' });
-    execSync('git commit -m "remove bob"', { cwd: repo, stdio: 'pipe' });
+    fixtureGit(repo, ['rm', 'people/bob.md']);
+    fixtureGit(repo, ['commit', '-m', 'remove bob']);
 
     const result = await performSync(engine, { repoPath: repo, full: true, ...SYNC_OPTS });
     expect(result.status).toBe('first_sync');
@@ -1024,6 +1445,92 @@ describe('#1970: unreachable last_commit bookmark recovery', () => {
     expect(await engine.getPage('people/log')).not.toBeNull();      // metafile source_path → spared
   });
 
+  test('[CRITICAL] a stale row restored before final selection is deleted in the anchor transaction', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({
+      'people/alice.md': personMd('Alice', 'Alice is a person.'),
+      'people/bob.md': personMd('Bob', 'Bob is a person.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    fixtureGit(repo, ['rm', 'people/bob.md']);
+    fixtureGit(repo, ['commit', '-m', 'remove bob for restore race']);
+    const head = fixtureGit(repo, ['rev-parse', 'HEAD']);
+
+    const result = await performSync(engine, {
+      repoPath: repo,
+      full: true,
+      ...SYNC_OPTS,
+      _hooks: {
+        beforeBookmarkFinalize: async () => {
+          // Simulate an out-of-band restore immediately before the final
+          // transaction. The transaction must select and retire this exact
+          // stale owner before advancing the anchor.
+          await engine.executeRaw(
+            `INSERT INTO pages
+               (source_id, slug, type, title, compiled_truth, timeline, frontmatter,
+                source_path, content_hash, deleted_at)
+             VALUES
+               ('default', 'people/bob', 'person', 'Bob', 'restored stale row', '',
+                '{}'::jsonb, 'people/bob.md', 'restored-stale', NULL)
+             ON CONFLICT (source_id, slug) DO UPDATE
+               SET deleted_at = NULL,
+                   source_path = EXCLUDED.source_path,
+                   compiled_truth = EXCLUDED.compiled_truth,
+                   content_hash = EXCLUDED.content_hash`,
+          );
+        },
+      },
+    });
+    expect(result.status).toBe('first_sync');
+    expect(await bookmark()).toBe(head);
+    expect(await engine.getPage('people/bob', { sourceId: 'default' })).toBeNull();
+  });
+
+  test('[CRITICAL] exact full-delete proof spares a row reclassified after selection', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({
+      'people/alice.md': personMd('Alice', 'Alice is a person.'),
+      'people/bob.md': personMd('Bob', 'Bob is a person.'),
+    });
+    await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
+    fixtureGit(repo, ['rm', 'people/bob.md']);
+    fixtureGit(repo, ['commit', '-m', 'remove bob for reclassification race']);
+    const head = fixtureGit(repo, ['rev-parse', 'HEAD']);
+    let selected = false;
+
+    const result = await performSync(engine, {
+      repoPath: repo,
+      full: true,
+      ...SYNC_OPTS,
+      _hooks: {
+        afterFullStaleSelection: async (tx, rows) => {
+          expect(rows.some(row => row.slug === 'people/bob' && row.sourcePath === 'people/bob.md')).toBe(true);
+          selected = true;
+          // Exact delete candidates were selected with the old path. Change
+          // the row to a non-syncable/manual path before the DELETE executes.
+          await tx.executeRaw(
+            `UPDATE pages
+                SET source_path = 'manual.json'
+              WHERE source_id = 'default'
+                AND slug = 'people/bob'
+                AND source_path = 'people/bob.md'`,
+          );
+        },
+      },
+    });
+
+    expect(selected).toBe(true);
+    expect(result.status).toBe('first_sync');
+    expect(await bookmark()).toBe(head);
+    const bob = await engine.executeRaw<{ source_path: string }>(
+      `SELECT source_path FROM pages
+        WHERE source_id = 'default' AND slug = 'people/bob' AND deleted_at IS NULL`,
+    );
+    expect(bob).toHaveLength(1);
+    expect(bob[0]!.source_path).toBe('manual.json');
+    expect(result.deleted).toBe(0);
+  });
+
   test('[CRITICAL] full delete failure blocks bookmark; retry reconciles then advances', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
     const repo = mkRepo({
@@ -1032,20 +1539,20 @@ describe('#1970: unreachable last_commit bookmark recovery', () => {
     });
     await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     const before = await bookmark();
-    execSync('git rm people/bob.md && git commit -m "remove bob"', { cwd: repo, stdio: 'pipe' });
-    const head = execSync('git rev-parse HEAD', { cwd: repo }).toString().trim();
+    fixtureGit(repo, ['rm', 'people/bob.md']);
+    fixtureGit(repo, ['commit', '-m', 'remove bob']);
+    const head = fixtureGit(repo, ['rev-parse', 'HEAD']);
 
-    const originalDeletePages = engine.deletePages.bind(engine);
-    const originalDeletePage = engine.deletePage.bind(engine);
-    (engine as any).deletePages = async () => { throw new Error('simulated batch delete outage'); };
-    (engine as any).deletePage = async () => { throw new Error('simulated single delete outage'); };
-    let blocked: Awaited<ReturnType<typeof performSync>> | undefined;
-    try {
-      blocked = await performSync(engine, { repoPath: repo, full: true, ...SYNC_OPTS });
-    } finally {
-      (engine as any).deletePages = originalDeletePages;
-      (engine as any).deletePage = originalDeletePage;
-    }
+    const blocked = await performSync(engine, {
+      repoPath: repo,
+      full: true,
+      ...SYNC_OPTS,
+      _hooks: {
+        afterFullStaleSelection: async () => {
+          throw new Error('simulated atomic delete outage');
+        },
+      },
+    });
     expect(blocked!.status).toBe('blocked_by_failures');
     expect(await bookmark()).toBe(before);
     expect(await engine.getPage('people/bob')).not.toBeNull();
@@ -1065,7 +1572,7 @@ describe('#1970: unreachable last_commit bookmark recovery', () => {
     // `git diff <blob>..HEAD` errors — the same failure shape as an oversized
     // post-rewrite diff hitting git()'s timeout/buffer limits. Must fall back,
     // not throw.
-    const blob = execSync('git rev-parse HEAD:people/alice.md', { cwd: repo }).toString().trim();
+    const blob = fixtureGit(repo, ['rev-parse', 'HEAD:people/alice.md']);
     await engine.executeRaw(`UPDATE sources SET last_commit = $1 WHERE id = 'default'`, [blob]);
 
     const result = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
@@ -1080,13 +1587,15 @@ describe('#1970: unreachable last_commit bookmark recovery', () => {
 
     // Orphan + recover.
     writeFileSync(join(repo, 'people/bob.md'), personMd('Bob', 'Bob is a person.'));
-    execSync('git add -A && git commit --amend -m "amended with bob"', { cwd: repo, stdio: 'pipe' });
+    fixtureGit(repo, ['add', '-A']);
+    fixtureGit(repo, ['commit', '--amend', '-m', 'amended with bob']);
     const recovered = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     expect(recovered.status).toBe('synced');
 
     // A subsequent ordinary commit now syncs incrementally (bookmark is sane).
     writeFileSync(join(repo, 'people/carol.md'), personMd('Carol', 'Carol joins.'));
-    execSync('git add -A && git commit -m "add carol"', { cwd: repo, stdio: 'pipe' });
+    fixtureGit(repo, ['add', '-A']);
+    fixtureGit(repo, ['commit', '-m', 'add carol']);
     const next = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     expect(next.status).toBe('synced');
     expect(next.added).toBe(1);
@@ -1094,5 +1603,30 @@ describe('#1970: unreachable last_commit bookmark recovery', () => {
     // No further changes → up_to_date (converged).
     const settled = await performSync(engine, { repoPath: repo, ...SYNC_OPTS });
     expect(settled.status).toBe('up_to_date');
+  });
+
+  test('incremental ingest audit is stamped with the synced source_id', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+    const repo = mkRepo({ 'people/alice.md': personMd('Alice', 'Initial source page.') });
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, local_path)
+       VALUES ('source-a', 'Source A', $1)`,
+      [repo],
+    );
+    const sourceOpts = { ...SYNC_OPTS, sourceId: 'source-a' } as const;
+    await performSync(engine, { repoPath: repo, ...sourceOpts });
+
+    writeFileSync(join(repo, 'people/alice.md'), personMd('Alice', 'Incremental update.'));
+    fixtureGit(repo, ['add', '-A']);
+    fixtureGit(repo, ['commit', '-m', 'update alice']);
+    const result = await performSync(engine, { repoPath: repo, ...sourceOpts });
+    expect(result.status).toBe('synced');
+
+    const rows = await engine.executeRaw<{ source_id: string }>(
+      `SELECT source_id FROM ingest_log
+        WHERE source_type = 'git_sync'
+        ORDER BY id DESC LIMIT 1`,
+    );
+    expect(rows).toEqual([{ source_id: 'source-a' }]);
   });
 });

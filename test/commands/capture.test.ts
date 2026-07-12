@@ -16,10 +16,38 @@ import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import matter from 'gray-matter';
 import { runCapture, __testing } from '../../src/commands/capture.ts';
+import { resetGateway } from '../../src/core/ai/gateway.ts';
+import { withEnv } from '../helpers/with-env.ts';
 
 let engine: PGLiteEngine;
 let tmpRoot: string;
 let brainDir: string;
+
+async function withHermeticCapture<T>(fn: () => Promise<T>): Promise<T> {
+  return withEnv({
+    HOME: tmpRoot,
+    GBRAIN_HOME: tmpRoot,
+    DATABASE_URL: undefined,
+    GBRAIN_DATABASE_URL: undefined,
+    GBRAIN_EMBEDDING_MODEL: undefined,
+    GBRAIN_EMBEDDING_DIMENSIONS: undefined,
+    OPENAI_API_KEY: undefined,
+    ANTHROPIC_API_KEY: undefined,
+    GOOGLE_GENERATIVE_AI_API_KEY: undefined,
+    ZEROENTROPY_API_KEY: undefined,
+    VOYAGE_API_KEY: undefined,
+  }, async () => {
+    // The gateway is process-global. A prior file in the same Bun shard may
+    // have configured Google (or another provider) with synthetic credentials;
+    // capture must not inherit that state and make a real network call.
+    resetGateway();
+    try {
+      return await fn();
+    } finally {
+      resetGateway();
+    }
+  });
+}
 
 beforeAll(async () => {
   engine = new PGLiteEngine();
@@ -158,7 +186,10 @@ describe('capture — local install integration', () => {
     const origLog = console.log;
     console.log = (...args: unknown[]) => logCaptured.push(args.map(String).join(' '));
     try {
-      await runCapture(engine, ['--slug', 'inbox/test-capture-1', '--quiet', 'A captured thought']);
+      await withHermeticCapture(() => runCapture(
+        engine,
+        ['--slug', 'inbox/test-capture-1', '--quiet', 'A captured thought'],
+      ));
     } finally {
       console.log = origLog;
     }
@@ -182,7 +213,7 @@ describe('capture — local install integration', () => {
     const origLog = console.log;
     console.log = (...args: unknown[]) => logCaptured.push(args.map(String).join(' '));
     try {
-      await runCapture(engine, ['--quiet', 'auto-slugged']);
+      await withHermeticCapture(() => runCapture(engine, ['--quiet', 'auto-slugged']));
     } finally {
       console.log = origLog;
     }
@@ -197,7 +228,10 @@ describe('capture — local install integration', () => {
     const origLog = console.log;
     console.log = (...args: unknown[]) => logCaptured.push(args.map(String).join(' '));
     try {
-      await runCapture(engine, ['--file', file, '--slug', 'inbox/from-file', '--quiet']);
+      await withHermeticCapture(() => runCapture(
+        engine,
+        ['--file', file, '--slug', 'inbox/from-file', '--quiet'],
+      ));
     } finally {
       console.log = origLog;
     }
@@ -211,7 +245,10 @@ describe('capture — local install integration', () => {
     const origLog = console.log;
     console.log = (...args: unknown[]) => logCaptured.push(args.map(String).join(' '));
     try {
-      await runCapture(engine, ['--json', '--slug', 'inbox/json-out', 'jsonny']);
+      await withHermeticCapture(() => runCapture(
+        engine,
+        ['--json', '--slug', 'inbox/json-out', 'jsonny'],
+      ));
     } finally {
       console.log = origLog;
     }

@@ -285,13 +285,15 @@ async function main() {
   }
 
   // DB-free durability pull (v0.42.44 D2): the harden cron calls
-  // `gbrain sources pull --path <dir>` every ~30 min. It must NOT open PGLite
+  // `gbrain sources pull --path <dir> --expected-remote <url>` every ~30 min.
   // (a live long-lived session holds the single-writer lock), so handle it
   // BEFORE connectEngine. The `sources pull <id>` form (no --path) still routes
   // through handleCliOnly → runSources with an engine.
-  if (command === 'sources' && subArgs[0] === 'pull' && subArgs.includes('--path')) {
-    const { runPull } = await import('./commands/sources-harden.ts');
-    await runPull(null, subArgs.slice(1));
+  if (command === 'sources' && ['pull', 'push', 'commit-push'].includes(subArgs[0] ?? '') && subArgs.includes('--path')) {
+    const { runPull, runPush, runCommitPush } = await import('./commands/sources-harden.ts');
+    if (subArgs[0] === 'push') await runPush(subArgs.slice(1));
+    else if (subArgs[0] === 'commit-push') await runCommitPush(subArgs.slice(1));
+    else await runPull(null, subArgs.slice(1));
     return;
   }
 
@@ -1577,16 +1579,22 @@ async function handleCliOnly(command: string, args: string[]) {
   try {
     switch (command) {
       case 'import': {
-        const { runImport } = await import('./commands/import.ts');
+        const { runImport, ImportInvocationError } = await import('./commands/import.ts');
         // v0.41 (Codex r2 #3 fix): honor errors counter for exit code.
         // runImport's per-file catch already records failures, but the
         // CLI was discarding the result so the process exited 0 even
         // when files failed (e.g. content-sanity hard-block throws,
-        // size-cap throws, parse errors). Surface non-zero on errors > 0
-        // so wrappers (sync, CI scripts, `&& gbrain doctor`) propagate.
-        const importResult = await runImport(engine, args);
-        if (importResult.errors > 0) {
-          setCliExitVerdict(1);
+        // size-cap throws, parse errors, and returned validation failures).
+        // Surface the import verdict so wrappers (sync, CI scripts,
+        // `&& gbrain doctor`) cannot mistake a partial import for success.
+        try {
+          const importResult = await runImport(engine, args);
+          setCliExitVerdict(importResult.exitCode);
+        } catch (error) {
+          if (!(error instanceof ImportInvocationError)) throw error;
+          if (args.includes('--json')) console.log(JSON.stringify(error.importResult));
+          else console.error(error.message);
+          setCliExitVerdict(error.exitCode);
         }
         break;
       }

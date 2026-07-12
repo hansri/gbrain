@@ -71,10 +71,22 @@ import { canonicalSourcePath } from '../core/source-path.ts';
 // count but safe at any future schema width and keeps per-batch error blast radius
 // small (a malformed row aborts at most 100, not thousands).
 const BATCH_SIZE = 100;
-// Dedicated provenance for timeline rows maintained from imported Markdown.
-// Manual timeline entries use their caller-provided source (often '' or
-// 'manual') and are never touched by this reconciler.
+// Dedicated provenance namespace for timeline rows maintained from imported
+// Markdown. A parsed source label is retained after the colon (for example
+// `gbrain-markdown:Meeting`); source-less/header entries use the bare prefix.
+// Manual rows never use this reserved namespace and are never reconciled.
 const IMPORTED_MARKDOWN_TIMELINE_SOURCE = 'gbrain-markdown';
+export const IMPORTED_MARKDOWN_TIMELINE_MANAGER = 'gbrain:markdown-timeline:v1';
+
+/** Conservative extraction watermark shared by ordinary and stale DB paths. */
+export function freshnessStampFor(updatedAtIso: string): string {
+  const updatedMs = Date.parse(updatedAtIso);
+  const versionMs = Date.parse(LINK_EXTRACTOR_VERSION_TS);
+  if (Number.isFinite(updatedMs) && Number.isFinite(versionMs) && updatedMs < versionMs) {
+    return LINK_EXTRACTOR_VERSION_TS;
+  }
+  return updatedAtIso;
+}
 
 // v0.42.7 (#1696): keyset batch size for `extract --stale`. SMALL by design —
 // listStalePagesForExtraction returns page CONTENT (compiled_truth + timeline),
@@ -110,11 +122,11 @@ export async function stampExtracted(
 
 /**
  * v0.42.7 (#1696): pure cross-source resolution for one extracted link
- * candidate. Validates both endpoints exist (else the batch JOIN drops the row),
- * then picks from_source_id / to_source_id: prefer the origin page's source,
- * fall back to 'default', else skip (never push a wrong-source edge). Returns
- * null when the candidate should be skipped. Shared by extractLinksFromDB and
- * extractStaleFromDB so the F10 multi-source resolution can't drift.
+ * candidate. Unqualified references are strictly same-source. A qualified
+ * wikilink may select an explicit target source, but the origin endpoint must
+ * still be owned by the page currently being extracted. There is deliberately
+ * no `default` or first-source fallback: absence is safer than a plausible but
+ * wrong cross-source edge.
  */
 export function resolveCandidateSources(
   c: LinkCandidate,
@@ -127,17 +139,11 @@ export function resolveCandidateSources(
   if (!allSlugs.has(c.targetSlug)) return null;
   if (!allSlugs.has(fromSlug)) return null;
   const fromSources = slugToSources.get(fromSlug) ?? [];
-  const fromSourceId = fromSources.includes(pageSourceId) ? pageSourceId
-    : (fromSources.includes('default') ? 'default' : fromSources[0]);
+  if (!fromSources.includes(pageSourceId)) return null;
+  const fromSourceId = pageSourceId;
   const targetSources = slugToSources.get(c.targetSlug) ?? [];
-  let toSourceId: string;
-  if (targetSources.includes(fromSourceId)) {
-    toSourceId = fromSourceId;
-  } else if (targetSources.includes('default')) {
-    toSourceId = 'default';
-  } else {
-    return null;
-  }
+  const toSourceId = c.targetSourceId ?? pageSourceId;
+  if (!targetSources.includes(toSourceId)) return null;
   return { fromSlug, fromSourceId, toSourceId };
 }
 
@@ -479,10 +485,17 @@ export function extractTimelineFromContent(content: string, slug: string): Extra
   const entries: ExtractedTimelineEntry[] = [];
 
   // Format 1: Bullet — - **YYYY-MM-DD** | Source — Summary
+  // Preserve both the spaced separator and the compact form emitted by some
+  // meeting and chat exporters (`| MeetingTool—Decision` / `| ChatTool-Follow-up`). The
+  // pre-existing parser accepted all three dash variants without spaces; this
+  // must remain backward-compatible so the source label is not downgraded to
+  // a generic Markdown summary.
   const bulletPattern = /^-\s+\*\*(\d{4}-\d{2}-\d{2})\*\*\s*\|\s*(.+?)\s*[—–-]\s*(.+)$/gm;
   let match;
   while ((match = bulletPattern.exec(content)) !== null) {
-    entries.push({ slug, date: match[1], source: match[2].trim(), summary: match[3].trim() });
+    const source = match[2].trim();
+    const summary = match[3].trim();
+    entries.push({ slug, date: match[1], source, summary });
   }
 
   // Format 2: Header — ### YYYY-MM-DD — Title
@@ -500,6 +513,80 @@ export function extractTimelineFromContent(content: string, slug: string): Extra
   }
 
   return entries;
+}
+
+/**
+ * Canonical DB/stale timeline projection.
+ *
+ * The established filesystem parser owns source-labelled bullets and dated
+ * headings. `parseTimelineEntries` remains the compatibility arm for the
+ * source-less pipe/dash variants accepted by the DB extractor. A labelled
+ * bullet is visible to both parsers, so suppress the generic duplicate before
+ * assigning the reserved managed-provenance namespace.
+ */
+export function extractManagedTimelineFromContent(
+  content: string,
+  slug: string,
+): ExtractedTimelineEntry[] {
+  const established = extractTimelineFromContent(content, slug);
+  const ambiguousEstablished = new Set<number>();
+  const compatibilityEntries: ExtractedTimelineEntry[] = [];
+
+  for (const candidate of parseTimelineEntries(content)) {
+    // The legacy filesystem parser must keep accepting compact ASCII dashes,
+    // but `Source-summary` is ambiguous: it is at least as likely to be one
+    // hyphenated source-less summary as a labelled event. Managed extraction
+    // therefore lets the compatibility parser keep the whole text and drops
+    // the invented source split. Unicode dashes, or any spaced dash, are
+    // sufficiently explicit and remain source separators.
+    const ambiguousIndex = established.findIndex(entry => (
+      entry.date === candidate.date
+      && candidate.summary === `${entry.source}-${entry.summary}`
+    ));
+    if (ambiguousIndex >= 0) {
+      ambiguousEstablished.add(ambiguousIndex);
+      compatibilityEntries.push({
+        slug,
+        date: candidate.date,
+        source: 'markdown',
+        summary: candidate.summary,
+        detail: candidate.detail || undefined,
+      });
+      continue;
+    }
+
+    const duplicate = established.some(entry => {
+      if (entry.date !== candidate.date) return false;
+      if (entry.summary === candidate.summary) return true;
+      return [
+        `${entry.source} — ${entry.summary}`,
+        `${entry.source} – ${entry.summary}`,
+        `${entry.source} - ${entry.summary}`,
+        `${entry.source}—${entry.summary}`,
+        `${entry.source}–${entry.summary}`,
+      ].includes(candidate.summary);
+    });
+    if (!duplicate) {
+      compatibilityEntries.push({
+        slug,
+        date: candidate.date,
+        source: 'markdown',
+        summary: candidate.summary,
+        detail: candidate.detail || undefined,
+      });
+    }
+  }
+
+  const entries = established
+    .filter((_, index) => !ambiguousEstablished.has(index))
+    .concat(compatibilityEntries);
+
+  return entries.map(entry => ({
+    ...entry,
+    source: entry.source && entry.source !== 'markdown'
+      ? `${IMPORTED_MARKDOWN_TIMELINE_SOURCE}:${entry.source}`
+      : IMPORTED_MARKDOWN_TIMELINE_SOURCE,
+  }));
 }
 
 // --- Main command ---
@@ -653,7 +740,10 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
     await extractStaleFromDB(engine, {
       dryRun: args.includes('--dry-run'),
       jsonMode: args.includes('--json'),
-      includeFrontmatter: args.includes('--include-frontmatter'),
+      // A freshness watermark is only truthful after the complete managed
+      // projection is reconciled. The canonical stale sweep therefore always
+      // includes frontmatter; the legacy flag remains accepted as a no-op.
+      includeFrontmatter: true,
       sourceIdFilter: staleSourceId,
       catchUp: args.includes('--catch-up'),
     });
@@ -745,7 +835,7 @@ Extraction (existing):
 
 Incremental sweep (v0.42.7):
   gbrain extract --stale [--source-id <id>] [--catch-up] [--dry-run] [--json]
-      Re-extract links + timeline ONLY for pages whose extraction is stale
+      Re-extract body/frontmatter links + timeline ONLY for stale pages
       (never extracted, edited since, or extractor bumped). DB-source; safe to
       cron. --catch-up loops past the 30-min wall-clock budget until 0 remain.
 
@@ -948,17 +1038,33 @@ Status (v0.42):
           if (!byMention) result.pages_processed += r.pages;
         }
       } else {
-        if (subcommand === 'links' || subcommand === 'all') {
-          // C3 (D6): only stamp the combined links+timeline watermark when BOTH
-          // ran ('all'); a links-only run must not mark timeline fresh.
-          const r = await extractLinksFromDB(engine, dryRun, jsonMode, typeFilter, since, { includeFrontmatter, sourceIdFilter, stampWatermark: subcommand === 'all' });
-          result.links_created = r.created;
-          result.pages_processed = r.pages;
-        }
-        if (subcommand === 'timeline' || subcommand === 'all') {
-          const r = await extractTimelineFromDB(engine, dryRun, jsonMode, typeFilter, since, { sourceIdFilter });
-          result.timeline_entries_created = r.created;
-          result.pages_processed = Math.max(result.pages_processed, r.pages);
+        if (subcommand === 'all' && includeFrontmatter && !dryRun) {
+          // A complete DB projection has one authority and one watermark.
+          // Reconcile body links, frontmatter links, and managed timeline rows
+          // together, then stamp only after every write succeeds. The dry-run
+          // path stays on the legacy readers below so it can emit previews.
+          const r = await extractAllFromDBAuthoritative(
+            engine,
+            typeFilter,
+            since,
+            { sourceIdFilter },
+          );
+          result.links_created = r.linksCreated;
+          result.timeline_entries_created = r.timelineCreated;
+          result.pages_processed = r.pagesProcessed;
+        } else {
+          if (subcommand === 'links' || subcommand === 'all') {
+            // C3 (D6): only stamp the combined links+timeline watermark when BOTH
+            // ran ('all'); a links-only run must not mark timeline fresh.
+            const r = await extractLinksFromDB(engine, dryRun, jsonMode, typeFilter, since, { includeFrontmatter, sourceIdFilter, stampWatermark: subcommand === 'all' });
+            result.links_created = r.created;
+            result.pages_processed = r.pages;
+          }
+          if (subcommand === 'timeline' || subcommand === 'all') {
+            const r = await extractTimelineFromDB(engine, dryRun, jsonMode, typeFilter, since, { sourceIdFilter });
+            result.timeline_entries_created = r.created;
+            result.pages_processed = Math.max(result.pages_processed, r.pages);
+          }
         }
       }
     } else {
@@ -1368,7 +1474,10 @@ export async function extractImportedPagesFromDB(
         frontmatter,
         page.type,
         resolver,
-        { skipFrontmatter: true, globalBasename },
+        // Post-sync owns the full managed projection. Skipping frontmatter
+        // here while stamping the shared watermark would preserve removed YAML
+        // edges indefinitely and falsely mark them fresh.
+        { skipFrontmatter: false, globalBasename },
       );
       for (const candidate of extracted.candidates) {
         const resolved = resolveCandidateSources(
@@ -1388,20 +1497,21 @@ export async function extractImportedPagesFromDB(
           origin_source_id: page.source_id,
         });
       }
-      for (const entry of parseTimelineEntries(fullContent)) {
+      for (const entry of extractManagedTimelineFromContent(fullContent, page.slug)) {
         timelineRows.push({
           slug: page.slug,
           date: entry.date,
-          source: IMPORTED_MARKDOWN_TIMELINE_SOURCE,
+          source: entry.source,
           summary: entry.summary,
           detail: entry.detail || '',
           source_id: page.source_id,
+          managed_by: IMPORTED_MARKDOWN_TIMELINE_MANAGER,
         });
       }
       processedRefs.push({
         slug: page.slug,
         source_id: page.source_id,
-        extractedAt: page.updated_at_iso,
+        extractedAt: freshnessStampFor(page.updated_at_iso),
       });
     }
 
@@ -1419,15 +1529,37 @@ export async function extractImportedPagesFromDB(
         [sourceId, slugBatch],
       );
       await tx.executeRaw(
+        `DELETE FROM links l
+          USING pages origin
+          WHERE l.origin_page_id = origin.id
+            AND origin.source_id = $1
+            AND origin.slug = ANY($2::text[])
+            AND l.link_source = 'frontmatter'`,
+        [sourceId, slugBatch],
+      );
+      // Rows in the reserved pre-v126 namespace were generated by this same
+      // extractor. Claim them before replacement so an exact legacy row cannot
+      // win the unique conflict and remain permanently unowned.
+      await tx.executeRaw(
+        `UPDATE timeline_entries te
+            SET managed_by = $3
+           FROM pages p
+          WHERE te.page_id = p.id
+            AND p.source_id = $1
+            AND p.slug = ANY($2::text[])
+            AND te.managed_by IS NULL
+            AND (te.source = $4 OR te.source LIKE $4 || ':%')`,
+        [sourceId, slugBatch, IMPORTED_MARKDOWN_TIMELINE_MANAGER, IMPORTED_MARKDOWN_TIMELINE_SOURCE],
+      );
+      await tx.executeRaw(
         `DELETE FROM timeline_entries te
           USING pages p
           WHERE te.page_id = p.id
             AND p.source_id = $1
             AND p.slug = ANY($2::text[])
-            AND te.source = $3`,
-        [sourceId, slugBatch, IMPORTED_MARKDOWN_TIMELINE_SOURCE],
+            AND te.managed_by = $3`,
+        [sourceId, slugBatch, IMPORTED_MARKDOWN_TIMELINE_MANAGER],
       );
-
       let createdLinks = 0;
       let createdTimeline = 0;
       for (let i = 0; i < linkRows.length; i += BATCH_SIZE) {
@@ -1448,11 +1580,57 @@ export async function extractImportedPagesFromDB(
         await tx.markPagesExtractedBatch(processedRefs, new Date().toISOString());
       }
       return { createdLinks, createdTimeline };
-    });
+    }, { retryOnConnectionError: true });
     linksCreated += reconciled.createdLinks;
     timelineCreated += reconciled.createdTimeline;
     pagesProcessed += pages.length;
   }
+  return { linksCreated, timelineCreated, pagesProcessed };
+}
+
+/**
+ * Authoritative ordinary DB extraction for `extract all --include-frontmatter`.
+ *
+ * Selection keeps the existing type/since/source semantics. Each selected
+ * page then flows through the same transactional projection used by post-sync
+ * and stale extraction: managed body/frontmatter links and managed timeline
+ * rows are replaced together, manual rows survive, and the page watermark is
+ * the final write in the transaction.
+ */
+export async function extractAllFromDBAuthoritative(
+  engine: BrainEngine,
+  typeFilter: PageType | undefined,
+  since: string | undefined,
+  opts?: { sourceIdFilter?: string },
+): Promise<{ linksCreated: number; timelineCreated: number; pagesProcessed: number }> {
+  const sourceIdFilter = opts?.sourceIdFilter;
+  const allRefs = sourceIdFilter
+    ? (await engine.listAllPageRefs()).filter(ref => ref.source_id === sourceIdFilter)
+    : await engine.listAllPageRefs();
+  const sinceMs = since ? new Date(since).getTime() : Number.NaN;
+  const selectedBySource = new Map<string, string[]>();
+
+  for (const { slug, source_id } of allRefs) {
+    const page = await engine.getPage(slug, { sourceId: source_id });
+    if (!page) continue;
+    if (typeFilter && page.type !== typeFilter) continue;
+    if (Number.isFinite(sinceMs) && new Date(page.updated_at).getTime() <= sinceMs) continue;
+
+    const slugs = selectedBySource.get(source_id) ?? [];
+    slugs.push(slug);
+    selectedBySource.set(source_id, slugs);
+  }
+
+  let linksCreated = 0;
+  let timelineCreated = 0;
+  let pagesProcessed = 0;
+  for (const [sourceId, slugs] of selectedBySource) {
+    const result = await extractImportedPagesFromDB(engine, slugs, { sourceId });
+    linksCreated += result.linksCreated;
+    timelineCreated += result.timelineCreated;
+    pagesProcessed += result.pagesProcessed;
+  }
+
   return { linksCreated, timelineCreated, pagesProcessed };
 }
 
@@ -1528,10 +1706,10 @@ async function extractLinksFromDB(
 ): Promise<{ created: number; pages: number; unresolved: UnresolvedFrontmatterRef[] }> {
   const includeFrontmatter = opts?.includeFrontmatter ?? false;
   const sourceIdFilter = opts?.sourceIdFilter;
-  // C3 (D6): the links_extracted_at watermark covers links AND timeline, so a
-  // links-ONLY run must NOT stamp it (that would hide timeline staleness for
-  // `gbrain extract links --source db`). Only stamp when the caller ran BOTH
-  // (subcommand 'all'). Caller passes stampWatermark accordingly.
+  // C3 (D6): the links_extracted_at watermark covers the complete managed
+  // graph projection. A links-only OR frontmatter-skipping run must not stamp
+  // it. The caller requests a stamp for `all`; flush additionally requires
+  // includeFrontmatter before committing it.
   const stampWatermark = opts?.stampWatermark ?? false;
   // Batch resolver: pg_trgm + exact only, NO search fallback. Dodges the
   // N-thousand API call trap on 46K-page brains. Resolver has a per-run
@@ -1544,7 +1722,15 @@ async function extractLinksFromDB(
   // one and let extractPageLinks's opts gate which pass actually runs.
   // Issue #972 (codex [P1]): scope basename resolution to the source being
   // extracted so bare wikilinks don't resolve across unrelated sources.
-  const resolver = makeResolver(engine, { mode: 'batch', sourceId: sourceIdFilter });
+  const resolvers = new Map<string, ReturnType<typeof makeResolver>>();
+  const resolverFor = (sourceId: string) => {
+    let resolver = resolvers.get(sourceId);
+    if (!resolver) {
+      resolver = makeResolver(engine, { mode: 'batch', sourceId });
+      resolvers.set(sourceId, resolver);
+    }
+    return resolver;
+  };
   const unresolved: UnresolvedFrontmatterRef[] = [];
   // Issue #972: opt-in global-basename wikilink resolution. Read once
   // per extract run; threaded into each extractPageLinks call.
@@ -1583,10 +1769,6 @@ async function extractLinksFromDB(
     slugToSources.set(ref.slug, list);
   }
   let processed = 0, created = 0;
-  // v0.42.7 (#1696): pages whose links we extracted this run — stamped after
-  // the loop so a manual `gbrain extract links|all --source db` clears the
-  // links_extraction_lag doctor signal. Non-dry-run only.
-  const processedRefs: Array<{ slug: string; source_id: string }> = [];
 
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
   progress.start('extract.links_db', allRefs.length);
@@ -1595,20 +1777,61 @@ async function extractLinksFromDB(
   const dryRunSeen = dryRun ? new Set<string>() : null;
 
   const batch: LinkBatchInput[] = [];
+  const batchRefs: Array<{ slug: string; source_id: string; extractedAt: string }> = [];
   async function flush() {
-    if (batch.length === 0) return;
-    const snapshot = batch.slice();
+    if (batchRefs.length === 0) return;
+    const rows = batch.slice();
+    const refs = batchRefs.slice();
     batch.length = 0;
-    try {
-      created += await engine.addLinksBatch(snapshot, { auditSite: 'extract.links_db' }); // gbrain-allow-direct-insert: gbrain extract command — canonical link reconciliation from markdown body
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (jsonMode) {
-        process.stderr.write(JSON.stringify({ event: 'batch_error', size: snapshot.length, error: msg }) + '\n');
-      } else {
-        console.error(`  batch error (${snapshot.length} link rows lost): ${msg}`);
+    batchRefs.length = 0;
+    created += await engine.transaction(async tx => {
+      const slugsBySource = new Map<string, string[]>();
+      for (const ref of refs) {
+        const slugs = slugsBySource.get(ref.source_id) ?? [];
+        slugs.push(ref.slug);
+        slugsBySource.set(ref.source_id, slugs);
       }
-    }
+      for (const [sourceId, slugs] of slugsBySource) {
+        // Body-derived rows are authoritative for the processed origin pages.
+        await tx.executeRaw(
+          `DELETE FROM links l
+            USING pages p
+            WHERE l.from_page_id = p.id
+              AND p.source_id = $1
+              AND p.slug = ANY($2::text[])
+              AND l.origin_page_id IS NULL
+              AND (l.link_source IS NULL OR l.link_source IN ('markdown', 'wikilink-resolved'))`,
+          [sourceId, slugs],
+        );
+        if (includeFrontmatter) {
+          // Frontmatter edges may point inward, so their owning page is the
+          // explicit origin_page_id rather than from_page_id.
+          await tx.executeRaw(
+            `DELETE FROM links l
+              USING pages origin
+              WHERE l.origin_page_id = origin.id
+                AND origin.source_id = $1
+                AND origin.slug = ANY($2::text[])
+                AND l.link_source = 'frontmatter'`,
+            [sourceId, slugs],
+          );
+        }
+      }
+      let inserted = 0;
+      for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+        inserted += await tx.addLinksBatch(
+          rows.slice(i, i + BATCH_SIZE),
+          { auditSite: 'extract.links_db' },
+        ); // gbrain-allow-direct-insert: authoritative DB link reconciliation
+      }
+      // The shared watermark can only claim a complete graph pass when the
+      // requested all-mode also reconciled frontmatter. A body-only run must
+      // not make stale frontmatter-origin rows look fresh.
+      if (stampWatermark && includeFrontmatter) {
+        await tx.markPagesExtractedBatch(refs, new Date().toISOString());
+      }
+      return inserted;
+    }, { retryOnConnectionError: true });
   }
 
   for (const { slug, source_id } of allRefs) {
@@ -1628,7 +1851,7 @@ async function extractLinksFromDB(
     // Issue #972: globalBasename routes bare `[[name]]` wikilinks through
     // basename lookup; off by default for back-compat.
     const extracted = await extractPageLinks(
-      slug, fullContent, page.frontmatter, page.type, resolver,
+      slug, fullContent, page.frontmatter, page.type, resolverFor(source_id),
       { skipFrontmatter: !includeFrontmatter, globalBasename },
     );
     unresolved.push(...extracted.unresolved);
@@ -1672,25 +1895,26 @@ async function extractLinksFromDB(
           to_source_id: toSourceId,
           origin_source_id: source_id,
         });
-        if (batch.length >= BATCH_SIZE) await flush();
       }
     }
     processed++;
-    if (!dryRun) processedRefs.push({ slug, source_id });
+    if (!dryRun) {
+      const readUpdatedAt = new Date(page.updated_at).toISOString();
+      const extractedAt = Date.parse(readUpdatedAt) < Date.parse(LINK_EXTRACTOR_VERSION_TS)
+        ? LINK_EXTRACTOR_VERSION_TS
+        : readUpdatedAt;
+      batchRefs.push({
+        slug,
+        source_id,
+        // Conservative read watermark: a concurrent edit after this read
+        // remains newer and therefore stale instead of being masked by now().
+        extractedAt,
+      });
+      if (batchRefs.length >= BATCH_SIZE) await flush();
+    }
     progress.tick(1);
   }
   await flush();
-  // v0.42.7 (#1696): stamp the extraction watermark for every page we
-  // processed (incl. zero-link pages — they WERE extracted). Chunked so the
-  // unnest UPDATE stays bounded on big brains. Best-effort (stampExtracted
-  // swallows): a stamp miss just leaves the page for extract --stale.
-  // C3 (D6): ONLY when both links + timeline ran (stampWatermark) — a
-  // links-only run leaves the combined watermark untouched.
-  if (!dryRun && stampWatermark) {
-    for (let i = 0; i < processedRefs.length; i += BATCH_SIZE) {
-      await stampExtracted(engine, processedRefs.slice(i, i + BATCH_SIZE));
-    }
-  }
   progress.finish();
 
   if (!jsonMode) {
@@ -1745,16 +1969,10 @@ async function extractTimelineFromDB(
     if (batch.length === 0) return;
     const snapshot = batch.slice();
     batch.length = 0;
-    try {
-      created += await engine.addTimelineEntriesBatch(snapshot, { auditSite: 'extract.timeline_db' });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (jsonMode) {
-        process.stderr.write(JSON.stringify({ event: 'batch_error', size: snapshot.length, error: msg }) + '\n');
-      } else {
-        console.error(`  batch error (${snapshot.length} timeline rows lost): ${msg}`);
-      }
-    }
+    // A partial timeline is not success. Let the command boundary report the
+    // failure and exit non-zero so callers can retry instead of trusting an
+    // incomplete projection.
+    created += await engine.addTimelineEntriesBatch(snapshot, { auditSite: 'extract.timeline_db' });
   }
 
   for (const { slug, source_id } of allRefs) {
@@ -1831,14 +2049,6 @@ async function extractStaleFromDB(
 ): Promise<{ linksCreated: number; timelineCreated: number; pagesProcessed: number; staleRemaining: number }> {
   const { dryRun, jsonMode, includeFrontmatter, sourceIdFilter, catchUp } = opts;
   const versionTs = LINK_EXTRACTOR_VERSION_TS;
-  const versionMs = Date.parse(versionTs);
-  const freshnessStampFor = (updatedAtIso: string): string => {
-    const updatedMs = Date.parse(updatedAtIso);
-    if (Number.isFinite(updatedMs) && Number.isFinite(versionMs) && updatedMs < versionMs) {
-      return versionTs;
-    }
-    return updatedAtIso;
-  };
 
   // Pre-flight count — cheap indexed COUNT. dry-run reports and returns.
   const totalStale = await engine.countStalePagesForExtraction({ sourceId: sourceIdFilter, versionTs });
@@ -1860,9 +2070,15 @@ async function extractStaleFromDB(
   // Batch mode = pg_trgm + exact only, NO per-name search fallback. The
   // resolution map sees ALL sources so qualified cross-source wikilinks resolve
   // even when --source-id scopes the stale SCAN.
-  const resolver = makeResolver(engine, { mode: 'batch' });
-  const nullResolver = { resolve: async () => null as string | null };
-  const activeResolver = includeFrontmatter ? resolver : nullResolver;
+  const resolvers = new Map<string, ReturnType<typeof makeResolver>>();
+  const resolverFor = (sourceId: string) => {
+    let resolver = resolvers.get(sourceId);
+    if (!resolver) {
+      resolver = makeResolver(engine, { mode: 'batch', sourceId });
+      resolvers.set(sourceId, resolver);
+    }
+    return resolver;
+  };
   const allRefs = await engine.listAllPageRefs();
   const allSlugs = new Set<string>();
   const slugToSources = new Map<string, string[]>();
@@ -1894,7 +2110,8 @@ async function extractStaleFromDB(
     for (const page of rows) {
       const fullContent = page.compiled_truth + '\n' + page.timeline;
       const extracted = await extractPageLinks(
-        page.slug, fullContent, page.frontmatter, page.type, activeResolver,
+        page.slug, fullContent, page.frontmatter, page.type, resolverFor(page.source_id),
+        { skipFrontmatter: !includeFrontmatter },
       );
       for (const c of extracted.candidates) {
         const r = resolveCandidateSources(c, page.slug, page.source_id, allSlugs, slugToSources);
@@ -1906,14 +2123,15 @@ async function extractStaleFromDB(
           to_source_id: r.toSourceId, origin_source_id: page.source_id,
         });
       }
-      for (const entry of parseTimelineEntries(fullContent)) {
+      for (const entry of extractManagedTimelineFromContent(fullContent, page.slug)) {
         timelineRows.push({
           slug: page.slug,
           date: entry.date,
-          source: IMPORTED_MARKDOWN_TIMELINE_SOURCE,
+          source: entry.source,
           summary: entry.summary,
           detail: entry.detail || '',
           source_id: page.source_id,
+          managed_by: IMPORTED_MARKDOWN_TIMELINE_MANAGER,
         });
       }
       // EVERY processed page is stamped (incl. zero-link pages). D4 race fix:
@@ -1953,17 +2171,42 @@ async function extractStaleFromDB(
               AND (l.link_source IS NULL OR l.link_source IN ('markdown', 'wikilink-resolved'))`,
           [sourceId, slugs],
         );
+        if (includeFrontmatter) {
+          // Frontmatter links can point either direction. `from_page_id`
+          // therefore cannot identify their authority; origin_page_id is the
+          // page whose frontmatter generated the edge and is the only safe
+          // reconciliation key.
+          await tx.executeRaw(
+            `DELETE FROM links l
+              USING pages origin
+              WHERE l.origin_page_id = origin.id
+                AND origin.source_id = $1
+                AND origin.slug = ANY($2::text[])
+                AND l.link_source = 'frontmatter'`,
+            [sourceId, slugs],
+          );
+        }
+        await tx.executeRaw(
+          `UPDATE timeline_entries te
+              SET managed_by = $3
+             FROM pages p
+            WHERE te.page_id = p.id
+              AND p.source_id = $1
+              AND p.slug = ANY($2::text[])
+              AND te.managed_by IS NULL
+              AND (te.source = $4 OR te.source LIKE $4 || ':%')`,
+          [sourceId, slugs, IMPORTED_MARKDOWN_TIMELINE_MANAGER, IMPORTED_MARKDOWN_TIMELINE_SOURCE],
+        );
         await tx.executeRaw(
           `DELETE FROM timeline_entries te
             USING pages p
             WHERE te.page_id = p.id
               AND p.source_id = $1
               AND p.slug = ANY($2::text[])
-              AND te.source = $3`,
-          [sourceId, slugs, IMPORTED_MARKDOWN_TIMELINE_SOURCE],
+              AND te.managed_by = $3`,
+          [sourceId, slugs, IMPORTED_MARKDOWN_TIMELINE_MANAGER],
         );
       }
-
       let createdLinks = 0;
       let createdTimeline = 0;
       for (let i = 0; i < linkRows.length; i += BATCH_SIZE) {
@@ -1976,7 +2219,7 @@ async function extractStaleFromDB(
       // rolls back and leaves the page stale for an idempotent retry.
       await tx.markPagesExtractedBatch(processedRefs, new Date().toISOString());
       return { createdLinks, createdTimeline };
-    });
+    }, { retryOnConnectionError: true });
     linksCreated += reconciled.createdLinks;
     timelineCreated += reconciled.createdTimeline;
 

@@ -87,7 +87,8 @@ export interface FileRow {
  * row in place (image was replaced); same content_hash is a no-op.
  */
 export interface FileSpec {
-  source_id?: string;
+  /** Required tenancy axis; callers must never rely on an implicit default. */
+  source_id: string;
   page_slug?: string | null;
   page_id?: number | null;
   filename: string;
@@ -120,6 +121,19 @@ export interface FileSpec {
 import type { BatchAuditSite } from './retry.ts';
 export interface BatchOpts {
   auditSite?: BatchAuditSite;
+  signal?: AbortSignal;
+}
+
+/**
+ * Retry policy for a database transaction.
+ *
+ * Batch primitives normally retry their own single statement. Once they are
+ * called through a transaction-scoped engine, however, a retryable error has
+ * already aborted the transaction. Callers that opt in here retry the WHOLE
+ * transaction only after the failed attempt has rolled back.
+ */
+export interface TransactionOpts {
+  retryOnConnectionError?: boolean;
   signal?: AbortSignal;
 }
 
@@ -185,6 +199,8 @@ export interface TimelineBatchInput {
    * same slug across sources would fan out timeline rows to both.
    */
   source_id?: string;
+  /** Explicit managed projection owner. Omit for manual/unowned rows. */
+  managed_by?: string;
 }
 
 /**
@@ -649,6 +665,14 @@ export function clampSearchLimit(limit: number | undefined, defaultLimit = 20, c
 export interface BrainEngine {
   /** Discriminator: lets migrations and other consumers branch on engine kind without instanceof + dynamic imports. */
   readonly kind: 'postgres' | 'pglite';
+  /** Stable identity of the concrete connected DB; optional for test doubles. */
+  getDatabaseIdentity?(): string;
+  /**
+   * Create a small worker connection to this exact connected database.
+   * Implemented by PostgresEngine from its captured connect configuration;
+   * callers must never reconstruct workers from ambient/global config.
+   */
+  createWorkerEngine?(poolSize: number): Promise<BrainEngine>;
 
   // Lifecycle
   connect(config: EngineConfig): Promise<void>;
@@ -663,7 +687,7 @@ export interface BrainEngine {
    */
   reconnect(ctx?: { error?: unknown }): Promise<void>;
   initSchema(): Promise<void>;
-  transaction<T>(fn: (engine: BrainEngine) => Promise<T>): Promise<T>;
+  transaction<T>(fn: (engine: BrainEngine) => Promise<T>, opts?: TransactionOpts): Promise<T>;
   /**
    * Run `fn` with a dedicated connection (Postgres: reserved backend;
    * PGLite: pass-through). See `ReservedConnection` for semantics and
@@ -1192,6 +1216,7 @@ export interface BrainEngine {
     name: string,
     dirPrefix?: string,
     minSimilarity?: number,
+    opts?: { sourceId?: string },
   ): Promise<{ slug: string; similarity: number } | null>;
   /**
    * v0.34.1 (#861 — P0 leak seal): `opts.sourceId` / `opts.sourceIds`

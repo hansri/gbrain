@@ -5505,6 +5505,112 @@ export const MIGRATIONS: Migration[] = [
         WHERE dimension IS NOT NULL;
     `,
   },
+  {
+    version: 123,
+    name: 'files_source_storage_path_identity',
+    // File paths are source-local, just like page slugs. The legacy global
+    // UNIQUE(storage_path) made an image imported into source B overwrite the
+    // metadata row owned by source A when both repos used the same relative
+    // path. Replace it with the composite identity used by BrainEngine's file
+    // API. The unique index is idempotent and works on Postgres + PGLite.
+    idempotent: true,
+    sql: `
+      ALTER TABLE files DROP CONSTRAINT IF EXISTS files_storage_path_key;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_files_source_storage_path
+        ON files(source_id, storage_path);
+    `,
+  },
+  {
+    version: 124,
+    name: 'pages_source_path_single_owner',
+    // A repo-relative path is an ownership key inside one source. Rename and
+    // delete reconciliation must never collapse two owners into a Map and
+    // mutate whichever row happened to be returned last. Fail closed on
+    // legacy duplicates: an operator must inspect/repair them deliberately.
+    // The lock prevents a concurrent importer from creating a new duplicate
+    // between the preflight and unique-index creation.
+    idempotent: true,
+    sql: `
+      LOCK TABLE pages IN SHARE ROW EXCLUSIVE MODE;
+
+      DO $$
+      DECLARE duplicate_owner RECORD;
+      BEGIN
+        SELECT source_id, source_path, array_agg(slug ORDER BY slug) AS slugs
+          INTO duplicate_owner
+          FROM pages
+         WHERE source_path IS NOT NULL
+         GROUP BY source_id, source_path
+        HAVING COUNT(*) > 1
+         ORDER BY source_id, source_path
+         LIMIT 1;
+
+        IF FOUND THEN
+          RAISE EXCEPTION USING
+            ERRCODE = '23505',
+            MESSAGE = format(
+              'v124 source_path ownership preflight failed for source=%s path=%s owners=%s',
+              duplicate_owner.source_id,
+              duplicate_owner.source_path,
+              duplicate_owner.slugs
+            ),
+            HINT = 'Run the documented duplicate preflight, choose the legitimate owner, and clear or correct source_path on the other row(s) before retrying.';
+        END IF;
+      END $$;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS pages_source_path_owner_uniq
+        ON pages(source_id, source_path)
+        WHERE source_path IS NOT NULL;
+    `,
+  },
+  {
+    version: 125,
+    name: 'gbrain_cycle_locks_owner_token',
+    idempotent: true,
+    sql: `
+      ALTER TABLE gbrain_cycle_locks
+        ADD COLUMN IF NOT EXISTS holder_token TEXT;
+      UPDATE gbrain_cycle_locks
+         SET holder_token = 'legacy:' || id || ':' || holder_pid::text || ':' || acquired_at::text
+       WHERE holder_token IS NULL OR holder_token = '';
+      ALTER TABLE gbrain_cycle_locks
+        ALTER COLUMN holder_token SET NOT NULL;
+      ALTER TABLE gbrain_cycle_locks
+        ALTER COLUMN holder_token SET DEFAULT 'legacy-unfenced';
+    `,
+  },
+  {
+    version: 126,
+    name: 'timeline_entries_explicit_managed_owner',
+    // `gbrain-markdown` is the extractor's reserved legacy namespace. Adopt
+    // those rows before enabling explicit ownership so an exact legacy row
+    // cannot block the managed replacement forever. Every non-reserved NULL
+    // row remains manual/unowned and is never touched by this migration.
+    idempotent: true,
+    sql: `
+      ALTER TABLE timeline_entries ADD COLUMN IF NOT EXISTS managed_by TEXT;
+      LOCK TABLE timeline_entries IN SHARE ROW EXCLUSIVE MODE;
+
+      UPDATE timeline_entries
+         SET managed_by = 'gbrain:markdown-timeline:v1'
+       WHERE managed_by IS NULL
+         AND (source = 'gbrain-markdown' OR source LIKE 'gbrain-markdown:%');
+
+      DELETE FROM timeline_entries newer
+       USING timeline_entries older
+       WHERE newer.managed_by IS NOT NULL
+         AND older.managed_by = newer.managed_by
+         AND newer.page_id = older.page_id
+         AND newer.date = older.date
+         AND newer.summary = older.summary
+         AND newer.source = older.source
+         AND newer.id > older.id;
+
+      CREATE INDEX IF NOT EXISTS idx_timeline_managed_page
+        ON timeline_entries(managed_by, page_id)
+        WHERE managed_by IS NOT NULL;
+    `,
+  },
 ];
 
 export const LATEST_VERSION = MIGRATIONS.length > 0

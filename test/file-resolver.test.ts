@@ -1,9 +1,14 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { createHash } from 'crypto';
 import { resolveFile, parseRedirect, parseMarker } from '../src/core/file-resolver.ts';
 import { LocalStorage } from '../src/core/storage/local.ts';
+
+function sha256(data: string | Buffer): string {
+  return createHash('sha256').update(data).digest('hex');
+}
 
 describe('file-resolver', () => {
   let brainRoot: string;
@@ -37,11 +42,12 @@ describe('file-resolver', () => {
 
   test('resolves via .redirect breadcrumb', async () => {
     // Upload to storage
-    await storage.upload('redirected/file.json', Buffer.from('{"from":"storage"}'));
+    const stored = Buffer.from('{"from":"storage"}');
+    await storage.upload('redirected/file.json', stored);
 
     // Create redirect breadcrumb
     writeFileSync(join(brainRoot, 'people/redirected.json.redirect'),
-      'moved_to: supabase\nbucket: brain-files\npath: redirected/file.json\nmoved_at: 2026-04-09\noriginal_hash: sha256:abc\n'
+      `moved_to: supabase\nbucket: brain-files\npath: redirected/file.json\nmoved_at: 2026-04-09\noriginal_hash: sha256:${sha256(stored)}\n`
     );
 
     const result = await resolveFile('people/redirected.json', brainRoot, storage);
@@ -51,7 +57,7 @@ describe('file-resolver', () => {
 
   test('throws when redirect exists but no storage backend', async () => {
     writeFileSync(join(brainRoot, 'people/no-storage.json.redirect'),
-      'moved_to: supabase\nbucket: test\npath: test.json\nmoved_at: 2026-04-09\noriginal_hash: sha256:abc\n'
+      `moved_to: supabase\nbucket: test\npath: test.json\nmoved_at: 2026-04-09\noriginal_hash: sha256:${'a'.repeat(64)}\n`
     );
 
     expect(resolveFile('people/no-storage.json', brainRoot)).rejects.toThrow('no storage backend');
@@ -61,6 +67,29 @@ describe('file-resolver', () => {
     await expect(
       resolveFile('../../etc/passwd', brainRoot, storage)
     ).rejects.toThrow('Path traversal blocked');
+  });
+
+  test('blocks an ancestor directory symlink that escapes the brain root', async () => {
+    const outside = mkdtempSync(join(tmpdir(), 'gbrain-resolver-outside-'));
+    writeFileSync(join(outside, 'secret.json'), '{"outside":true}');
+    symlinkSync(outside, join(brainRoot, 'escape-dir'));
+    try {
+      await expect(resolveFile('escape-dir/secret.json', brainRoot, storage))
+        .rejects.toThrow(/ancestor symlink/);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test('preserves valid reads through an ancestor symlink that remains in-root', async () => {
+    const target = join(brainRoot, 'in-root-target');
+    mkdirSync(target);
+    writeFileSync(join(target, 'safe.json'), '{"inside":true}');
+    symlinkSync(target, join(brainRoot, 'in-root-link'));
+
+    const result = await resolveFile('in-root-link/safe.json', brainRoot, storage);
+    expect(result.source).toBe('local');
+    expect(result.data.toString()).toBe('{"inside":true}');
   });
 
   test('blocks .supabase marker with traversal prefix', async () => {
@@ -96,6 +125,82 @@ describe('file-resolver', () => {
     expect(result.source).toBe('storage');
     expect(result.data.toString()).toBe('jpeg-data');
   });
+
+  test('valid YAML pointer overrides a partial local file and verifies stored bytes', async () => {
+    const stored = Buffer.from('complete authoritative object');
+    await storage.upload('default/partial.bin', stored);
+    writeFileSync(join(brainRoot, 'people/partial.bin'), stored.subarray(0, 7));
+    writeFileSync(join(brainRoot, 'people/partial.bin.redirect.yaml'), [
+      'target: supabase://brain-files/default/partial.bin',
+      'bucket: brain-files',
+      'storage_path: default/partial.bin',
+      `size: ${stored.byteLength}`,
+      `hash: sha256:${sha256(stored)}`,
+      'mime: application/octet-stream',
+      'uploaded: 2026-07-10T00:00:00Z',
+      '',
+    ].join('\n'));
+
+    const result = await resolveFile('people/partial.bin', brainRoot, storage);
+    expect(result.source).toBe('redirect');
+    expect(result.data.equals(stored)).toBe(true);
+  });
+
+  test('rejects corrupt stored bytes instead of blessing them through a pointer', async () => {
+    const expected = Buffer.from('expected bytes');
+    await storage.upload('default/corrupt.bin', Buffer.from('corrupt bytes!'));
+    writeFileSync(join(brainRoot, 'people/corrupt.bin.redirect.yaml'), [
+      'target: supabase://brain-files/default/corrupt.bin',
+      'bucket: brain-files',
+      'storage_path: default/corrupt.bin',
+      `size: ${expected.byteLength}`,
+      `hash: sha256:${sha256(expected)}`,
+      'mime: application/octet-stream',
+      'uploaded: 2026-07-10T00:00:00Z',
+      '',
+    ].join('\n'));
+
+    await expect(resolveFile('people/corrupt.bin', brainRoot, storage))
+      .rejects.toThrow(/integrity check failed/);
+  });
+
+  test('rejects malformed pointer integrity metadata even when a local file exists', async () => {
+    writeFileSync(join(brainRoot, 'people/untrusted.bin'), 'local bytes');
+    writeFileSync(join(brainRoot, 'people/untrusted.bin.redirect.yaml'), [
+      'target: supabase://brain-files/default/untrusted.bin',
+      'bucket: brain-files',
+      'storage_path: default/untrusted.bin',
+      'size: 11',
+      'hash: sha256:not-a-real-hash',
+      '',
+    ].join('\n'));
+
+    await expect(resolveFile('people/untrusted.bin', brainRoot, storage))
+      .rejects.toThrow(/Invalid redirect hash/);
+  });
+
+  test('does not let a local symlink shadow a valid redirect pointer', async () => {
+    const stored = Buffer.from('pointer-controlled content');
+    const outside = join(brainRoot, '..', `gbrain-outside-${Date.now()}.bin`);
+    writeFileSync(outside, stored);
+    await storage.upload('default/symlink.bin', stored);
+    symlinkSync(outside, join(brainRoot, 'people/symlink.bin'));
+    writeFileSync(join(brainRoot, 'people/symlink.bin.redirect.yaml'), [
+      'target: supabase://brain-files/default/symlink.bin',
+      'bucket: brain-files',
+      'storage_path: default/symlink.bin',
+      `size: ${stored.byteLength}`,
+      `hash: sha256:${sha256(stored)}`,
+      '',
+    ].join('\n'));
+    try {
+      const result = await resolveFile('people/symlink.bin', brainRoot, storage);
+      expect(result.source).toBe('redirect');
+      expect(result.data.equals(stored)).toBe(true);
+    } finally {
+      rmSync(outside, { force: true });
+    }
+  });
 });
 
 describe('parseRedirect', () => {
@@ -111,13 +216,13 @@ describe('parseRedirect', () => {
 
   test('parses redirect YAML', () => {
     const path = join(tmpDir, 'test.redirect');
-    writeFileSync(path, 'moved_to: supabase\nbucket: brain-files\npath: people/sarah.json\nmoved_at: 2026-04-09\noriginal_hash: sha256:abc123\n');
+    writeFileSync(path, `moved_to: supabase\nbucket: brain-files\npath: people/sarah.json\nmoved_at: 2026-04-09\noriginal_hash: sha256:${'b'.repeat(64)}\n`);
 
     const info = parseRedirect(path);
     expect(info.moved_to).toBe('supabase');
     expect(info.bucket).toBe('brain-files');
     expect(info.path).toBe('people/sarah.json');
-    expect(info.original_hash).toBe('sha256:abc123');
+    expect(info.original_hash).toBe(`sha256:${'b'.repeat(64)}`);
   });
 });
 

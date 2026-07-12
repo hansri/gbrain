@@ -28,7 +28,7 @@ import { ensureWellFormed } from './text-safe.ts';
  * OR updated_at > links_extracted_at`. It is an ISO-8601 string (NOT a number) —
  * the column is TIMESTAMPTZ and the predicate binds it as `::timestamptz`.
  */
-export const LINK_EXTRACTOR_VERSION_TS = '2026-05-31T00:00:00Z';
+export const LINK_EXTRACTOR_VERSION_TS = '2026-07-10T00:00:00Z';
 
 // ─── Entity references ──────────────────────────────────────────
 
@@ -413,6 +413,8 @@ export interface LinkCandidate {
   fromSlug?: string;
   /** Target page slug (no .md, no ../). */
   targetSlug: string;
+  /** Explicit target source from a qualified wikilink. Unqualified links omit it. */
+  targetSourceId?: string;
   /** Inferred relationship type. */
   linkType: string;
   /** Surrounding text (up to ~80 chars) used for inference + storage. */
@@ -514,6 +516,7 @@ export async function extractPageLinks(
     const context = idx >= 0 ? excerpt(content, idx, 240) : ref.name;
     candidates.push({
       targetSlug: ref.slug,
+      ...(ref.sourceId ? { targetSourceId: ref.sourceId } : {}),
       linkType: inferLinkType(pageType, context, content, ref.slug),
       context,
       linkSource: 'markdown',
@@ -557,7 +560,7 @@ export async function extractPageLinks(
     fmUnresolved = fm.unresolved;
   }
 
-  // Within-page dedup: same (fromSlug, targetSlug, linkType, linkSource)
+  // Within-page dedup: same (fromSlug, target source+slug, linkType, linkSource)
   // collapses to one entry. First occurrence wins.
   // Issue #972 (codex P2d, decided): a qualified `[[companies/acme]]` (typed
   // markdown edge) and a bare `[[acme]]` (wikilink-resolved edge) to the SAME
@@ -568,7 +571,7 @@ export async function extractPageLinks(
   const seen = new Set<string>();
   const result: LinkCandidate[] = [];
   for (const c of candidates) {
-    const key = `${c.fromSlug ?? ''}\u0000${c.targetSlug}\u0000${c.linkType}\u0000${c.linkSource ?? ''}`;
+    const key = `${c.fromSlug ?? ''}\u0000${c.targetSourceId ?? ''}\u0000${c.targetSlug}\u0000${c.linkType}\u0000${c.linkSource ?? ''}`;
     if (seen.has(key)) continue;
     seen.add(key);
     result.push(c);
@@ -888,6 +891,9 @@ export function makeResolver(
   engine: BrainEngine,
   opts: { mode: 'batch' | 'live'; sourceId?: string } = { mode: 'live' },
 ): SlugResolver {
+  // An omitted source means the canonical default source, never federation.
+  // Callers walking multiple sources create one resolver per source.
+  const resolverSourceId = opts.sourceId ?? 'default';
   const cache = new Map<string, string | null>();
 
   const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9\s-]/g, '').trim().replace(/\s+/g, '-');
@@ -913,7 +919,7 @@ export function makeResolver(
       // spanning unrelated sources — a bare [[name]] must NOT resolve to a
       // same-tail page in a DIFFERENT source and create a cross-source edge.
       // #972 is "global basename across folders," not "cross-source federation."
-      const all = await engine.getAllSlugs(opts.sourceId ? { sourceId: opts.sourceId } : undefined);
+      const all = await engine.getAllSlugs({ sourceId: resolverSourceId });
       // Issue #972 (codex [P2] DRY): one shared index builder for all surfaces.
       basenameIndex = buildBasenameIndex(all);
       return basenameIndex;
@@ -944,7 +950,10 @@ export function makeResolver(
 
       // Step 1: already a slug? (dir/name shape, lowercase, hyphenated)
       if (/^[a-z][a-z0-9-]*\/[a-z0-9][a-z0-9-]*$/.test(trimmed)) {
-        const page = await engine.getPage(trimmed);
+        const page = await engine.getPage(
+          trimmed,
+          { sourceId: resolverSourceId },
+        );
         if (page) {
           cache.set(cacheKey, trimmed);
           return trimmed;
@@ -956,7 +965,10 @@ export function makeResolver(
       for (const hint of hints) {
         if (!hint) continue;
         const candidate = `${hint}/${slugified}`;
-        const page = await engine.getPage(candidate);
+        const page = await engine.getPage(
+          candidate,
+          { sourceId: resolverSourceId },
+        );
         if (page) {
           cache.set(cacheKey, candidate);
           return candidate;
@@ -968,7 +980,9 @@ export function makeResolver(
       // try the whole pages table.
       const searchHints = hints.length > 0 ? hints : [undefined];
       for (const hint of searchHints) {
-        const match = await engine.findByTitleFuzzy(trimmed, hint, 0.55);
+        const match = await engine.findByTitleFuzzy(trimmed, hint, 0.55, {
+          sourceId: resolverSourceId,
+        });
         if (match) {
           cache.set(cacheKey, match.slug);
           return match.slug;
@@ -980,7 +994,10 @@ export function makeResolver(
       // mode skips this step entirely to keep migration deterministic.
       if (opts.mode === 'live') {
         try {
-          const results = await engine.searchKeyword(trimmed, { limit: 3 });
+          const results = await engine.searchKeyword(trimmed, {
+            limit: 3,
+            sourceId: resolverSourceId,
+          });
           if (results.length > 0 && results[0].score >= 0.8) {
             // Filter by dir hint if provided.
             const top = hints.length > 0

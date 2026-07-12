@@ -4,9 +4,10 @@
  *   gbrain sources harden   <id|--all> [--pat-file <p>] [--branch <b>]
  *                                      [--no-cron] [--no-verify] [--dry-run] [--json]
  *   gbrain sources pull     <id> | --path <dir> [--branch <b>]
+ *   gbrain sources push     --path <dir> [--branch <b>]
  *   gbrain sources unharden <id>
  *
- * `harden`/`unharden` write executables, an OS cron, and a credential helper on
+ * `harden`/`unharden` write executables, an OS cron, and a credential store on
  * the host → CLI-only (never MCP). `pull --path` is DB-free (the cron's entry):
  * cli.ts dispatches it BEFORE connectEngine so a live PGLite session keeps its
  * single-writer lock.
@@ -15,9 +16,10 @@
 import type { BrainEngine } from '../core/engine.ts';
 import {
   hardenBrainRepo, unhardenBrainRepo, acceptPat,
+  commitAndPushPaths,
   type DurabilityReport,
 } from '../core/brain-repo-durability.ts';
-import { divergenceSafePull, detectDefaultBranch } from '../core/git-remote.ts';
+import { divergenceSafePull, detectDefaultBranch, pushBranch, validateOriginRemote } from '../core/git-remote.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import { existsSync } from 'fs';
 import { join } from 'path';
@@ -34,10 +36,19 @@ function flagVal(args: string[], name: string): string | undefined {
 
 function configHost(config: unknown): string | null {
   try {
-    const url = (config as Record<string, unknown>)?.remote_url;
+    const parsed = typeof config === 'string' ? JSON.parse(config) as Record<string, unknown> : config as Record<string, unknown>;
+    const url = parsed?.remote_url;
     if (typeof url === 'string' && url) return new URL(url).hostname;
   } catch { /* */ }
   return null;
+}
+
+function configRemoteUrl(config: unknown): string | null {
+  try {
+    const parsed = typeof config === 'string' ? JSON.parse(config) as Record<string, unknown> : config as Record<string, unknown>;
+    const url = parsed?.remote_url;
+    return typeof url === 'string' && url ? url : null;
+  } catch { return null; }
 }
 
 async function loadSourceRows(engine: BrainEngine, id: string | undefined, all: boolean): Promise<SourceRow[]> {
@@ -85,8 +96,14 @@ export async function runHarden(engine: BrainEngine, args: string[]): Promise<vo
       console.error(`[${row.id}] skipped — no local git repo at ${row.local_path ?? '(none)'}`);
       continue;
     }
+    const expectedRemoteUrl = configRemoteUrl(row.config);
+    if (!expectedRemoteUrl) {
+      console.error(`[${row.id}] skipped — source has no registered config.remote_url; refusing unbound Git auth`);
+      continue;
+    }
     const report = await hardenBrainRepo({
       repoPath: row.local_path, sourceId: row.id, branch,
+      expectedRemoteUrl,
       pat: pat?.token, installCron, verify, dryRun,
       logger: json ? undefined : (l) => console.error(`  ${l}`),
     });
@@ -120,10 +137,15 @@ function renderReport(r: DurabilityReport): void {
 export async function runPull(engine: BrainEngine | null, args: string[]): Promise<void> {
   const path = flagVal(args, '--path');
   const branchFlag = flagVal(args, '--branch');
+  let expectedRemoteUrl = flagVal(args, '--expected-remote');
 
   let repoPath: string;
   if (path) {
     repoPath = path;
+    if (!expectedRemoteUrl) {
+      console.error('DB-free pull requires --expected-remote <registered-url>.');
+      process.exit(2);
+    }
   } else {
     const id = args.find(a => !a.startsWith('--') && a !== branchFlag);
     if (!engine || !id) {
@@ -136,14 +158,21 @@ export async function runPull(engine: BrainEngine | null, args: string[]): Promi
       process.exit(1);
     }
     repoPath = rows[0].local_path;
+    expectedRemoteUrl = configRemoteUrl(rows[0].config) ?? undefined;
+    if (!expectedRemoteUrl) {
+      console.error(`Source "${id}" has no registered config.remote_url.`);
+      process.exit(2);
+    }
   }
 
   if (!existsSync(join(repoPath, '.git'))) {
     console.error(`[gbrain] not a git repo: ${repoPath}`);
     process.exit(1);
   }
+  // Validate exact registered origin before branch detection/status.
+  validateOriginRemote(repoPath, expectedRemoteUrl);
   const branch = branchFlag || detectDefaultBranch(repoPath);
-  const outcome = divergenceSafePull(repoPath, branch);
+  const outcome = divergenceSafePull(repoPath, branch, { expectedRemoteUrl });
   switch (outcome.status) {
     case 'up_to_date': console.log(`up to date (${branch})`); break;
     case 'advanced': console.log(`advanced ${outcome.from.slice(0, 7)}→${outcome.to.slice(0, 7)} (${branch})`); break;
@@ -152,6 +181,39 @@ export async function runPull(engine: BrainEngine | null, args: string[]): Promi
       console.error(`[gbrain] ${outcome.detail}`);
       process.exit(3);
   }
+}
+
+// ── push (DB-free; used by the generated local durability hook) ─────────────
+
+export async function runPush(args: string[]): Promise<void> {
+  const repoPath = flagVal(args, '--path');
+  const branchFlag = flagVal(args, '--branch');
+  const expectedRemoteUrl = flagVal(args, '--expected-remote');
+  if (!repoPath || !expectedRemoteUrl || !existsSync(join(repoPath, '.git'))) {
+    console.error('Usage: gbrain sources push --path <dir> --expected-remote <registered-url> [--branch <b>]');
+    process.exit(2);
+  }
+  validateOriginRemote(repoPath, expectedRemoteUrl, { push: true });
+  const branch = branchFlag || detectDefaultBranch(repoPath);
+  pushBranch(repoPath, branch, { expectedRemoteUrl });
+  console.log(`pushed (${branch})`);
+}
+
+// ── commit-push (DB-free trusted persistent-write boundary) ─────────────────
+
+export async function runCommitPush(args: string[]): Promise<void> {
+  const repoPath = flagVal(args, '--path');
+  const branch = flagVal(args, '--branch');
+  const expectedRemoteUrl = flagVal(args, '--expected-remote');
+  const message = flagVal(args, '--message');
+  const separator = args.indexOf('--');
+  const paths = separator === -1 ? [] : args.slice(separator + 1);
+  if (!repoPath || !expectedRemoteUrl || !message || paths.length === 0) {
+    console.error('Usage: gbrain sources commit-push --path <dir> --expected-remote <registered-url> --message <msg> -- <path> [path ...]');
+    process.exit(2);
+  }
+  const result = commitAndPushPaths({ repoPath, branch, expectedRemoteUrl, message, paths });
+  console.log(`${result.committed ? 'committed + ' : ''}pushed (${result.commit.slice(0, 7)})`);
 }
 
 // ── unharden ────────────────────────────────────────────────────────────────
@@ -170,6 +232,7 @@ export async function runUnharden(engine: BrainEngine, args: string[]): Promise<
   const steps = await unhardenBrainRepo({
     repoPath: rows[0].local_path ?? '',
     sourceId: rows[0].id,
+    expectedRemoteUrl: configRemoteUrl(rows[0].config) ?? undefined,
     logger: (l) => console.error(l),
   });
   for (const s of steps) {

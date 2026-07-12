@@ -5,8 +5,8 @@
  * source. Pre-fix, every run walked all sources together which
  * confused link resolution on cross-source duplicates. This test
  * pins the new `--source-id` flag: walk + extract only that source's
- * pages, while the resolver still sees ALL sources so qualified
- * `[[source:slug]]` wikilinks across sources can resolve.
+ * pages. Unqualified resolution stays within each origin source; only an
+ * explicit `[[source:slug]]` may cross that boundary.
  *
  * Hermetic via PGLite in-memory (no DATABASE_URL needed). Dedicated
  * file per D4 lock.
@@ -124,6 +124,62 @@ describe('extract --source-id flag (#1204)', () => {
       `SELECT COUNT(*)::text AS n FROM links`,
     );
     expect(Number(linkRows[0]?.n ?? 0)).toBe(0);
+  });
+
+  test('unqualified DB extraction never falls back to a default/other-source target', async () => {
+    await engine.executeRaw(
+      `INSERT INTO pages (slug, source_id, type, title, compiled_truth, timeline)
+       VALUES ('notes/strict-origin', 'alpha', 'note', 'Strict origin', 'See [[companies/only-beta]].', ''),
+              ('companies/only-beta', 'beta', 'company', 'Only Beta', '', '')`,
+    );
+
+    await runExtract(engine, ['links', '--source', 'db', '--source-id', 'alpha']);
+    const rows = await engine.executeRaw<{ n: string }>(
+      `SELECT COUNT(*)::text AS n
+         FROM links l
+         JOIN pages f ON f.id = l.from_page_id
+         JOIN pages t ON t.id = l.to_page_id
+        WHERE f.source_id = 'alpha' AND f.slug = 'notes/strict-origin'
+          AND t.slug = 'companies/only-beta'`,
+    );
+    expect(Number(rows[0]?.n ?? 0)).toBe(0);
+  });
+
+  test('qualified DB extraction may target exactly the named source', async () => {
+    await engine.executeRaw(
+      `INSERT INTO pages (slug, source_id, type, title, compiled_truth, timeline)
+       VALUES ('notes/qualified-origin', 'alpha', 'note', 'Qualified origin', 'See [[beta:companies/only-beta]].', ''),
+              ('companies/only-beta', 'beta', 'company', 'Only Beta', '', '')`,
+    );
+
+    await runExtract(engine, ['links', '--source', 'db', '--source-id', 'alpha']);
+    const rows = await engine.executeRaw<{ from_source: string; to_source: string }>(
+      `SELECT f.source_id AS from_source, t.source_id AS to_source
+         FROM links l
+         JOIN pages f ON f.id = l.from_page_id
+         JOIN pages t ON t.id = l.to_page_id
+        WHERE f.slug = 'notes/qualified-origin' AND t.slug = 'companies/only-beta'`,
+    );
+    expect(rows).toEqual([{ from_source: 'alpha', to_source: 'beta' }]);
+  });
+
+  test('stale frontmatter resolver is source-scoped at exact and fuzzy tiers', async () => {
+    await engine.executeRaw(
+      `INSERT INTO pages (slug, source_id, type, title, compiled_truth, timeline, frontmatter)
+       VALUES ('deals/strict', 'alpha', 'deal', 'Strict', '', '', '{"investors":["Only Beta"]}'::jsonb),
+              ('companies/only-beta', 'beta', 'company', 'Only Beta', '', '', '{}'::jsonb)`,
+    );
+
+    await runExtract(engine, ['--stale', '--source-id', 'alpha']);
+    const rows = await engine.executeRaw<{ n: string }>(
+      `SELECT COUNT(*)::text AS n
+         FROM links l
+         JOIN pages f ON f.id = l.from_page_id
+         JOIN pages t ON t.id = l.to_page_id
+        WHERE t.source_id = 'alpha' AND t.slug = 'deals/strict'
+          AND f.source_id <> 'alpha'`,
+    );
+    expect(Number(rows[0]?.n ?? 0)).toBe(0);
   });
 
   test('filesystem CLI dispatch writes links and timeline rows into the explicit source', async () => {

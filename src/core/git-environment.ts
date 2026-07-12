@@ -48,9 +48,29 @@ export function gitAuthorityEnvironment(
     if (value !== undefined) env[key] = value;
   }
   env.GIT_NO_REPLACE_OBJECTS = '1';
+  // Local object reads must never turn a promisor/partial-clone marker from a
+  // repository into an implicit network request. Explicit fetch paths in
+  // git-remote.ts remain the sole network authority.
+  env.GIT_NO_LAZY_FETCH = '1';
   env.GIT_CONFIG_NOSYSTEM = '1';
   env.GIT_CONFIG_GLOBAL = '/dev/null';
   env.GIT_TERMINAL_PROMPT = '0';
   env.GIT_OPTIONAL_LOCKS = '0';
   return env;
+}
+
+/**
+ * Minimal environment for Git operations that may contact a remote. Proxy
+ * variables and all inherited Git config injection are deliberately absent;
+ * network policy is supplied explicitly by git-remote.ts on every call.
+ */
+export function gitNetworkEnvironment(
+  base: NodeJS.ProcessEnv = process.env,
+  additions: NodeJS.ProcessEnv = {},
+): NodeJS.ProcessEnv {
+  const env = gitAuthorityEnvironment(base);
+  delete env.GIT_OPTIONAL_LOCKS;
+  env.GIT_TERMINAL_PROMPT = '0';
+  env.GCM_INTERACTIVE = 'never';
+  return { ...env, ...additions };
 }

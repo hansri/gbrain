@@ -1436,7 +1436,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       if (req.path.startsWith('/admin/api/') || req.path === '/admin/events' || req.path === '/admin/login') {
         return next();
       }
-      res.sendFile(path.join(adminDistPath, 'index.html'));
+      // Keep the filename relative to an explicit root. An absolute sendFile
+      // path can include a legitimate dot-directory (for example Git's
+      // `.worktrees` checkout root), which `send` treats as a forbidden
+      // dotfile segment and turns into a false 404.
+      res.sendFile('index.html', { root: adminDistPath });
     });
   } else {
     // Embedded path. Read assets from the generated manifest. Cache the

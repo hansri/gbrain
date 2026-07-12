@@ -171,4 +171,21 @@ describeE2E('Postgres JSONB round-trip — frontmatter / data / pages_updated / 
     expect(rows[0].jt).toBe('object');
     expect(rows[0].mood).toBe('happy');
   });
+
+  test('nested engine transaction joins the outer Postgres rollback unit', async () => {
+    const engine = getEngine();
+    let sharedEngine = false;
+    await expect(engine.transaction(async outer => {
+      await outer.transaction(async inner => {
+        sharedEngine = inner === outer;
+        await inner.putPage('jsonb-test/nested-rollback', {
+          type: 'concept', title: 'nested', compiled_truth: 'must roll back',
+        });
+      });
+      throw new Error('rollback joined postgres transaction');
+    })).rejects.toThrow('rollback joined postgres transaction');
+
+    expect(sharedEngine).toBe(true);
+    expect(await engine.getPage('jsonb-test/nested-rollback')).toBeNull();
+  }, 30_000);
 });

@@ -32,8 +32,7 @@ describe('whoami op contract', () => {
       ctxWith({ remote: false }),
       {},
     )) as any;
-    expect(result.transport).toBe('local');
-    expect(result.scopes).toEqual([]);
+    expect(result).toEqual({ transport: 'local', scopes: [] });
   });
 
   test('local transport ignores ctx.auth even if a stale value leaked through', async () => {
@@ -61,6 +60,9 @@ describe('whoami op contract', () => {
       clientId: 'gbrain_cl_abc',
       clientName: 'gstack-test',
       scopes: ['read', 'sources_admin'],
+      allowedTools: ['whoami', 'get_page'],
+      sourceId: 'oauth-primary',
+      allowedSources: ['shared', 'oauth-primary'],
       expiresAt: 1234567890,
     };
     const result = (await whoami.handler(
@@ -72,6 +74,9 @@ describe('whoami op contract', () => {
     expect(result.client_name).toBe('gstack-test');
     expect(result.scopes).toEqual(['read', 'sources_admin']);
     expect(result.expires_at).toBe(1234567890);
+    expect(result.allowed_tools).toEqual(['get_page', 'whoami']);
+    expect(result.source_id).toBe('oauth-primary');
+    expect(result.allowed_sources).toEqual(['oauth-primary', 'shared']);
   });
 
   test('legacy transport (token name as clientId, no gbrain_cl_ prefix)', async () => {
@@ -92,6 +97,36 @@ describe('whoami op contract', () => {
     expect(result.token_name).toBe('my-personal-token');
     expect(result.scopes).toEqual(['read', 'write', 'admin']);
     expect(result.expires_at).toBeNull();
+    expect(result.allowed_tools).toBeNull();
+    expect(result.source_id).toBeNull();
+    expect(result.allowed_sources).toEqual([]);
+  });
+
+  test('legacy agent identity returns exact sorted capability evidence without token leakage', async () => {
+    const bearer = 'legacy-secret-agent-token';
+    const auth: AuthInfo = {
+      token: bearer,
+      clientId: 'routine-agent-principal',
+      clientName: 'Routine agent',
+      scopes: ['read'],
+      allowedTools: ['whoami', 'search', 'get_page'],
+      sourceId: 'source-a',
+      allowedSources: ['shared', 'source-a', 'source-c'],
+    };
+    const result = (await whoami.handler(ctxWith({ remote: true, auth }), {})) as any;
+
+    expect(result).toMatchObject({
+      transport: 'legacy',
+      token_name: 'Routine agent',
+      allowed_tools: ['get_page', 'search', 'whoami'],
+      source_id: 'source-a',
+      allowed_sources: ['shared', 'source-a', 'source-c'],
+    });
+    expect(JSON.stringify(result)).not.toContain(bearer);
+    expect(result).not.toHaveProperty('token');
+    // Sorting is a presentation copy, never a mutation of auth enforcement.
+    expect(auth.allowedTools).toEqual(['whoami', 'search', 'get_page']);
+    expect(auth.allowedSources).toEqual(['shared', 'source-a', 'source-c']);
   });
 
   // Q3: ambiguous transport — fail-closed. The footgun this guards against

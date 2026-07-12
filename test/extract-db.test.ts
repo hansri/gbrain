@@ -228,6 +228,43 @@ describe('gbrain extract timeline --source db', () => {
     const entries = await engine.getTimeline('people/alice');
     expect(entries.length).toBe(0);
   });
+
+  test('timeline batch failures propagate to a non-zero command exit', async () => {
+    await engine.putPage('people/alice', {
+      type: 'person', title: 'Alice', compiled_truth: '',
+      timeline: '- **2026-01-15** | Must not be swallowed',
+    });
+    const originalTimelineBatch = engine.addTimelineEntriesBatch;
+    const originalExit = process.exit;
+    const originalError = console.error;
+    let exitCode: number | undefined;
+    let errorOutput = '';
+    (engine as unknown as {
+      addTimelineEntriesBatch: typeof engine.addTimelineEntriesBatch;
+    }).addTimelineEntriesBatch = async () => {
+      throw new Error('simulated timeline batch failure');
+    };
+    process.exit = ((code?: number) => {
+      exitCode = code;
+      throw new Error('__timeline_exit__');
+    }) as typeof process.exit;
+    console.error = (message?: unknown) => { errorOutput += String(message); };
+
+    try {
+      await expect(runExtract(engine, ['timeline', '--source', 'db']))
+        .rejects.toThrow('__timeline_exit__');
+    } finally {
+      (engine as unknown as {
+        addTimelineEntriesBatch: typeof engine.addTimelineEntriesBatch;
+      }).addTimelineEntriesBatch = originalTimelineBatch;
+      process.exit = originalExit;
+      console.error = originalError;
+    }
+
+    expect(exitCode).toBe(1);
+    expect(errorOutput).toContain('simulated timeline batch failure');
+    expect(await engine.getTimeline('people/alice')).toHaveLength(0);
+  });
 });
 
 describe('gbrain extract all --source db', () => {

@@ -34,7 +34,9 @@ afterEach(() => {
 describe('collectSyncableFiles symlink + cycle hardening', () => {
   test('1. self-referencing symlink does not loop', async () => {
     await withEnv({ GBRAIN_EMBEDDING_MULTIMODAL: undefined }, () => {
-      writeFileSync(join(tmp, 'README.md'), '# top\n');
+      // README.md is a canonical metafile and intentionally excluded from
+      // brain sync; use an ordinary page so this test isolates symlink safety.
+      writeFileSync(join(tmp, 'page.md'), '# top\n');
       // Symlink "loop" inside tempdir pointing back to itself.
       symlinkSync(tmp, join(tmp, 'loop'));
 
@@ -43,7 +45,7 @@ describe('collectSyncableFiles symlink + cycle hardening', () => {
       const ms = Date.now() - t0;
 
       expect(ms).toBeLessThan(1000); // would hang if walker followed the loop
-      expect(files).toContain(join(tmp, 'README.md'));
+      expect(files).toContain(join(tmp, 'page.md'));
       expect(files.every(f => !f.includes('/loop/'))).toBe(true);
     });
   });
@@ -88,7 +90,7 @@ describe('collectSyncableFiles symlink + cycle hardening', () => {
 
   test('4. strategy filter admits the right files', async () => {
     await withEnv({ GBRAIN_EMBEDDING_MULTIMODAL: undefined }, () => {
-      writeFileSync(join(tmp, 'README.md'), '# r\n');
+      writeFileSync(join(tmp, 'page.md'), '# r\n');
       writeFileSync(join(tmp, 'foo.ts'), '// f\n');
       writeFileSync(join(tmp, 'bar.py'), '# b\n');
 
@@ -97,8 +99,8 @@ describe('collectSyncableFiles symlink + cycle hardening', () => {
       const auto = collectSyncableFiles(tmp, { strategy: 'auto' });
 
       expect(code.map(f => f.split('/').pop()).sort()).toEqual(['bar.py', 'foo.ts']);
-      expect(markdown.map(f => f.split('/').pop())).toEqual(['README.md']);
-      expect(auto.map(f => f.split('/').pop()).sort()).toEqual(['README.md', 'bar.py', 'foo.ts']);
+      expect(markdown.map(f => f.split('/').pop())).toEqual(['page.md']);
+      expect(auto.map(f => f.split('/').pop()).sort()).toEqual(['bar.py', 'foo.ts', 'page.md']);
     });
   });
 

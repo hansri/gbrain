@@ -10,6 +10,74 @@ const TMP = join(import.meta.dir, '.tmp-import-test');
 // Minimal mock engine that tracks calls and supports transaction()
 function mockEngine(overrides: Partial<Record<string, any>> = {}): BrainEngine {
   const calls: { method: string; args: any[] }[] = [];
+  const locks = new Map<string, {
+    pid: number;
+    host: string;
+    holderToken: string;
+  }>();
+
+  const ownsLock = (
+    id: unknown,
+    pid: unknown,
+    host: unknown,
+    holderToken: unknown,
+  ): id is string => {
+    if (typeof id !== 'string') return false;
+    const lock = locks.get(id);
+    return lock !== undefined
+      && lock.pid === pid
+      && lock.host === host
+      && lock.holderToken === holderToken;
+  };
+
+  // Test-only PGLite lock table. Match the full acquisition tuple so these
+  // importer tests exercise acquire, commit fencing, and release instead of
+  // bypassing the production source-writer lease.
+  const queryLockTable = async (query: string, params: unknown[] = []) => {
+    calls.push({ method: 'db.query', args: [query, params] });
+    if (query.includes('INSERT INTO gbrain_cycle_locks')) {
+      const [id, pid, host, holderToken] = params;
+      if (
+        typeof id !== 'string'
+        || typeof pid !== 'number'
+        || typeof host !== 'string'
+        || typeof holderToken !== 'string'
+      ) {
+        throw new Error('Malformed mock source-writer lock acquisition');
+      }
+      if (locks.has(id)) return { rows: [] };
+      locks.set(id, { pid, host, holderToken });
+      return { rows: [{ id }] };
+    }
+    if (query.includes('UPDATE gbrain_cycle_locks')) {
+      const [, id, pid, host, holderToken] = params;
+      return { rows: ownsLock(id, pid, host, holderToken) ? [{ id }] : [] };
+    }
+    if (query.includes('DELETE FROM gbrain_cycle_locks')) {
+      const [id, pid, host, holderToken] = params;
+      const matched = ownsLock(id, pid, host, holderToken);
+      if (matched) locks.delete(id);
+      return {
+        rows: matched && query.includes('RETURNING id') ? [{ id }] : [],
+      };
+    }
+    throw new Error(`Unhandled mock lock query: ${query}`);
+  };
+
+  const executeRaw = async (query: string, params: unknown[] = []) => {
+    calls.push({ method: 'executeRaw', args: [query, params] });
+    if (query.includes('FROM gbrain_cycle_locks')) {
+      if (!query.includes('FOR UPDATE')) {
+        throw new Error('Mock source-writer commit fence must lock the row');
+      }
+      const [id, pid, host, holderToken] = params;
+      return ownsLock(id, pid, host, holderToken) ? [{ id }] : [];
+    }
+    if (overrides.executeRaw) return overrides.executeRaw(query, params);
+    return null;
+  };
+
+  const db = { query: queryLockTable };
   const track = (method: string) => (...args: any[]) => {
     calls.push({ method, args });
     if (overrides[method]) return overrides[method](...args);
@@ -19,6 +87,12 @@ function mockEngine(overrides: Partial<Record<string, any>> = {}): BrainEngine {
   const engine = new Proxy({} as any, {
     get(_, prop: string) {
       if (prop === '_calls') return calls;
+      if (prop === 'kind') return 'pglite';
+      if (prop === 'db') return db;
+      // transaction() returns this same proxy, so lease validation remains
+      // identity-based and needs no cross-engine identity escape.
+      if (prop === 'getDatabaseIdentity') return undefined;
+      if (prop === 'executeRaw') return executeRaw;
       if (prop === 'getTags') return overrides.getTags || (() => Promise.resolve([]));
       if (prop === 'getPage') return overrides.getPage || (() => Promise.resolve(null));
       // transaction: just call the fn with the same engine (no real DB transaction in tests)
@@ -73,6 +147,24 @@ This is the compiled truth.
     // Chunks were upserted
     const chunkCall = calls.find((c: any) => c.method === 'upsertChunks');
     expect(chunkCall).toBeTruthy();
+
+    const lockAcquireIndex = calls.findIndex((c: any) =>
+      c.method === 'db.query' && c.args[0].includes('INSERT INTO gbrain_cycle_locks'));
+    const commitFenceIndex = calls.findIndex((c: any) =>
+      c.method === 'executeRaw'
+      && c.args[0].includes('FROM gbrain_cycle_locks')
+      && c.args[0].includes('FOR UPDATE'));
+    const lockReleaseIndex = calls.findIndex((c: any) =>
+      c.method === 'db.query'
+      && c.args[0].includes('DELETE FROM gbrain_cycle_locks')
+      && c.args[0].includes('RETURNING id'));
+    expect(lockAcquireIndex).toBeGreaterThanOrEqual(0);
+    expect(commitFenceIndex).toBeGreaterThan(lockAcquireIndex);
+    expect(lockReleaseIndex).toBeGreaterThan(commitFenceIndex);
+
+    const acquiredOwner = calls[lockAcquireIndex].args[1].slice(0, 4);
+    expect(calls[commitFenceIndex].args[1]).toEqual(acquiredOwner);
+    expect(calls[lockReleaseIndex].args[1]).toEqual(acquiredOwner);
   });
 
   test('skips files larger than MAX_FILE_SIZE (5MB)', async () => {
@@ -568,7 +660,17 @@ remember to follow up
     // Second call: existing page has the first hash; the second capture's
     // hash must match so the short-circuit fires and status === 'skipped'.
     const engine2 = mockEngine({
-      getPage: () => Promise.resolve({ content_hash: firstHash } as any),
+      getPage: () => Promise.resolve({
+        id: 1,
+        source_id: 'default',
+        slug: 'inbox/test',
+        content_hash: firstHash,
+      } as any),
+      executeRaw: (query: string) => Promise.resolve(
+        query.includes('SELECT page_kind, source_path FROM pages')
+          ? [{ page_kind: 'markdown', source_path: null }]
+          : [],
+      ),
       putPage: (_slug: string, page: any) => {
         secondHash = page.content_hash;
         return Promise.resolve(null);
@@ -610,7 +712,17 @@ edited body
     await importFromContent(engine1, 'inbox/test', content1, { noEmbed: true });
 
     const engine2 = mockEngine({
-      getPage: () => Promise.resolve({ content_hash: firstHash } as any),
+      getPage: () => Promise.resolve({
+        id: 1,
+        source_id: 'default',
+        slug: 'inbox/test',
+        content_hash: firstHash,
+      } as any),
+      executeRaw: (query: string) => Promise.resolve(
+        query.includes('SELECT page_kind, source_path FROM pages')
+          ? [{ page_kind: 'markdown', source_path: null }]
+          : [],
+      ),
       putPage: (_slug: string, page: any) => {
         secondHash = page.content_hash;
         return Promise.resolve(null);
@@ -654,7 +766,17 @@ body
     await importFromContent(engine1, 'concepts/x', content1, { noEmbed: true });
 
     const engine2 = mockEngine({
-      getPage: () => Promise.resolve({ content_hash: firstHash } as any),
+      getPage: () => Promise.resolve({
+        id: 1,
+        source_id: 'default',
+        slug: 'concepts/x',
+        content_hash: firstHash,
+      } as any),
+      executeRaw: (query: string) => Promise.resolve(
+        query.includes('SELECT page_kind, source_path FROM pages')
+          ? [{ page_kind: 'markdown', source_path: null }]
+          : [],
+      ),
       putPage: (_slug: string, page: any) => {
         secondHash = page.content_hash;
         return Promise.resolve(null);

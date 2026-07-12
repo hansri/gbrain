@@ -95,6 +95,16 @@ describe('loadCheckpoint', () => {
     expect(loadCheckpoint(cpPath, '/tmp/example-brain')).toBeNull();
   });
 
+  test('returns null when completedFingerprints contains non-string values', () => {
+    writeFileSync(cpPath, JSON.stringify({
+      dir: '/tmp/example-brain',
+      completedPaths: ['a.md'],
+      completedFingerprints: { 'a.md': 42 },
+      timestamp: '2026-01-01T00:00:00Z',
+    }));
+    expect(loadCheckpoint(cpPath, '/tmp/example-brain')).toBeNull();
+  });
+
   test('returns the checkpoint for valid v0.33.2 payload', () => {
     const cp: ImportCheckpoint = {
       dir: '/tmp/example-brain',
@@ -115,22 +125,39 @@ describe('saveCheckpoint', () => {
     const cp: ImportCheckpoint = {
       dir: '/tmp/example-brain',
       completedPaths: ['a.md', 'b.md', 'c.md'],
+      completedFingerprints: { 'b.md': 'bbb', 'a.md': 'aaa' },
+      completedProofs: {
+        'b.md': { authorityFingerprint: 'sha256:bbb', pageId: 2, slug: 'b', contentHash: 'db-bbb' },
+        'a.md': { authorityFingerprint: 'sha256:aaa', pageId: 1, slug: 'a', contentHash: 'db-aaa' },
+      },
       timestamp: '2026-05-14T00:00:00Z',
     };
     saveCheckpoint(cpPath, cp);
     const loaded = loadCheckpoint(cpPath, '/tmp/example-brain');
     expect(loaded?.completedPaths).toEqual(['a.md', 'b.md', 'c.md']);
     expect(loaded?.dir).toBe('/tmp/example-brain');
+    expect(loaded?.completedFingerprints).toEqual({ 'a.md': 'aaa', 'b.md': 'bbb' });
+    expect(loaded?.completedProofs).toEqual({
+      'a.md': { authorityFingerprint: 'sha256:aaa', pageId: 1, slug: 'a', contentHash: 'db-aaa' },
+      'b.md': { authorityFingerprint: 'sha256:bbb', pageId: 2, slug: 'b', contentHash: 'db-bbb' },
+    });
   });
 
   test('serializes completedPaths sorted (deterministic output)', () => {
     saveCheckpoint(cpPath, {
       dir: '/tmp/example-brain',
       completedPaths: ['z.md', 'a.md', 'm.md'],
+      completedFingerprints: { 'z.md': 'zzz', 'a.md': 'aaa', 'm.md': 'mmm' },
+      completedProofs: {
+        'z.md': { authorityFingerprint: 'sha256:zzz', pageId: 26, slug: 'z', contentHash: 'db-z' },
+        'a.md': { authorityFingerprint: 'sha256:aaa', pageId: 1, slug: 'a', contentHash: 'db-a' },
+      },
       timestamp: '2026-05-14T00:00:00Z',
     });
     const onDisk = JSON.parse(readFileSync(cpPath, 'utf-8'));
     expect(onDisk.completedPaths).toEqual(['a.md', 'm.md', 'z.md']);
+    expect(Object.keys(onDisk.completedFingerprints)).toEqual(['a.md', 'm.md', 'z.md']);
+    expect(Object.keys(onDisk.completedProofs)).toEqual(['a.md', 'z.md']);
   });
 
   test('atomic-ish write — no stray .tmp file after success', () => {

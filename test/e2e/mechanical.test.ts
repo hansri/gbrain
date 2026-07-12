@@ -19,6 +19,10 @@ import {
 import { operationsByName, operations } from '../../src/core/operations.ts';
 import type { OperationContext } from '../../src/core/operations.ts';
 import { importFromContent } from '../../src/core/import-file.ts';
+import {
+  DEFAULT_EMBEDDING_DIMENSIONS,
+  DEFAULT_EMBEDDING_MODEL,
+} from '../../src/core/ai/defaults.ts';
 
 // Skip all E2E tests if no database is configured
 const skip = !hasDatabase();
@@ -567,11 +571,20 @@ describeE2E('E2E: Files', () => {
   test('file_upload stores metadata + file_list shows it', async () => {
     // Create a temp file
     const tmpDir = mkdtempSync(join(tmpdir(), 'gbrain-e2e-'));
+    const storageDir = mkdtempSync(join(tmpdir(), 'gbrain-e2e-storage-'));
     const tmpFile = join(tmpDir, 'test-doc.pdf');
     writeFileSync(tmpFile, 'fake pdf content');
 
     try {
-      const result = await callOp('file_upload', {
+      const op = operationsByName.file_upload;
+      const baseCtx = makeCtx();
+      const result = await op.handler({
+        ...baseCtx,
+        config: {
+          ...baseCtx.config,
+          storage: { backend: 'local', bucket: 'test', localPath: storageDir },
+        },
+      }, {
         path: tmpFile,
         page_slug: 'people/sarah-chen',
       }) as any;
@@ -587,6 +600,7 @@ describeE2E('E2E: Files', () => {
       expect(url.url).toContain('gbrain:files/');
     } finally {
       rmSync(tmpDir, { recursive: true });
+      rmSync(storageDir, { recursive: true });
     }
   });
 
@@ -642,7 +656,7 @@ describeE2E('E2E: file_list LIMIT enforcement', () => {
       await sql`
         INSERT INTO files (page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
         VALUES (${testSlug}, ${'file-' + String(i).padStart(3, '0') + '.txt'}, ${testSlug + '/file-' + i + '.txt'}, ${'text/plain'}, ${100}, ${'hash-' + i}, ${'{}'}::jsonb)
-        ON CONFLICT (storage_path) DO NOTHING
+        ON CONFLICT (source_id, storage_path) DO NOTHING
       `;
     }
 
@@ -720,15 +734,14 @@ describeE2E('E2E: Setup Journey', () => {
   const cliEnv = () => ({ ...process.env, DATABASE_URL: process.env.DATABASE_URL! });
 
   test('gbrain init --non-interactive connects and initializes', () => {
-    // v0.37.10.0: pass --embedding-model explicitly. Tier-1 CI runs without
-    // any embedding-provider env var, and the v0.37 fail-loud-no-key gate
-    // (D3) would otherwise exit 1 here. The provider is offline-resolved
-    // (preflight validates dim against recipe; no HTTP call), so this works
-    // without a real API key. After this init writes config, subsequent
-    // inits in the file honor persisted config per D5 (no flag needed).
+    // Tier-1 CI runs without embedding-provider credentials, so pass the
+    // canonical defaults explicitly to exercise offline schema setup without
+    // triggering the intentional no-key choice gate. Importing both values
+    // keeps the fixture aligned when the zero-config provider changes.
     const result = Bun.spawnSync({
       cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!,
-            '--embedding-model', 'openai:text-embedding-3-large'],
+            '--embedding-model', DEFAULT_EMBEDDING_MODEL,
+            '--embedding-dimensions', String(DEFAULT_EMBEDDING_DIMENSIONS)],
       cwd: cliCwd,
       env: cliEnv(),
       timeout: 15_000,
@@ -1254,15 +1267,14 @@ describeE2E('E2E: Doctor Command', () => {
   });
 
   test('gbrain doctor exits 0 on healthy DB', () => {
-    // Init first so config exists for CLI. Pin --embedding-model explicitly
-    // so the spawned doctor doesn't pick a different default (e.g. ZE-1280d
-    // when ZEROENTROPY_API_KEY is in env) that mismatches the 1536d schema
-    // setupDB initialized, producing a WARN-status embedding_width_consistency
-    // check and exit 1. Mirrors the same pattern in 'Setup Journey'.
+    // Init first so config exists for CLI. Pin the imported canonical model
+    // and width together; this preserves the no-key Tier-1 path without
+    // letting a historical provider fixture drift from fresh-schema defaults.
     Bun.spawnSync({
       cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive',
             '--url', process.env.DATABASE_URL!,
-            '--embedding-model', 'openai:text-embedding-3-large'],
+            '--embedding-model', DEFAULT_EMBEDDING_MODEL,
+            '--embedding-dimensions', String(DEFAULT_EMBEDDING_DIMENSIONS)],
       cwd: cliCwd, env: cliEnv(), timeout: 15_000,
     });
     const result = Bun.spawnSync({
