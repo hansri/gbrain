@@ -155,6 +155,7 @@ describe('check-update CLI', () => {
     expect(output).toHaveProperty('current_version');
     expect(output).toHaveProperty('update_available');
     expect(output).toHaveProperty('upgrade_command');
+    expect(output.upgrade_command).toBe('gbrain upgrade');
     expect(output).toHaveProperty('current_source', 'package-json');
     expect(typeof output.update_available).toBe('boolean');
   });

@@ -1,8 +1,10 @@
 import postgres from 'postgres';
+import { randomUUID } from 'node:crypto';
 import { GBrainError, type EngineConfig } from './types.ts';
-import { SCHEMA_SQL } from './schema-embedded.ts';
+import { getConfiguredPostgresSchema } from './postgres-schema.ts';
 import type { BrainEngine } from './engine.ts';
 import { verifySchema } from './schema-verify.ts';
+import { normalizeDatabaseInstanceId } from './database-instance-id.ts';
 
 let sql: ReturnType<typeof postgres> | null = null;
 let connectedUrl: string | null = null;
@@ -189,6 +191,285 @@ export async function setSessionDefaults(_sql: ReturnType<typeof postgres>): Pro
   // No-op: timeouts are now applied as startup parameters in resolveSessionTimeouts().
 }
 
+/**
+ * Serialize schema replay and migrations without relying on a pooled session.
+ *
+ * A plain `pg_advisory_lock()` is session-scoped. Calling lock and unlock on a
+ * postgres.js pool can therefore use different backends and leak the lock
+ * indefinitely. A dedicated one-connection session avoids that class of bug:
+ * lock and verified unlock execute on one reserved backend, while schema work
+ * uses the normal work pool. Keeping the lock client separate also means
+ * GBRAIN_POOL_SIZE=1 cannot self-deadlock.
+ *
+ * A transaction-scoped advisory lock is deliberately not used here: long-lived
+ * lock transactions block CREATE INDEX CONCURRENTLY from completing. Callers
+ * must provide a direct/session-mode URL. No URL or credential is included in
+ * errors emitted by this helper.
+ */
+export const SCHEMA_MIGRATION_LOCK_KEY = 42;
+// With pg_catalog omitted, Postgres searches it implicitly before public for
+// name resolution while keeping public as current_schema()/the CREATE target.
+// Explicit `pg_catalog, public` is unsafe for schema replay: unqualified CREATE
+// TABLE would target pg_catalog and fail (or require forbidden catalog writes).
+export const PUBLIC_SCHEMA_SEARCH_PATH_SQL = 'SET search_path = public';
+
+type PostgresPool = ReturnType<typeof postgres>;
+
+function normalizeSchemaArray(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map(item => String(item));
+  if (typeof value !== 'string') return [];
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return [];
+  const inner = trimmed.slice(1, -1);
+  if (!inner) return [];
+  // Only the two canonical unquoted identifiers can be accepted. Any quoted,
+  // escaped, or comma-bearing custom name deliberately fails closed.
+  return inner.split(',').map(item => item.trim());
+}
+
+/**
+ * GBrain's Postgres schema is public-owned. The default "$user", public path
+ * remains compatible only while the role schema does not exist, in which case
+ * Postgres reports the effective explicit path as exactly [public]. Every
+ * other effective path is a shadowing or wrong-CREATE-target risk for the many
+ * historical unqualified migration statements.
+ */
+export function isPublicSchemaAuthority(
+  currentSchema: unknown,
+  explicitSchemas: unknown,
+): boolean {
+  if (currentSchema !== 'public') return false;
+  const schemas = normalizeSchemaArray(explicitSchemas);
+  return schemas.length === 1 && schemas[0] === 'public';
+}
+
+/** Read-only, pre-DDL validation of one concrete Postgres work/DDL pool. */
+export async function assertPublicSchemaAuthority(
+  conn: PostgresPool,
+  label: 'configured work database' | 'DDL database',
+): Promise<void> {
+  const rows = await conn.unsafe<{
+    current_schema: string | null;
+    explicit_schemas: string[] | string | null;
+  }[]>(`
+    SELECT current_schema()::text AS current_schema,
+           current_schemas(false)::text[] AS explicit_schemas
+  `);
+  if (rows.length !== 1
+    || !isPublicSchemaAuthority(rows[0]?.current_schema, rows[0]?.explicit_schemas)) {
+    throw new Error(
+      `Refusing schema mutation: ${label} has an incompatible search_path. ` +
+      'GBrain schema authority is public; use an effective public-only path.',
+    );
+  }
+}
+
+export interface DatabaseSessionLockHandle {
+  assertOwned(): Promise<void>;
+  /**
+   * Prove a work pool reaches the exact database/cluster holding this reserved
+   * session. Uses a collision-resistant per-attempt advisory challenge, not a
+   * URL/database-name comparison (two clusters may host the same db name).
+   */
+  assertSameDatabase(workPool: PostgresPool): Promise<void>;
+  /** Prove the reserved lock session is connected to the intended brain. */
+  assertDatabaseIdentity(expectedBrainId: string): Promise<void>;
+  release(): Promise<void>;
+}
+
+interface DatabaseUrlAuthority {
+  database: string;
+  looksPooled: boolean;
+}
+
+function inspectDatabaseUrlAuthority(url: string): DatabaseUrlAuthority {
+  if (!/^postgres(?:ql)?:\/\//i.test(url)) {
+    throw new Error('Database session lock requires a valid Postgres URL');
+  }
+  let parsed: URL;
+  try { parsed = new URL(url); }
+  catch { throw new Error('Database session lock requires a valid Postgres URL'); }
+  const host = parsed.hostname.toLowerCase();
+  const database = decodeURIComponent(parsed.pathname.replace(/^\//, ''));
+  if (!database) throw new Error('Database session lock URL must name a database');
+  return {
+    database,
+    looksPooled: parsed.port === '6543'
+      || /(pooler|pooling|pgbouncer|supavisor)/i.test(host),
+  };
+}
+
+/** Conservative topology check shared by lock and schema-route guards. */
+export function isLikelyTransactionPoolerUrl(url: string): boolean {
+  try {
+    return inspectDatabaseUrlAuthority(url).looksPooled;
+  } catch {
+    // An invalid authority is never safe to treat as a direct/session route.
+    return true;
+  }
+}
+
+/**
+ * Resolve a URL on which session-scoped advisory locks are trustworthy.
+ * Known/likely pooler URLs fail closed unless a distinct explicit or safely
+ * derived session/direct authority is supplied.
+ */
+export function resolveDatabaseSessionLockUrl(
+  configuredUrl: string,
+  directUrl?: string | null,
+): string {
+  const configured = inspectDatabaseUrlAuthority(configuredUrl);
+  const explicit = directUrl?.trim();
+  if (explicit) {
+    const direct = inspectDatabaseUrlAuthority(explicit);
+    if (direct.looksPooled) {
+      throw new Error(
+        'Database session lock refuses a likely transaction-pooler direct override; configure GBRAIN_DIRECT_DATABASE_URL to a direct or session-mode endpoint.',
+      );
+    }
+    if (direct.database !== configured.database) {
+      throw new Error('Database session lock direct override names a different database');
+    }
+    return explicit;
+  }
+  if (configured.looksPooled) {
+    throw new Error(
+      'Database session lock refuses a likely transaction-pooler URL; configure GBRAIN_DIRECT_DATABASE_URL to a direct or session-mode endpoint.',
+    );
+  }
+  return configuredUrl;
+}
+
+export async function acquireDatabaseSessionLock(
+  url: string,
+  key: number,
+): Promise<DatabaseSessionLockHandle> {
+  if (!Number.isSafeInteger(key)) throw new Error('Database session lock key must be a safe integer');
+  let proofKey: string;
+  do {
+    const random63 = BigInt(`0x${randomUUID().replace(/-/g, '').slice(0, 16)}`)
+      & ((1n << 63n) - 1n);
+    proofKey = random63.toString();
+  } while (proofKey === '0' || proofKey === String(key));
+  const lockPool = postgres(url, {
+    max: 1,
+    idle_timeout: 0,
+    // postgres.js otherwise retires even reserved connections after a random
+    // 30–60 minutes, silently releasing a lock during supported 2h runs.
+    max_lifetime: null,
+    connect_timeout: 10,
+    prepare: false,
+    types: { bigint: postgres.BigInt },
+    onnotice: process.env.GBRAIN_PG_NOTICES === '1' ? undefined : () => {},
+  });
+  let reserved: Awaited<ReturnType<typeof lockPool.reserve>> | null = null;
+  try {
+    reserved = await lockPool.reserve();
+    await reserved.unsafe("SET statement_timeout = '30min'");
+    await reserved`SELECT pg_advisory_lock(${key}::bigint)`;
+    await reserved`SELECT pg_advisory_lock(${proofKey}::bigint)`;
+    let released = false;
+    const owned = reserved;
+    const assertOwned = async (): Promise<void> => {
+      const rows = await owned<{ held: boolean }[]>`
+        SELECT EXISTS (
+          SELECT 1
+            FROM pg_locks
+           WHERE locktype = 'advisory'
+             AND pid = pg_backend_pid()
+             AND classid = 0
+             AND objid = ${key}::oid
+             AND objsubid = 1
+             AND granted
+        ) AS held
+      `;
+      if (rows[0]?.held !== true) {
+        throw new Error('Database session lock is no longer owned by its reserved backend');
+      }
+    };
+    return {
+      assertOwned,
+      async assertSameDatabase(workPool: PostgresPool): Promise<void> {
+        await assertOwned();
+        // The random proof lock exists only on the reserved authority. A
+        // transaction on the same database must therefore fail to acquire it;
+        // a different cluster/database succeeds and auto-releases on commit.
+        const rows = await workPool.begin(async tx =>
+          tx<{ acquired: boolean }[]>`
+            SELECT pg_try_advisory_xact_lock(${proofKey}::bigint) AS acquired
+          `,
+        );
+        if (rows.length !== 1 || rows[0]?.acquired !== false) {
+          throw new Error(
+            'Database session lock authority does not cover the configured work database',
+          );
+        }
+      },
+      async assertDatabaseIdentity(expectedBrainId: string): Promise<void> {
+        const rows = await owned<{ value: string }[]>`
+          SELECT value FROM public.config WHERE key = 'database_instance_id'
+        `;
+        if (rows.length !== 1
+          || normalizeDatabaseInstanceId(rows[0]?.value) !== expectedBrainId) {
+          throw new Error(
+            'Database session lock authority does not match the configured brain identity',
+          );
+        }
+      },
+      async release(): Promise<void> {
+        if (released) return;
+        released = true;
+        let proofUnlocked = false;
+        let primaryUnlocked = false;
+        try {
+          const rows = await owned<{ unlocked: boolean }[]>`
+            SELECT pg_advisory_unlock(${proofKey}::bigint) AS unlocked
+          `;
+          proofUnlocked = rows[0]?.unlocked === true;
+        } finally {
+          try {
+            const rows = await owned<{ unlocked: boolean }[]>`
+              SELECT pg_advisory_unlock(${key}::bigint) AS unlocked
+            `;
+            primaryUnlocked = rows[0]?.unlocked === true;
+          } finally {
+            owned.release();
+            reserved = null;
+            await endPoolBounded(lockPool);
+          }
+        }
+        if (!proofUnlocked || !primaryUnlocked) {
+          throw new Error('Database session lock release was not acknowledged by its owning session');
+        }
+      }
+    };
+  } catch (error) {
+    reserved?.release();
+    await endPoolBounded(lockPool);
+    throw error;
+  }
+}
+
+export async function withDatabaseSessionLock<T>(
+  url: string,
+  key: number,
+  fn: (handle: DatabaseSessionLockHandle) => Promise<T>,
+): Promise<T> {
+  const handle = await acquireDatabaseSessionLock(url, key);
+  try {
+    return await fn(handle);
+  } finally {
+    await handle.release();
+  }
+}
+
+export async function withSchemaMigrationLock<T>(
+  url: string,
+  fn: (handle: DatabaseSessionLockHandle) => Promise<T>,
+): Promise<T> {
+  return withDatabaseSessionLock(url, SCHEMA_MIGRATION_LOCK_KEY, fn);
+}
+
 export function getConnection(): ReturnType<typeof postgres> {
   if (!sql) {
     throw new GBrainError(
@@ -304,13 +585,66 @@ export async function disconnect(): Promise<void> {
 
 export async function initSchema(): Promise<void> {
   const conn = getConnection();
-  // Advisory lock prevents concurrent initSchema() calls from deadlocking
-  await conn`SELECT pg_advisory_lock(42)`;
-  try {
-    await conn.unsafe(SCHEMA_SQL);
-  } finally {
-    await conn`SELECT pg_advisory_unlock(42)`;
+  const url = connectedUrl;
+  if (!url) {
+    throw new GBrainError(
+      'No database connection',
+      'connected database URL is unavailable',
+      'Reconnect with gbrain init --url <connection_string>',
+    );
   }
+  // A session advisory lock cannot be trusted through transaction-mode
+  // PgBouncer. Prefer the same explicit/derived direct URL used by the
+  // connection manager; non-pooler URLs fall back to themselves.
+  const directPoolDisabled = process.env.GBRAIN_DISABLE_DIRECT_POOL === '1'
+    || process.env.GBRAIN_DISABLE_DIRECT_POOL === 'true';
+  if (directPoolDisabled && isLikelyTransactionPoolerUrl(url)) {
+    throw new Error(
+      'Refusing schema mutation through a transaction pooler while ' +
+      'GBRAIN_DISABLE_DIRECT_POOL is active. Unset the kill switch for the ' +
+      'schema phase, or configure the primary database URL as a direct/session endpoint.',
+    );
+  }
+  const configuredDirect = directPoolDisabled
+    ? undefined
+    : process.env.GBRAIN_DIRECT_DATABASE_URL?.trim();
+  const { deriveDirectUrl } = await import('./connection-manager.ts');
+  const schemaLockUrl = resolveDatabaseSessionLockUrl(
+    url,
+    configuredDirect || deriveDirectUrl(url),
+  );
+  await withSchemaMigrationLock(schemaLockUrl, async lock => {
+    // This standalone path has one work/DDL pool. Prove it reaches the same
+    // database as the reserved session and resolves unqualified legacy schema
+    // statements only to public before any DDL is attempted.
+    await assertPublicSchemaAuthority(conn, 'configured work database');
+    await lock.assertSameDatabase(conn);
+
+    const establishAndAssertIdentity = async (): Promise<void> => {
+      await conn`
+        INSERT INTO public.config (key, value)
+        VALUES ('database_instance_id', ${randomUUID()})
+        ON CONFLICT (key) DO NOTHING
+      `;
+      const rows = await conn<{ value: string }[]>`
+        SELECT value FROM public.config WHERE key = 'database_instance_id'
+      `;
+      if (rows.length !== 1) {
+        throw new Error('Database instance identity is not unique or readable');
+      }
+      await lock.assertDatabaseIdentity(normalizeDatabaseInstanceId(rows[0]?.value));
+    };
+
+    const table = await conn<{ present: string | null }[]>`
+      SELECT to_regclass('public.config')::text AS present
+    `;
+    if (table[0]?.present) {
+      await establishAndAssertIdentity();
+    }
+    const schemaSql = await getConfiguredPostgresSchema();
+    await conn.unsafe(`${PUBLIC_SCHEMA_SEARCH_PATH_SQL};\n${schemaSql}`);
+    await establishAndAssertIdentity();
+  });
 }
 
 export { verifySchema } from './schema-verify.ts';

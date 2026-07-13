@@ -6,13 +6,34 @@
 import { describe, test, expect, afterEach } from "bun:test";
 import { join } from "path";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "fs";
-import { tmpdir } from "os";
-import { spawnSync, execSync } from "child_process";
+import { devNull, tmpdir } from "os";
+import { spawnSync, execFileSync } from "child_process";
 
 const CLI = join(import.meta.dir, "..", "src", "cli.ts");
 const REPO_ROOT = join(import.meta.dir, "..");
 
 let fixtures: string[] = [];
+
+function hermeticGitEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: devNull,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_AUTHOR_NAME: "t",
+    GIT_AUTHOR_EMAIL: "t@t",
+    GIT_COMMITTER_NAME: "t",
+    GIT_COMMITTER_EMAIL: "t@t",
+  };
+}
+
+function git(cwd: string, ...args: string[]): void {
+  execFileSync("git", args, {
+    cwd,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: hermeticGitEnv(),
+  });
+}
 
 afterEach(() => {
   for (const f of fixtures) {
@@ -43,10 +64,9 @@ function makeGitFixture(skills: Record<string, string>): string {
     const fm = `---\nname: ${name}\ndescription: test\ntriggers:\n  - "${name}"\n---\n`;
     writeFileSync(join(skillsDir, name, "SKILL.md"), fm + body);
   }
-  execSync("git init --quiet", { cwd: root });
-  execSync("git config user.email t@t", { cwd: root });
-  execSync("git config user.name t", { cwd: root });
-  execSync("git add -A && git commit --quiet -m init", { cwd: root });
+  git(root, "init", "--quiet");
+  git(root, "add", "-A");
+  git(root, "commit", "--quiet", "-m", "init");
   return root;
 }
 
@@ -54,7 +74,7 @@ function runDoctor(cwd: string, args: string[]): { stdout: string; stderr: strin
   const res = spawnSync("bun", [CLI, "doctor", "--fast", ...args], {
     cwd,
     encoding: "utf-8",
-    env: { ...process.env, NO_COLOR: "1" },
+    env: { ...hermeticGitEnv(), NO_COLOR: "1" },
   });
   return { stdout: res.stdout, stderr: res.stderr, status: res.status ?? -1 };
 }
@@ -85,7 +105,8 @@ describe("gbrain doctor --fix CLI integration", () => {
 
     // Re-run --fast (not --fix) — commit the fix first so the dirty guard
     // doesn't fire and we're testing detection cleanly.
-    execSync("git add -A && git commit --quiet -m fixup", { cwd: root });
+    git(root, "add", "-A");
+    git(root, "commit", "--quiet", "-m", "fixup");
     const { stdout: checkOut } = runDoctor(root, ["--json"]);
     const dryCount = (checkOut.match(/"type":"dry_violation"/g) || []).length;
     expect(dryCount).toBe(0);

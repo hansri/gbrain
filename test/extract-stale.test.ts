@@ -15,7 +15,12 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import { runExtract } from '../src/commands/extract.ts';
+import {
+  extractAllFromDBAuthoritative,
+  extractImportedPagesFromDB,
+  IMPORTED_MARKDOWN_TIMELINE_MANAGER,
+  runExtract,
+} from '../src/commands/extract.ts';
 import { LINK_EXTRACTOR_VERSION_TS } from '../src/core/link-extraction.ts';
 import type { PageInput } from '../src/core/types.ts';
 
@@ -102,6 +107,421 @@ describe('engine: stale-page extraction methods', () => {
 });
 
 describe('gbrain extract --stale', () => {
+  test('[CRITICAL] post-sync DB extraction preserves a concurrent edit as stale', async () => {
+    await engine.putPage('people/bob', personPage('Bob'));
+    await engine.putPage(
+      'people/alice',
+      personPage('Alice', '[Bob](people/bob) met Alice on 2026-07-10.'),
+    );
+    await engine.executeRaw(
+      `UPDATE pages SET updated_at = now() - interval '3 hours' WHERE slug = 'people/alice'`,
+    );
+
+    const originalStamp = engine.markPagesExtractedBatch;
+    let raced = false;
+    (engine as unknown as { markPagesExtractedBatch: unknown }).markPagesExtractedBatch = async function (
+      this: PGLiteEngine,
+      refs: Array<{ slug: string; source_id: string; extractedAt?: string }>,
+      fallback: string,
+    ) {
+      raced = true;
+      await this.executeRaw(
+        `UPDATE pages
+            SET compiled_truth = 'Concurrent DB edit after extraction read',
+                updated_at = now() - interval '1 hour'
+          WHERE slug = 'people/alice'`,
+      );
+      return originalStamp.call(this, refs, fallback);
+    };
+    try {
+      const result = await extractImportedPagesFromDB(engine, ['people/alice'], {
+        sourceId: 'default',
+      });
+      expect(result.pagesProcessed).toBe(1);
+    } finally {
+      (engine as unknown as { markPagesExtractedBatch: unknown }).markPagesExtractedBatch = originalStamp;
+    }
+
+    expect(raced).toBe(true);
+    expect((await engine.getLinks('people/alice')).some(link => link.to_slug === 'people/bob')).toBe(true);
+    const freshness = await engine.executeRaw<{ stale: boolean }>(
+      `SELECT updated_at > links_extracted_at AS stale
+         FROM pages WHERE slug = 'people/alice' AND source_id = 'default'`,
+    );
+    expect(freshness[0]?.stale).toBe(true);
+  });
+
+  test('[CRITICAL] post-sync extraction removes stale managed rows but preserves manual rows', async () => {
+    await engine.putPage('people/bob', personPage('Bob'));
+    await engine.putPage('people/alice', {
+      ...personPage('Alice', '[Bob](people/bob) worked with Alice.'),
+      timeline: '- **2026-07-10** - Met Bob',
+    });
+
+    await extractImportedPagesFromDB(engine, ['people/alice'], { sourceId: 'default' });
+    await engine.addLink(
+      'people/alice', 'people/bob', 'Hand-curated relationship', 'manual-note', 'manual',
+      undefined, undefined,
+      { fromSourceId: 'default', toSourceId: 'default', originSourceId: 'default' },
+    );
+    await engine.addTimelineEntry(
+      'people/alice',
+      { date: '2026-07-11', source: 'manual', summary: 'Manual milestone', detail: '' },
+      { sourceId: 'default' },
+    );
+
+    expect((await engine.getLinks('people/alice')).some(l => l.link_source === 'markdown')).toBe(true);
+    expect((await engine.getTimeline('people/alice', { sourceId: 'default' }))
+      .some(t => t.source === 'gbrain-markdown')).toBe(true);
+
+    await engine.executeRaw(
+      `UPDATE pages
+          SET compiled_truth = 'No managed relationships remain.', timeline = '', updated_at = now()
+        WHERE source_id = 'default' AND slug = 'people/alice'`,
+    );
+    await extractImportedPagesFromDB(engine, ['people/alice'], { sourceId: 'default' });
+
+    const links = await engine.getLinks('people/alice');
+    expect(links.some(l => l.link_source === 'markdown' || l.link_source === 'wikilink-resolved')).toBe(false);
+    expect(links.some(l => l.link_source === 'manual' && l.link_type === 'manual-note')).toBe(true);
+    const timeline = await engine.getTimeline('people/alice', { sourceId: 'default' });
+    expect(timeline.some(t => t.source === 'gbrain-markdown')).toBe(false);
+    expect(timeline.some(t => t.source === 'manual' && t.summary === 'Manual milestone')).toBe(true);
+    const freshness = await engine.executeRaw<{ fresh: boolean }>(
+      `SELECT links_extracted_at = updated_at AS fresh
+         FROM pages WHERE source_id = 'default' AND slug = 'people/alice'`,
+    );
+    expect(freshness[0]?.fresh).toBe(true);
+  });
+
+  test('[CRITICAL] never claims an exact source-less manual row as managed Markdown', async () => {
+    await engine.putPage('people/alice', {
+      ...personPage('Alice'),
+      timeline: '- **2026-07-10** - Met Bob',
+    });
+    await engine.addTimelineEntry(
+      'people/alice',
+      { date: '2026-07-10', source: '', summary: 'Met Bob', detail: '' },
+      { sourceId: 'default' },
+    );
+    await engine.addTimelineEntry(
+      'people/alice',
+      { date: '2026-07-09', source: '', summary: 'Manual source-less note', detail: 'keep me' },
+      { sourceId: 'default' },
+    );
+    await engine.addTimelineEntry(
+      'people/alice',
+      { date: '2026-07-08', source: 'manual', summary: 'Explicit manual note', detail: '' },
+      { sourceId: 'default' },
+    );
+
+    await extractImportedPagesFromDB(engine, ['people/alice'], { sourceId: 'default' });
+
+    const rows = await engine.executeRaw<{ date: string; source: string; summary: string; detail: string }>(
+      `SELECT date::text AS date, source, summary, detail
+         FROM timeline_entries te
+         JOIN pages p ON p.id = te.page_id
+        WHERE p.source_id = 'default' AND p.slug = 'people/alice'
+        ORDER BY date DESC`,
+    );
+    const matching = rows.filter(r => r.date === '2026-07-10' && r.summary === 'Met Bob');
+    expect(matching).toHaveLength(2);
+    expect(matching).toContainEqual({ date: '2026-07-10', source: '', summary: 'Met Bob', detail: '' });
+    expect(matching).toContainEqual({
+      date: '2026-07-10', source: 'gbrain-markdown', summary: 'Met Bob', detail: '',
+    });
+    expect(rows).toContainEqual({
+      date: '2026-07-09', source: '', summary: 'Manual source-less note', detail: 'keep me',
+    });
+    expect(rows).toContainEqual({
+      date: '2026-07-08', source: 'manual', summary: 'Explicit manual note', detail: '',
+    });
+
+    await engine.executeRaw(
+      `UPDATE pages SET timeline = '', updated_at = now()
+        WHERE source_id = 'default' AND slug = 'people/alice'`,
+    );
+    await extractImportedPagesFromDB(engine, ['people/alice'], { sourceId: 'default' });
+    const afterRemoval = await engine.getTimeline('people/alice', { sourceId: 'default' });
+    expect(afterRemoval.some(t => t.source === 'gbrain-markdown' && t.summary === 'Met Bob')).toBe(false);
+    expect(afterRemoval.some(t => t.source === '' && t.summary === 'Met Bob')).toBe(true);
+  });
+
+  test('[CRITICAL] reserved legacy rows are adopted and removed while non-reserved manual rows survive', async () => {
+    await engine.putPage('people/alice', {
+      ...personPage('Alice'),
+      timeline: [
+        '- **2026-07-10** | Meeting — Met Bob',
+        '### 2026-07-11 — Signed agreement',
+        '',
+        'Final paperwork completed.',
+      ].join('\n'),
+    });
+    await engine.addTimelineEntry(
+      'people/alice',
+      { date: '2026-07-10', source: 'gbrain-markdown', summary: 'Legacy managed row', detail: '' },
+      { sourceId: 'default' },
+    );
+    await engine.addTimelineEntry(
+      'people/alice',
+      { date: '2026-07-10', source: 'Meeting', summary: 'Manual meeting note', detail: 'keep me' },
+      { sourceId: 'default' },
+    );
+
+    await extractImportedPagesFromDB(engine, ['people/alice'], { sourceId: 'default' });
+    const rows = await engine.getTimeline('people/alice', { sourceId: 'default' });
+    expect(rows.some(t => t.source === 'gbrain-markdown' && t.summary === 'Legacy managed row')).toBe(false);
+    expect(rows.some(t => t.source === 'gbrain-markdown:Meeting' && t.summary === 'Met Bob'
+      && t.managed_by === IMPORTED_MARKDOWN_TIMELINE_MANAGER)).toBe(true);
+    expect(rows.some(t => t.source === 'gbrain-markdown' && t.summary === 'Signed agreement'
+      && t.managed_by === IMPORTED_MARKDOWN_TIMELINE_MANAGER)).toBe(true);
+    expect(rows.some(t => t.source === 'Meeting' && t.summary === 'Manual meeting note')).toBe(true);
+
+    await engine.executeRaw(
+      `UPDATE pages SET timeline = '', updated_at = now()
+        WHERE source_id = 'default' AND slug = 'people/alice'`,
+    );
+    await extractImportedPagesFromDB(engine, ['people/alice'], { sourceId: 'default' });
+    const after = await engine.getTimeline('people/alice', { sourceId: 'default' });
+    expect(after.some(t => t.summary === 'Legacy managed row')).toBe(false);
+    expect(after.some(t => t.managed_by === IMPORTED_MARKDOWN_TIMELINE_MANAGER)).toBe(false);
+    expect(after.some(t => t.source === 'Meeting' && t.summary === 'Manual meeting note')).toBe(true);
+  });
+
+  test('[CRITICAL] frontmatter reconciliation deletes by origin page and preserves manual incoming edges', async () => {
+    await engine.putPage('companies/acme', companyPage('Acme'));
+    await engine.putPage('deals/seed', {
+      type: 'deal',
+      title: 'Seed',
+      compiled_truth: '',
+      timeline: '',
+      frontmatter: { investors: ['Acme'] },
+    });
+
+    await runExtract(engine, ['--stale']);
+    expect((await engine.getLinks('companies/acme', { sourceId: 'default' }))
+      .some(l => l.to_slug === 'deals/seed' && l.link_source === 'frontmatter')).toBe(true);
+
+    await engine.addLink(
+      'companies/acme', 'deals/seed', 'Hand-curated incoming edge', 'manual-note', 'manual',
+      undefined, undefined,
+      { fromSourceId: 'default', toSourceId: 'default', originSourceId: 'default' },
+    );
+    await engine.executeRaw(
+      `UPDATE pages SET frontmatter = '{}'::jsonb, updated_at = now()
+        WHERE source_id = 'default' AND slug = 'deals/seed'`,
+    );
+    await runExtract(engine, ['--stale']);
+
+    const links = await engine.getLinks('companies/acme', { sourceId: 'default' });
+    expect(links.some(l => l.to_slug === 'deals/seed' && l.link_source === 'frontmatter')).toBe(false);
+    expect(links.some(l => l.to_slug === 'deals/seed' && l.link_source === 'manual')).toBe(true);
+  });
+
+  test('[CRITICAL] post-sync extraction authoritatively removes frontmatter-origin edges before stamping', async () => {
+    await engine.putPage('companies/acme', companyPage('Acme'));
+    await engine.putPage('deals/seed', {
+      type: 'deal', title: 'Seed', compiled_truth: '', timeline: '',
+      frontmatter: { investors: ['Acme'] },
+    });
+
+    await extractImportedPagesFromDB(engine, ['deals/seed'], { sourceId: 'default' });
+    expect((await engine.getLinks('companies/acme', { sourceId: 'default' }))
+      .some(l => l.to_slug === 'deals/seed' && l.link_source === 'frontmatter')).toBe(true);
+
+    await engine.addLink(
+      'companies/acme', 'deals/seed', 'Manual incoming edge', 'manual-note', 'manual',
+      undefined, undefined,
+      { fromSourceId: 'default', toSourceId: 'default', originSourceId: 'default' },
+    );
+    await engine.executeRaw(
+      `UPDATE pages SET frontmatter = '{}'::jsonb, updated_at = now()
+        WHERE source_id = 'default' AND slug = 'deals/seed'`,
+    );
+    await extractImportedPagesFromDB(engine, ['deals/seed'], { sourceId: 'default' });
+
+    const links = await engine.getLinks('companies/acme', { sourceId: 'default' });
+    expect(links.some(l => l.to_slug === 'deals/seed' && l.link_source === 'frontmatter')).toBe(false);
+    expect(links.some(l => l.to_slug === 'deals/seed' && l.link_source === 'manual')).toBe(true);
+    const freshness = await engine.executeRaw<{ fresh: boolean }>(
+      `SELECT links_extracted_at = updated_at AS fresh
+         FROM pages WHERE source_id = 'default' AND slug = 'deals/seed'`,
+    );
+    expect(freshness[0]?.fresh).toBe(true);
+  });
+
+  test('[CRITICAL] ordinary DB include-frontmatter extraction replaces removed YAML edges', async () => {
+    await engine.putPage('companies/acme', companyPage('Acme'));
+    await engine.putPage('deals/seed', {
+      type: 'deal', title: 'Seed', compiled_truth: '', timeline: '',
+      frontmatter: { investors: ['Acme'] },
+    });
+
+    await runExtract(engine, ['all', '--source', 'db', '--include-frontmatter']);
+    expect((await engine.getLinks('companies/acme', { sourceId: 'default' }))
+      .some(l => l.to_slug === 'deals/seed' && l.link_source === 'frontmatter')).toBe(true);
+
+    await engine.executeRaw(
+      `UPDATE pages SET frontmatter = '{}'::jsonb, updated_at = now()
+        WHERE source_id = 'default' AND slug = 'deals/seed'`,
+    );
+    await runExtract(engine, ['all', '--source', 'db', '--include-frontmatter']);
+
+    expect((await engine.getLinks('companies/acme', { sourceId: 'default' }))
+      .some(l => l.to_slug === 'deals/seed' && l.link_source === 'frontmatter')).toBe(false);
+    const freshness = await engine.executeRaw<{ fresh: boolean }>(
+      `SELECT links_extracted_at = updated_at AS fresh
+         FROM pages WHERE source_id = 'default' AND slug = 'deals/seed'`,
+    );
+    expect(freshness[0]?.fresh).toBe(true);
+  });
+
+  test('[CRITICAL] ordinary DB all-mode rolls back every managed projection when timeline write fails', async () => {
+    await engine.putPage('people/bob', personPage('Bob'));
+    await engine.putPage('companies/acme', companyPage('Acme'));
+    await engine.putPage('deals/seed', {
+      type: 'deal',
+      title: 'Seed',
+      compiled_truth: '[Bob](people/bob) reviewed the deal.',
+      timeline: '- **2026-07-10** - Old managed milestone',
+      frontmatter: { investors: ['Acme'] },
+    });
+    await runExtract(engine, [
+      'all', '--source', 'db', '--include-frontmatter', '--type', 'deal',
+    ]);
+    await engine.addLink(
+      'deals/seed', 'people/bob', 'Hand-curated relationship', 'manual-note', 'manual',
+      undefined, undefined,
+      { fromSourceId: 'default', toSourceId: 'default', originSourceId: 'default' },
+    );
+    await engine.addTimelineEntry(
+      'deals/seed',
+      { date: '2026-07-13', source: 'manual', summary: 'Manual milestone', detail: '' },
+      { sourceId: 'default' },
+    );
+
+    await engine.executeRaw(
+      `UPDATE pages
+          SET compiled_truth = 'No managed relationships remain.',
+              timeline = '- **2026-07-12** - New managed milestone',
+              frontmatter = '{}'::jsonb,
+              links_extracted_at = now() - interval '2 hours',
+              updated_at = now() - interval '1 hour'
+        WHERE source_id = 'default' AND slug = 'deals/seed'`,
+    );
+
+    const originalTimelineBatch = engine.addTimelineEntriesBatch;
+    (engine as unknown as {
+      addTimelineEntriesBatch: typeof engine.addTimelineEntriesBatch;
+    }).addTimelineEntriesBatch = async () => {
+      throw new Error('simulated authoritative timeline failure');
+    };
+    try {
+      await expect(extractAllFromDBAuthoritative(
+        engine, 'deal', undefined, { sourceIdFilter: 'default' },
+      )).rejects.toThrow('simulated authoritative timeline failure');
+    } finally {
+      (engine as unknown as {
+        addTimelineEntriesBatch: typeof engine.addTimelineEntriesBatch;
+      }).addTimelineEntriesBatch = originalTimelineBatch;
+    }
+
+    const linksAfterFailure = await engine.getLinks('deals/seed', { sourceId: 'default' });
+    expect(linksAfterFailure.some(l => l.to_slug === 'people/bob' && l.link_source === 'markdown')).toBe(true);
+    expect(linksAfterFailure.some(l => l.to_slug === 'people/bob' && l.link_source === 'manual')).toBe(true);
+    expect((await engine.getLinks('companies/acme', { sourceId: 'default' }))
+      .some(l => l.to_slug === 'deals/seed' && l.link_source === 'frontmatter')).toBe(true);
+    const timelineAfterFailure = await engine.getTimeline('deals/seed', { sourceId: 'default' });
+    expect(timelineAfterFailure.some(t => t.source === 'gbrain-markdown' && t.summary === 'Old managed milestone')).toBe(true);
+    expect(timelineAfterFailure.some(t => t.source === 'gbrain-markdown' && t.summary === 'New managed milestone')).toBe(false);
+    expect(timelineAfterFailure.some(t => t.source === 'manual' && t.summary === 'Manual milestone')).toBe(true);
+    expect((await engine.executeRaw<{ stale: boolean }>(
+      `SELECT updated_at > links_extracted_at AS stale
+         FROM pages WHERE source_id = 'default' AND slug = 'deals/seed'`,
+    ))[0]?.stale).toBe(true);
+
+    await extractAllFromDBAuthoritative(
+      engine, 'deal', undefined, { sourceIdFilter: 'default' },
+    );
+
+    const linksAfterRetry = await engine.getLinks('deals/seed', { sourceId: 'default' });
+    expect(linksAfterRetry.some(l => l.to_slug === 'people/bob' && l.link_source === 'markdown')).toBe(false);
+    expect(linksAfterRetry.some(l => l.to_slug === 'people/bob' && l.link_source === 'manual')).toBe(true);
+    expect((await engine.getLinks('companies/acme', { sourceId: 'default' }))
+      .some(l => l.to_slug === 'deals/seed' && l.link_source === 'frontmatter')).toBe(false);
+    const timelineAfterRetry = await engine.getTimeline('deals/seed', { sourceId: 'default' });
+    expect(timelineAfterRetry.some(t => t.source === 'gbrain-markdown' && t.summary === 'Old managed milestone')).toBe(false);
+    expect(timelineAfterRetry.some(t => t.source === 'gbrain-markdown' && t.summary === 'New managed milestone')).toBe(true);
+    expect(timelineAfterRetry.some(t => t.source === 'manual' && t.summary === 'Manual milestone')).toBe(true);
+    expect((await engine.executeRaw<{ fresh: boolean }>(
+      `SELECT links_extracted_at = updated_at AS fresh
+         FROM pages WHERE source_id = 'default' AND slug = 'deals/seed'`,
+    ))[0]?.fresh).toBe(true);
+  });
+
+  test('[CRITICAL] body-only ordinary DB extraction does not bless stale frontmatter edges', async () => {
+    await engine.putPage('companies/acme', companyPage('Acme'));
+    await engine.putPage('deals/seed', {
+      type: 'deal', title: 'Seed', compiled_truth: '', timeline: '',
+      frontmatter: { investors: ['Acme'] },
+    });
+    await runExtract(engine, ['all', '--source', 'db', '--include-frontmatter']);
+
+    await engine.executeRaw(
+      `UPDATE pages
+          SET frontmatter = '{}'::jsonb,
+              links_extracted_at = now() - interval '2 hours',
+              updated_at = now() - interval '1 hour'
+        WHERE source_id = 'default' AND slug = 'deals/seed'`,
+    );
+    await runExtract(engine, ['all', '--source', 'db']);
+
+    // The caller explicitly skipped frontmatter, so the old edge is preserved
+    // but, critically, the page remains stale for a complete sweep.
+    expect((await engine.getLinks('companies/acme', { sourceId: 'default' }))
+      .some(l => l.to_slug === 'deals/seed' && l.link_source === 'frontmatter')).toBe(true);
+    const freshness = await engine.executeRaw<{ stale: boolean }>(
+      `SELECT updated_at > links_extracted_at AS stale
+         FROM pages WHERE source_id = 'default' AND slug = 'deals/seed'`,
+    );
+    expect(freshness[0]?.stale).toBe(true);
+  });
+
+  test('[CRITICAL] stale sweep removes obsolete managed rows but preserves manual rows', async () => {
+    await engine.putPage('people/bob', personPage('Bob'));
+    await engine.putPage('people/alice', {
+      ...personPage('Alice', '[Bob](people/bob) worked with Alice.'),
+      timeline: '- **2026-07-10** - Met Bob',
+    });
+    await runExtract(engine, ['--stale']);
+
+    await engine.addLink(
+      'people/alice', 'people/bob', 'Hand-curated relationship', 'manual-note', 'manual',
+      undefined, undefined,
+      { fromSourceId: 'default', toSourceId: 'default', originSourceId: 'default' },
+    );
+    await engine.addTimelineEntry(
+      'people/alice',
+      { date: '2026-07-11', source: 'manual', summary: 'Manual milestone', detail: '' },
+      { sourceId: 'default' },
+    );
+
+    await engine.executeRaw(
+      `UPDATE pages
+          SET compiled_truth = 'No managed relationships remain.', timeline = '', updated_at = now()
+        WHERE source_id = 'default' AND slug = 'people/alice'`,
+    );
+    await runExtract(engine, ['--stale']);
+
+    const links = await engine.getLinks('people/alice');
+    expect(links.some(l => l.link_source === 'markdown' || l.link_source === 'wikilink-resolved')).toBe(false);
+    expect(links.some(l => l.link_source === 'manual' && l.link_type === 'manual-note')).toBe(true);
+    const timeline = await engine.getTimeline('people/alice', { sourceId: 'default' });
+    expect(timeline.some(t => t.source === 'gbrain-markdown')).toBe(false);
+    expect(timeline.some(t => t.source === 'manual' && t.summary === 'Manual milestone')).toBe(true);
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(0);
+  });
+
   test('extracts typed edges + stamps every processed page (incl. zero-link)', async () => {
     await engine.putPage('people/alice', personPage('Alice'));
     await engine.putPage('companies/acme', companyPage('Acme', '[Alice](people/alice) is the CEO of [Acme](companies/acme).'));
@@ -135,6 +555,26 @@ describe('gbrain extract --stale', () => {
     expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(0);
     const rows = await engine.executeRaw<{ fresh: boolean }>(
       `SELECT bool_and(links_extracted_at >= $1::timestamptz) AS fresh FROM pages`,
+      [LINK_EXTRACTOR_VERSION_TS],
+    );
+    expect(rows[0]?.fresh).toBe(true);
+  });
+
+  test('CRITICAL: ordinary authoritative DB extraction uses the extractor-version floor', async () => {
+    await engine.putPage('people/alice', personPage('Alice'));
+    await engine.executeRaw(
+      `UPDATE pages
+          SET updated_at = '2026-05-01 00:00:00.123456+00',
+              links_extracted_at = NULL
+        WHERE source_id = 'default' AND slug = 'people/alice'`,
+    );
+
+    await runExtract(engine, ['all', '--source', 'db', '--include-frontmatter']);
+
+    expect(await engine.countStalePagesForExtraction({ versionTs: LINK_EXTRACTOR_VERSION_TS })).toBe(0);
+    const rows = await engine.executeRaw<{ fresh: boolean }>(
+      `SELECT links_extracted_at >= $1::timestamptz AS fresh
+         FROM pages WHERE source_id = 'default' AND slug = 'people/alice'`,
       [LINK_EXTRACTOR_VERSION_TS],
     );
     expect(rows[0]?.fresh).toBe(true);
@@ -237,7 +677,10 @@ describe('gbrain extract --stale', () => {
     // Make the link flush throw mid-sweep. The --stale path flushes
     // NON-swallowing (no try/catch), so the throw must propagate AND no page in
     // the batch may be stamped (stamp runs only AFTER a successful flush).
-    const origBatch = engine.addLinksBatch.bind(engine);
+    // Keep the method unbound. transaction() creates a scoped engine whose
+    // database handle points at the open transaction; restoring a function
+    // bound to the outer engine would make the clean retry wait on itself.
+    const origBatch = engine.addLinksBatch;
     let threw = false;
     (engine as unknown as { addLinksBatch: unknown }).addLinksBatch = async () => { throw new Error('__flush_boom__'); };
     try {
@@ -271,16 +714,17 @@ describe('gbrain extract --stale', () => {
     // D4 stamps with the READ updated_at (now-3h), so now-1h > now-3h → acme
     // stays stale (edit preserved). The OLD now()-stamp would set
     // links_extracted_at = now > now-1h → acme marked fresh, edit silently lost.
-    const origStamp = engine.markPagesExtractedBatch.bind(engine);
+    const origStamp = engine.markPagesExtractedBatch;
     let hooked = false;
-    (engine as unknown as { markPagesExtractedBatch: unknown }).markPagesExtractedBatch = async (
+    (engine as unknown as { markPagesExtractedBatch: unknown }).markPagesExtractedBatch = async function (
+      this: PGLiteEngine,
       refs: Array<{ slug: string; source_id: string; extractedAt?: string }>, def: string,
-    ) => {
+    ) {
       if (!hooked) {
         hooked = true;
-        await engine.executeRaw(`UPDATE pages SET updated_at = now() - interval '1 hour' WHERE slug = 'companies/acme'`);
+        await this.executeRaw(`UPDATE pages SET updated_at = now() - interval '1 hour' WHERE slug = 'companies/acme'`);
       }
-      return origStamp(refs, def);
+      return origStamp.call(this, refs, def);
     };
     try {
       await runExtract(engine, ['--stale']);

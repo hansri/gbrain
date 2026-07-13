@@ -5,7 +5,13 @@ import type { BrainEngine } from '../core/engine.ts';
 import { operations } from '../core/operations.ts';
 import { VERSION } from '../version.ts';
 import { buildToolDefs } from './tool-defs.ts';
-import { dispatchToolCall, validateParams, buildOperationContext } from './dispatch.ts';
+import { validateParams, buildOperationContext } from './dispatch.ts';
+import {
+  dispatchStdioToolCall,
+  resolveStdioMcpPolicy,
+  stdioAuthForPolicy,
+  type ResolvedStdioMcpPolicy,
+} from './stdio-policy.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
 import { loadConfig } from '../core/config.ts';
 import {
@@ -15,7 +21,15 @@ import {
 } from '../core/context/resolve-ipc.ts';
 import { resolveEntitiesToPointers, logDeliveredReflexPointers } from '../core/context/retrieval-reflex.ts';
 
-export async function startMcpServer(engine: BrainEngine) {
+export async function startMcpServer(
+  engine: BrainEngine,
+  policy: ResolvedStdioMcpPolicy = resolveStdioMcpPolicy(),
+) {
+  // Resolve the stdio principal once at launch. Tool calls and the local
+  // Retrieval Reflex socket must share this exact immutable source authority;
+  // neither request parameters nor later environment mutation may widen it.
+  const stdioSourceId = process.env.GBRAIN_SOURCE || 'default';
+  const stdioAuth = stdioAuthForPolicy(stdioSourceId, policy);
   const server = new Server(
     { name: 'gbrain', version: VERSION },
     { capabilities: { tools: {} } },
@@ -25,7 +39,7 @@ export async function startMcpServer(engine: BrainEngine) {
   // the subagent tool registry (v0.15+) can call the same mapper against a
   // filtered OPERATIONS subset instead of duplicating this shape.
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: buildToolDefs(operations),
+    tools: buildToolDefs([...policy.allowedOperations]),
   }));
 
   // Dispatch tool calls via shared dispatch.ts (parity with HTTP transport).
@@ -40,17 +54,17 @@ export async function startMcpServer(engine: BrainEngine) {
     // see private hunches via takes_list / takes_search / query. Operators
     // who want stdio to see everything should call ops directly via
     // `gbrain call <op>` (sets remote=false in src/cli.ts).
-    return dispatchToolCall(engine, name, params, {
-      remote: true,
+    return dispatchStdioToolCall(engine, name, params, policy, {
       takesHoldersAllowList: ['world'],
       // v0.31: source defaults to 'default' for stdio (no per-token scope).
       // Operators who want a different source on stdio MCP should set
       // GBRAIN_SOURCE in the env or use --source via `gbrain call`.
-      sourceId: process.env.GBRAIN_SOURCE || 'default',
+      sourceId: stdioSourceId,
+      auth: stdioAuth,
       // v0.31 (eD3): _meta.brain_hot_memory injection so Claude Desktop /
       // Code see the brain's relevant hot memory automatically alongside
       // every tool-call response. Best-effort; absorbs errors.
-      metaHook: getBrainHotMemoryMeta,
+      metaHook: policy.includeHotMemory ? getBrainHotMemoryMeta : undefined,
     });
   });
 
@@ -67,13 +81,13 @@ export async function startMcpServer(engine: BrainEngine) {
     const cfg = loadConfig();
     if (cfg?.engine === 'pglite' && cfg.database_path) {
       resolveSocket = resolveSocketPath(cfg.database_path);
-      const defaultSource = process.env.GBRAIN_SOURCE || 'default';
       resolveServer = await startResolveIpcServer(
         resolveSocket,
+        { sourceId: stdioSourceId },
         (req) =>
           resolveEntitiesToPointers(
             engine,
-            req.sourceId || defaultSource,
+            req.sourceId!,
             req.candidates ?? [],
             {
               priorContextText: req.priorContextText,

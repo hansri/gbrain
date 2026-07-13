@@ -26,6 +26,7 @@ import { v0_28_0 } from './v0_28_0.ts';
 import { v0_29_1 } from './v0_29_1.ts';
 import { v0_31_0 } from './v0_31_0.ts';
 import { v0_32_2 } from './v0_32_2.ts';
+import { v0_42_59_0 } from './v0_42_59_0.ts';
 
 export const migrations: Migration[] = [
   v0_11_0,
@@ -43,6 +44,7 @@ export const migrations: Migration[] = [
   v0_29_1,
   v0_31_0,
   v0_32_2,
+  v0_42_59_0,
 ];
 
 /** Look up a migration by exact version string. */
@@ -53,14 +55,15 @@ export function getMigration(version: string): Migration | null {
 export type { Migration, FeaturePitch, OrchestratorOpts, OrchestratorResult } from './types.ts';
 
 /**
- * Compare two semver strings (MAJOR.MINOR.PATCH). Returns -1 / 0 / 1.
+ * Compare dotted numeric release versions (at least MAJOR.MINOR.PATCH, with
+ * optional build/revision segments). Returns -1 / 0 / 1.
  * Extracted from src/commands/upgrade.ts#isNewerThan for shared use across
  * the migration runner + post-upgrade pitch path.
  */
 export function compareVersions(a: string, b: string): -1 | 0 | 1 {
   const va = a.split('.').map(n => parseInt(n, 10) || 0);
   const vb = b.split('.').map(n => parseInt(n, 10) || 0);
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < Math.max(va.length, vb.length); i++) {
     const da = va[i] ?? 0;
     const db = vb[i] ?? 0;
     if (da > db) return 1;

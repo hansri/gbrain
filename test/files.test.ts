@@ -196,4 +196,16 @@ describe('collectFiles (production import)', () => {
       rmSync(tmpDir, { recursive: true });
     }
   });
+
+  test('collectFiles skips redirect breadcrumbs on retry', () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'gbrain-redirect-breadcrumb-'));
+    try {
+      writeFileSync(join(tmpDir, 'asset.bin.redirect.yaml'), 'storage_path: default/asset.bin');
+      writeFileSync(join(tmpDir, 'legacy.bin.redirect'), 'path: legacy.bin');
+      writeFileSync(join(tmpDir, 'real.bin'), 'content');
+      expect(collectFiles(tmpDir).map(f => basename(f))).toEqual(['real.bin']);
+    } finally {
+      rmSync(tmpDir, { recursive: true });
+    }
+  });
 });

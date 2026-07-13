@@ -368,8 +368,9 @@ describe('serve IPC wiring — suppression passthrough + reflex-channel logging 
     const { logDeliveredReflexPointers } = await import('../src/core/context/retrieval-reflex.ts');
     const server = await startResolveIpcServer(
       sock,
+      { sourceId: 'default' },
       (req) =>
-        resolveEntitiesToPointers(engine, req.sourceId || 'default', req.candidates ?? [], {
+        resolveEntitiesToPointers(engine, req.sourceId!, req.candidates ?? [], {
           priorContextText: req.priorContextText,
           maxPointers: req.maxPointers,
           suppression: req.suppression,

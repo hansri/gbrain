@@ -72,16 +72,41 @@ describe('resolveRequestedScope — explicit source_id', () => {
     expect(resolveRequestedScope(ctx, 'b')).toEqual({ sourceId: 'b' });
   });
 
+  test('non-empty allowedSources is the exact grant and wins over scalar sourceId', () => {
+    const ctx = ctxOf({
+      remote: true,
+      sourceId: 'scalar-a',
+      auth: { token: 't', clientId: 'c', scopes: [], allowedSources: ['list-b'] } as any,
+    });
+    expect(resolveRequestedScope(ctx, 'list-b')).toEqual({ sourceId: 'list-b' });
+    expect(() => resolveRequestedScope(ctx, 'scalar-a')).toThrow(OperationError);
+  });
+
   test('trusted local + explicit source_id is allowed even with no grant', () => {
     expect(resolveRequestedScope(ctxOf({ remote: false }), 'anything')).toEqual({ sourceId: 'anything' });
   });
 
-  test('remote with no federated grant array can pass an explicit source_id (scalar-floor model)', () => {
-    // allowedSources undefined → no federated restriction to enforce; the scalar
-    // sourceId path governs. (Empty [] is treated the same as undefined.)
-    expect(resolveRequestedScope(ctxOf({ remote: true }), 'z')).toEqual({ sourceId: 'z' });
-    const emptyGrant = ctxOf({ remote: true, auth: { token: 't', clientId: 'c', scopes: [], allowedSources: [] } as any });
-    expect(resolveRequestedScope(emptyGrant, 'z')).toEqual({ sourceId: 'z' });
+  test('missing allowedSources falls back to scalar as an exact singleton grant', () => {
+    const ctx = ctxOf({ remote: true, sourceId: 'scalar-a' });
+    expect(resolveRequestedScope(ctx, 'scalar-a')).toEqual({ sourceId: 'scalar-a' });
+    expect(() => resolveRequestedScope(ctx, 'foreign-b')).toThrow(OperationError);
+  });
+
+  test('empty allowedSources falls back to scalar as an exact singleton grant', () => {
+    const ctx = ctxOf({
+      remote: true,
+      sourceId: 'scalar-a',
+      auth: { token: 't', clientId: 'c', scopes: [], allowedSources: [] } as any,
+    });
+    expect(resolveRequestedScope(ctx, 'scalar-a')).toEqual({ sourceId: 'scalar-a' });
+    expect(() => resolveRequestedScope(ctx, 'foreign-b')).toThrow(OperationError);
+  });
+
+  test('remote caller with neither list nor scalar grant is denied, never unscoped', () => {
+    const ctx = ctxOf({ remote: true, sourceId: '' });
+    expect(() => resolveRequestedScope(ctx, 'anything')).toThrow(OperationError);
+    expect(() => resolveRequestedScope(ctx, undefined)).toThrow(OperationError);
+    expect(() => resolveRequestedScope(ctx, '__all__')).toThrow(OperationError);
   });
 });
 

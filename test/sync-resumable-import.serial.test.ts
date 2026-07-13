@@ -33,6 +33,10 @@ import {
   resolveMaxConnections,
 } from '../src/core/sync-concurrency.ts';
 import { computePoolBudgetCheck } from '../src/commands/doctor.ts';
+import { decodeSyncResumeProof } from '../src/commands/sync.ts';
+import { encodeSyncResumeProof } from '../src/commands/sync.ts';
+import { importGitCommitFile } from '../src/core/import-file.ts';
+import { syncLockId, tryAcquireDbLock } from '../src/core/db-lock.ts';
 
 let engine: PGLiteEngine;
 let repoPath: string;
@@ -106,7 +110,37 @@ describe('#1794 — resumable incremental sync (pinned target)', () => {
   });
 
   // ── A. CRITICAL: resume skips checkpointed paths (the mechanism) ──────────
-  test('[CRITICAL] resume skips paths already in the checkpoint', async () => {
+  test('[CRITICAL] writer lease blocks stale deletes and anchor advancement', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+
+    await performSync(engine, { repoPath, full: true, noPull: true, noEmbed: true });
+    const c0 = (await lastCommitConfig())!;
+    expect(await engine.getPage('notes/base')).not.toBeNull();
+
+    unlinkSync(join(repoPath, 'notes/base.md'));
+    const c1 = commitPages(repoPath, { 'replacement.md': pageMd('Replacement') }, 'replace base');
+    const held = await tryAcquireDbLock(engine, syncLockId('default'));
+    expect(held).not.toBeNull();
+    try {
+      await expect(performSync(engine, { repoPath, noPull: true, noEmbed: true }))
+        .rejects.toThrow(/another sync is in progress/i);
+      // The blocked contender must not apply its stale delete, import any new
+      // page, or advance the shared anchor while another writer owns the lease.
+      expect(await engine.getPage('notes/base')).not.toBeNull();
+      expect(await engine.getPage('notes/replacement')).toBeNull();
+      expect(await lastCommitConfig()).toBe(c0);
+    } finally {
+      await held?.release();
+    }
+
+    const converged = await performSync(engine, { repoPath, noPull: true, noEmbed: true });
+    expect(converged.status).toBe('synced');
+    expect(await engine.getPage('notes/base')).toBeNull();
+    expect(await engine.getPage('notes/replacement')).not.toBeNull();
+    expect(await lastCommitConfig()).toBe(c1);
+  }, 60_000);
+
+  test('[CRITICAL] path-only checkpoint cannot skip missing DB rows', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
 
     const full = await performSync(engine, { repoPath, full: true, noPull: true, noEmbed: true });
@@ -120,25 +154,104 @@ describe('#1794 — resumable incremental sync (pinned target)', () => {
       'd.md': pageMd('D'), 'e.md': pageMd('E'), 'f.md': pageMd('F'),
     }, 'six pages');
 
-    // Simulate a prior killed run that drained a,b,c (pinned at C1) but DID
-    // NOT import them — so if resume honors the checkpoint, a,b,c stay absent.
+    // Simulate a forged/legacy path-only checkpoint that claims a,b,c drained
+    // even though no source-scoped DB rows exist. It must be rejected.
     await seedCheckpoint(c0, c1, ['notes/a.md', 'notes/b.md', 'notes/c.md']);
 
     const res = await performSync(engine, { repoPath, noPull: true, noEmbed: true });
     expect(res.status).toBe('synced');
 
-    // d,e,f imported; a,b,c skipped (proof resumeFilter honored the checkpoint).
+    // Every page imports; path-only state is not convergence evidence.
     expect(await engine.getPage('notes/d')).not.toBeNull();
     expect(await engine.getPage('notes/e')).not.toBeNull();
     expect(await engine.getPage('notes/f')).not.toBeNull();
-    expect(await engine.getPage('notes/a')).toBeNull();
-    expect(await engine.getPage('notes/b')).toBeNull();
-    expect(await engine.getPage('notes/c')).toBeNull();
+    expect(await engine.getPage('notes/a')).not.toBeNull();
+    expect(await engine.getPage('notes/b')).not.toBeNull();
+    expect(await engine.getPage('notes/c')).not.toBeNull();
 
     // Anchor advanced to the pinned target; checkpoint cleared.
     expect(await lastCommitConfig()).toBe(c1);
     expect(await ckptPaths(c0)).toEqual([]);
     expect(await ckptTarget(c0)).toEqual([]);
+  }, 60_000);
+
+  test('[CRITICAL] proof changed after resume filtering blocks anchor advance and preserves checkpoint', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+
+    await performSync(engine, { repoPath, full: true, noPull: true, noEmbed: true });
+    const c0 = (await lastCommitConfig())!;
+    const c1 = commitPages(repoPath, { 'a.md': pageMd('A') }, 'add a');
+    const imported = await importGitCommitFile(
+      engine,
+      repoPath,
+      c1,
+      'notes/a.md',
+      { noEmbed: true, sourceId: 'default' },
+    );
+    expect(imported.status).toBe('imported');
+    const page = await engine.getPage('notes/a', { sourceId: 'default' });
+    expect(page).not.toBeNull();
+    const oid = execSync(`git rev-parse ${c1}:notes/a.md`, {
+      cwd: repoPath,
+      stdio: 'pipe',
+    }).toString().trim();
+    await seedCheckpoint(c0, c1, [encodeSyncResumeProof({
+      v: 2,
+      path: 'notes/a.md',
+      state: 'present',
+      blobOid: oid,
+      pageId: page!.id,
+      slug: page!.slug,
+      contentHash: page!.content_hash,
+    })]);
+
+    const result = await performSync(engine, {
+      repoPath,
+      noPull: true,
+      noEmbed: true,
+      _hooks: {
+        afterResumeProofsVerified: async () => {
+          // Models a pre-hardening/out-of-band writer that bypasses the source
+          // lease after the initial proof but before the bookmark decision.
+          await engine.executeRaw(
+            `UPDATE pages SET content_hash = 'out-of-band-replacement'
+              WHERE source_id = 'default' AND source_path = 'notes/a.md'`,
+          );
+        },
+      },
+    });
+
+    expect(result.status).toBe('blocked_by_failures');
+    expect(await lastCommitConfig()).toBe(c0);
+    expect((await ckptPaths(c0)).length).toBeGreaterThan(0);
+  }, 60_000);
+
+  test('[CRITICAL] proof changed after current-run import blocks anchor advance and preserves checkpoint', async () => {
+    const { performSync } = await import('../src/commands/sync.ts');
+
+    await performSync(engine, { repoPath, full: true, noPull: true, noEmbed: true });
+    const c0 = (await lastCommitConfig())!;
+    commitPages(repoPath, { 'a.md': pageMd('A') }, 'add a');
+
+    const result = await performSync(engine, {
+      repoPath,
+      noPull: true,
+      noEmbed: true,
+      _hooks: {
+        beforeBookmarkFinalize: async () => {
+          // Models a legacy writer that bypassed the source lease after this
+          // run banked its exact page proof but before the bookmark decision.
+          await engine.executeRaw(
+            `UPDATE pages SET content_hash = 'late-current-run-replacement'
+              WHERE source_id = 'default' AND source_path = 'notes/a.md'`,
+          );
+        },
+      },
+    });
+
+    expect(result.status).toBe('blocked_by_failures');
+    expect(await lastCommitConfig()).toBe(c0);
+    expect((await ckptPaths(c0)).length).toBeGreaterThan(0);
   }, 60_000);
 
   // ── B. CRITICAL: real abort banks progress, second run converges ──────────
@@ -197,19 +310,24 @@ describe('#1794 — resumable incremental sync (pinned target)', () => {
     // Simulate a started-but-unfinished run pinned at C1 (nothing drained yet).
     await seedCheckpoint(c0, c1, []);
     // The enrich process commits FORWARD past the pin while we were "down".
-    const c2 = commitPages(repoPath, { 'y.md': pageMd('Y') }, 'add y (forward drift)');
+    const c2 = commitPages(repoPath, {
+      'x.md': pageMd('X at C2'),
+      'y.md': pageMd('Y'),
+    }, 'modify x and add y (forward drift)');
     expect(c2).not.toBe(c1);
 
     // Run 1: drains C0..C1 only, advances to the PIN (C1), not live HEAD (C2).
     const r1 = await performSync(engine, { repoPath, noPull: true, noEmbed: true });
     expect(r1.status).toBe('synced');
-    expect(await engine.getPage('notes/x')).not.toBeNull();
+    expect((await engine.getPage('notes/x'))?.compiled_truth).toContain('Body for X.');
+    expect((await engine.getPage('notes/x'))?.compiled_truth).not.toContain('X at C2');
     expect(await engine.getPage('notes/y')).toBeNull(); // past the pin, not yet
     expect(await lastCommitConfig()).toBe(c1);
 
     // Run 2: now anchored at C1, diff C1..C2 picks up y.
     const r2 = await performSync(engine, { repoPath, noPull: true, noEmbed: true });
     expect(r2.status).toBe('synced');
+    expect((await engine.getPage('notes/x'))?.compiled_truth).toContain('Body for X at C2.');
     expect(await engine.getPage('notes/y')).not.toBeNull();
     expect(await lastCommitConfig()).toBe(c2);
   }, 60_000);
@@ -245,7 +363,10 @@ describe('#1794 — resumable incremental sync (pinned target)', () => {
   test('[Codex #2/#5] blocked sync leaves last_sync_at + last_commit unchanged; good file banked', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
 
-    const sid = 'srcE';
+    // Canonical source ids are lowercase kebab-case. This fixture exercises
+    // resumability, not source-id rejection, so keep it valid under the
+    // tightened resolver boundary.
+    const sid = 'src-e';
     await engine.executeRaw(
       `INSERT INTO sources (id, name, local_path) VALUES ($1, $2, $3)`,
       [sid, sid, repoPath],
@@ -288,25 +409,26 @@ describe('#1794 — resumable incremental sync (pinned target)', () => {
       const fp = syncFingerprint({ sourceId: sid, lastCommit: c0 });
       return loadOpCheckpoint(engine, { op: 'sync', fingerprint: fp });
     })();
-    expect(banked).toContain('notes/good.md');
-    expect(banked).not.toContain('notes/bad.md');
+    const bankedProofs = banked.map(decodeSyncResumeProof).filter(Boolean);
+    expect(bankedProofs.some(proof => proof?.path === 'notes/good.md')).toBe(true);
+    expect(bankedProofs.some(proof => proof?.path === 'notes/bad.md')).toBe(false);
   }, 60_000);
 
-  // ── F. Codex #3: file added in range but deleted from disk → skip, not block
-  test('[Codex #3] vanished-on-disk added file is skipped, not a failure', async () => {
+  // ── F. Commit authority: a live checkout delete cannot erase pinned bytes
+  test('[CRITICAL] vanished-on-disk added file imports from the pinned commit', async () => {
     const { performSync } = await import('../src/commands/sync.ts');
 
     await performSync(engine, { repoPath, full: true, noPull: true, noEmbed: true });
     const c1 = commitPages(repoPath, { 'keep.md': pageMd('Keep'), 'gone.md': pageMd('Gone') }, 'two pages');
 
-    // Delete gone.md from disk WITHOUT committing — it's still 'added' in the
-    // C0..C1 diff, but importFile won't find it (forward-delete simulation).
+    // Delete gone.md from disk WITHOUT committing. The pinned C1 object remains
+    // authoritative and must still be imported.
     unlinkSync(join(repoPath, 'notes/gone.md'));
 
     const res = await performSync(engine, { repoPath, noPull: true, noEmbed: true });
     expect(res.status).toBe('synced'); // NOT blocked_by_failures
     expect(await engine.getPage('notes/keep')).not.toBeNull();
-    expect(await engine.getPage('notes/gone')).toBeNull();
+    expect(await engine.getPage('notes/gone')).not.toBeNull();
     expect(await lastCommitConfig()).toBe(c1);
   }, 60_000);
 

@@ -56,7 +56,8 @@ The USD-limit knobs accept `off`, `unlimited`, or `none` (case-insensitive) to m
 Fires only when sync embeds **inline** (federated_v2 off, or `--serial` without
 `--no-embed`). Under federated_v2 + parallel, embedding is deferred to capped backfill
 jobs and the gate is informational. The estimate prices the **delta** — the files this
-sync will actually import (fetched-first, so it sees commits the run is about to pull) —
+sync will actually import (fetched-first only after origin passes the HTTPS/private-target
+policy and matches the configured source URL, so it sees commits the run is about to pull) —
 not the whole tree. A busy brain with a dirty working tree but caught-up commits
 estimates `$0`, because an attached-HEAD sync imports only the committed diff.
 
@@ -76,9 +77,19 @@ estimate is `delta + stale backlog`, labeled as such.
 
 - `~N tokens (delta: changed files since last sync)` — the precise estimate.
 - `<=N tokens (full-tree ceiling for K source(s): <reasons> …)` — a conservative
-  over-count used only when a precise delta can't be computed: a first sync, a chunker
-  version drift (forces a full re-chunk), or git being unavailable. Unchanged files
-  still skip via `content_hash` at execution, so the ceiling over-states real spend.
+  count of the immutable target commit, used only when a precise delta can't be
+  computed: a first sync, a chunker version drift (forces a full re-chunk), or git
+  being unavailable. If committed blobs cannot be read, the estimate is unavailable
+  and the gate fails closed; mutable checkout bytes are never substituted. Changed image
+  inputs also fail the numeric estimate closed instead of decoding compressed bytes as
+  UTF-8: multimodal billing cannot be safely inferred from file size, including images
+  between the 5 MB text limit and the 20 MB multimodal input limit.
+
+Authority uncertainty follows the same explicit-override contract as a known high
+estimate: `--yes` and `spend.posture=tokenmax` still authorize inline embedding.
+`--yes` remains the intentional silent bypass; tokenmax and preview output report the
+estimate and cost as unavailable. Without either override, an interactive run prompts
+and a non-interactive run safely defers embeds.
 
 ## Notes & limits
 

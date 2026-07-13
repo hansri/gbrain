@@ -10,6 +10,7 @@ import { saveConfig, loadConfig, loadConfigFileOnly, toEngineConfig, gbrainPath,
 import { createEngine } from '../core/engine-factory.ts';
 import { discoverOAuth, mintClientCredentialsToken, smokeTestMcp } from '../core/remote-mcp-probe.ts';
 import { runInitEmbedCheck } from '../core/init-embed-check.ts';
+import { getOrCreateDatabaseInstanceId } from '../core/database-instance-id.ts';
 
 export async function runInit(args: string[]) {
   // Help guard: cli.ts only routes --help to printOpHelp() for shared-op
@@ -125,7 +126,15 @@ export async function runInit(args: string[]) {
       }
     }
 
-    return initPGLite({ jsonOutput, apiKey, customPath, aiOpts, schemaPack, skipEmbedCheck });
+    return initPGLite({
+      jsonOutput,
+      apiKey,
+      customPath,
+      aiOpts,
+      schemaPack,
+      skipEmbedCheck,
+      nonInteractive: isNonInteractive,
+    });
   }
 
   // Supabase/Postgres mode
@@ -148,7 +157,15 @@ export async function runInit(args: string[]) {
     databaseUrl = await supabaseWizard();
   }
 
-  return initPostgres({ databaseUrl, jsonOutput, apiKey, aiOpts, schemaPack, skipEmbedCheck });
+  return initPostgres({
+    databaseUrl,
+    jsonOutput,
+    apiKey,
+    aiOpts,
+    schemaPack,
+    skipEmbedCheck,
+    nonInteractive: isNonInteractive,
+  });
 }
 
 interface ResolveAIOptionsArgs {
@@ -695,7 +712,7 @@ async function initRemoteMcp(opts: {
     console.log('Next steps:');
     console.log(`  1. Configure your agent's MCP client to point at ${config.remote_mcp!.mcp_url} (Claude Desktop / Hermes / openclaw).`);
     console.log('  2. Run `gbrain doctor` to re-verify connectivity at any time.');
-    console.log('  3. Run `gbrain remote ping` after writing markdown if you want the host to re-index immediately (Tier B).');
+    console.log('  3. Re-indexing is host-side; generic remote job submission is intentionally unavailable.');
   }
 }
 
@@ -784,6 +801,8 @@ async function initPGLite(opts: {
   jsonOutput: boolean;
   apiKey: string | null;
   customPath: string | null;
+  /** Explicit CLI contract: --non-interactive must never prompt, even on a TTY. */
+  nonInteractive: boolean;
   aiOpts?: ResolvedAIOptions;
   /** v0.42 (T17): schema pack to default. Stored as config.schema_pack
    *  so loadActivePack's homeConfig tier resolves it. */
@@ -893,6 +912,11 @@ async function initPGLite(opts: {
     }
 
     await engine.initSchema();
+    // Every newly initialized brain gets one database-owned UUID before init
+    // can report success. Migration receipts bind to this value instead of a
+    // route/path hash, so changing credentials, poolers, or release homes does
+    // not create a second migration authority for the same brain.
+    await getOrCreateDatabaseInstanceId(engine);
 
     // v0.37.10.0 T6 (D11): post-initSchema invariant assertion. After preflight
     // + always-configureGateway, this is structurally guaranteed to pass —
@@ -966,9 +990,13 @@ async function initPGLite(opts: {
 
     // v0.32.3 search-lite install-time mode picker. Runs AFTER initSchema so
     // DB config writes are valid. Idempotent: skipped on re-init if already set.
-    // Non-TTY auto-selects; --json emits a structured event.
+    // Non-TTY and explicit --non-interactive auto-select; --json emits a
+    // structured event.
     const { runModePicker } = await import('./init-mode-picker.ts');
-    await runModePicker(engine, { jsonOutput: opts.jsonOutput });
+    await runModePicker(engine, {
+      jsonOutput: opts.jsonOutput,
+      nonInteractive: opts.nonInteractive,
+    });
 
     const stats = await engine.getStats();
 
@@ -1007,6 +1035,8 @@ async function initPostgres(opts: {
   databaseUrl: string;
   jsonOutput: boolean;
   apiKey: string | null;
+  /** Explicit CLI contract: --non-interactive must never prompt, even on a TTY. */
+  nonInteractive: boolean;
   aiOpts?: ResolvedAIOptions;
   /** v0.42 (T17): schema pack to default. */
   schemaPack?: string;
@@ -1145,6 +1175,7 @@ async function initPostgres(opts: {
 
     console.log('Running schema migration...');
     await engine.initSchema();
+    await getOrCreateDatabaseInstanceId(engine);
 
     // v0.37.10.0 T6 (D11): post-initSchema invariant assertion guardrail.
     if (resolvedDim) {
@@ -1208,7 +1239,10 @@ async function initPostgres(opts: {
     // v0.32.3 search-lite install-time mode picker. Same shape as the
     // PGLite path above — runs AFTER initSchema, idempotent on re-init.
     const { runModePicker: runPostgresModePicker } = await import('./init-mode-picker.ts');
-    await runPostgresModePicker(engine, { jsonOutput: opts.jsonOutput });
+    await runPostgresModePicker(engine, {
+      jsonOutput: opts.jsonOutput,
+      nonInteractive: opts.nonInteractive,
+    });
 
     const stats = await engine.getStats();
 

@@ -17,7 +17,10 @@ Your agent now reads `skills/RESOLVER.md` once per request, routes intent to the
 
 Scaffolded skills are first-class files in your agent repo — edit freely. To pull upstream gbrain improvements later, `gbrain skillpack reference <name>` diffs your local copy vs the bundle. The legacy `skillpack install` managed-block model was retired in v0.36.0.0; if you're upgrading from an older release, run `gbrain skillpack migrate-fence` once to strip the legacy fence and keep your existing skill rows.
 
-To upgrade later: `gbrain upgrade` runs schema migrations + post-upgrade prompts (chunker bumps, the v0.36.2.0 ZeroEntropy switch). Always TTY-only; non-TTY upgrades skip prompts with informational stderr lines.
+To upgrade later, read every skipped version's `skills/migrations/v*.md` first.
+The normal `gbrain upgrade` path runs schema migrations and post-upgrade
+prompts, but a migration guide may require a supervised staged release before
+that shortcut is safe.
 
 ## 2. CLI standalone
 
@@ -28,7 +31,15 @@ bun install -g github:garrytan/gbrain
 gbrain init --pglite
 ```
 
-> **If `bun install -g` hits a postinstall error** (Bun blocks postinstall hooks in some environments), the CLI prints a recovery hint pointing at [#218](https://github.com/garrytan/gbrain/issues/218). Run `gbrain doctor` to diagnose, then `gbrain apply-migrations --yes` manually. The deterministic fallback is `git clone https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain && bun install && bun link`.
+> **Package postinstall is deliberately non-mutating.** It installs
+> the CLI and prints the explicit migration step without opening any configured
+> brain. Run `gbrain doctor`, take the required backup, follow release-specific
+> `upgrade-preflight` instructions, and only then run `gbrain apply-migrations
+> --yes` through the exact staged/current-release binary. Postinstall has no
+> migration opt-in and never selects a `gbrain` executable from `PATH`. If
+> install itself fails, the deterministic fallback is `git clone
+> https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain && bun install
+> && bun link`.
 
 The init flow detects your repo size and suggests Supabase for brains > 1000 markdown files. To switch later:
 

@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { v0_22_4 } from '../src/commands/migrations/v0_22_4.ts';
 import { migrations, getMigration } from '../src/commands/migrations/index.ts';
+import { migrationTestOpts } from './helpers/migration-opts.ts';
 
 describe('v0.22.4 migration (B11)', () => {
   test('exports a Migration with the right version', () => {
@@ -28,11 +29,11 @@ describe('v0.22.4 migration (B11)', () => {
   });
 
   test('dry-run orchestrator returns complete with all phases skipped', async () => {
-    const result = await v0_22_4.orchestrator({
+    const result = await v0_22_4.orchestrator(migrationTestOpts({
       yes: true,
       dryRun: true,
       noAutopilotInstall: true,
-    });
+    }));
     expect(result.version).toBe('0.22.4');
     expect(result.phases.length).toBe(3);
     for (const p of result.phases) {
@@ -45,7 +46,7 @@ describe('v0.22.4 migration (B11)', () => {
 
   test('phaseASchema is a no-op (returns complete with the no-changes hint)', async () => {
     const { __testing } = await import('../src/commands/migrations/v0_22_4.ts');
-    const result = __testing.phaseASchema({ yes: true, dryRun: false, noAutopilotInstall: true });
+    const result = __testing.phaseASchema(migrationTestOpts());
     expect(result.name).toBe('schema');
     expect(result.status).toBe('complete');
     expect(result.detail).toContain('no schema changes');
@@ -53,8 +54,20 @@ describe('v0.22.4 migration (B11)', () => {
 
   test('exports paths used for audit + pending-host-work outputs', async () => {
     const { __testing } = await import('../src/commands/migrations/v0_22_4.ts');
-    expect(__testing.auditReportPath()).toMatch(/v0\.22\.4-audit\.json$/);
-    expect(__testing.pendingHostWorkPath()).toMatch(/pending-host-work\.jsonl$/);
+    const fs = await import('fs');
+    const path = await import('path');
+    const os = await import('os');
+    const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-v0_22_4-path-test-'));
+    const origGbrainHome = process.env.GBRAIN_HOME;
+    process.env.GBRAIN_HOME = stateRoot;
+    try {
+      expect(__testing.auditReportPath()).toBe(path.join(stateRoot, '.gbrain', 'migrations', 'v0.22.4-audit.json'));
+      expect(__testing.pendingHostWorkPath()).toBe(path.join(stateRoot, '.gbrain', 'migrations', 'pending-host-work.jsonl'));
+    } finally {
+      if (origGbrainHome === undefined) delete process.env.GBRAIN_HOME;
+      else process.env.GBRAIN_HOME = origGbrainHome;
+      fs.rmSync(stateRoot, { recursive: true, force: true });
+    }
   });
 
   test('dotted migration filename references — emit-todo entries point at v0.22.4.md', async () => {
@@ -71,9 +84,9 @@ describe('v0.22.4 migration (B11)', () => {
     const fs = await import('fs');
     const path = await import('path');
     const os = await import('os');
-    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-migration-test-'));
-    const origHome = process.env.HOME;
-    process.env.HOME = tmpHome;
+    const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gbrain-migration-test-'));
+    const origGbrainHome = process.env.GBRAIN_HOME;
+    process.env.GBRAIN_HOME = stateRoot;
     try {
       const fakeReport = {
         ok: false,
@@ -116,7 +129,7 @@ describe('v0.22.4 migration (B11)', () => {
         aborted_at_source: null,
       };
       const r = __testing.phaseCEmitTodo(
-        { yes: true, dryRun: false, noAutopilotInstall: true },
+        migrationTestOpts(),
         fakeReport,
       );
       expect(r.status).toBe('complete');
@@ -129,7 +142,7 @@ describe('v0.22.4 migration (B11)', () => {
       expect(ids).toEqual(['archive', 'wiki']);
       // Idempotency: re-running emit doesn't duplicate.
       __testing.phaseCEmitTodo(
-        { yes: true, dryRun: false, noAutopilotInstall: true },
+        migrationTestOpts(),
         fakeReport,
       );
       const lines2 = fs.readFileSync(__testing.pendingHostWorkPath(), 'utf8').split('\n').filter(Boolean);
@@ -142,8 +155,9 @@ describe('v0.22.4 migration (B11)', () => {
         expect(e.command).toContain('--fix');
       }
     } finally {
-      process.env.HOME = origHome;
-      fs.rmSync(tmpHome, { recursive: true, force: true });
+      if (origGbrainHome === undefined) delete process.env.GBRAIN_HOME;
+      else process.env.GBRAIN_HOME = origGbrainHome;
+      fs.rmSync(stateRoot, { recursive: true, force: true });
     }
   });
 });

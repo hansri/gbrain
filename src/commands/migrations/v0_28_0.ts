@@ -30,8 +30,8 @@ import type {
   Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult,
 } from './types.ts';
 import type { BrainEngine } from '../../core/engine.ts';
-import { loadConfig, toEngineConfig, gbrainPath } from '../../core/config.ts';
-import { createEngine } from '../../core/engine-factory.ts';
+import { gbrainPath } from '../../core/config.ts';
+import { openMigrationEngine } from './snapshot.ts';
 
 let testEngineOverride: BrainEngine | null = null;
 export function __setTestEngineOverride(engine: BrainEngine | null): void {
@@ -186,20 +186,14 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
 
   const phases: OrchestratorPhaseResult[] = [];
 
-  // Acquire engine for phases that need it. Skip cleanly when none configured.
+  // Acquire only the engine captured by apply-migrations.
   let engine: BrainEngine | null = null;
   let ownsEngine = false;
   try {
-    if (testEngineOverride) {
-      engine = testEngineOverride;
-    } else {
-      const config = loadConfig();
-      if (config) {
-        const engineConfig = toEngineConfig(config);
-        engine = await createEngine(engineConfig);
-        await engine.connect(engineConfig);
-        ownsEngine = true;
-      }
+    if (!opts.dryRun) {
+      const opened = await openMigrationEngine(opts, testEngineOverride);
+      engine = opened.engine;
+      ownsEngine = opened.ownsEngine;
     }
 
     phases.push(await phaseASchema(engine, opts));

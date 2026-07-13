@@ -32,6 +32,17 @@ export interface OrchestratorOpts {
   hostDir?: string;
   /** Skip autopilot install (Phase F). */
   noAutopilotInstall: boolean;
+  /** Concrete database identity captured once by the migration runner. */
+  brainId: string;
+  /** Immutable engine config snapshot paired with brainId for every phase. */
+  engineConfig: import('../../core/types.ts').EngineConfig;
+  /** Full immutable config snapshot used for gateway/schema dimension setup. */
+  gbrainConfig: import('../../core/config.ts').GBrainConfig;
+  /**
+   * Bound post-upgrade authority. Present only when the upgrade transition,
+   * not an ordinary apply-migrations invocation, started this orchestrator.
+   */
+  upgradeTransition?: import('../../core/upgrade-child-capability.ts').UpgradeChildTransition;
 }
 
 export interface OrchestratorPhaseResult {

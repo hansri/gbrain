@@ -73,6 +73,7 @@ describe('binary self-update — real swap E2E', () => {
     try {
       expect(versionOf(target)).toBe('gbrain 0.42.0');
       const result = await runBinarySelfUpdate(target, {
+        expectedVersion: '0.43.0',
         fetchRelease: async () => ({ tag: 'v0.43.0', assets: assets(`${base}/good-asset`) }),
         platform: 'linux',
         arch: 'x64',
@@ -82,6 +83,23 @@ describe('binary self-update — real swap E2E', () => {
       // The running "binary" was atomically replaced; a fresh exec sees the new version.
       expect(versionOf(target)).toBe('gbrain 0.43.0');
       expect(tmpLeftovers(dir)).toEqual([]); // staged temp renamed away, none left
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('staged binary version mismatch fails before atomic replacement', async () => {
+    const { dir, target } = makeTargetBinary();
+    try {
+      const result = await runBinarySelfUpdate(target, {
+        expectedVersion: '0.42.9',
+        fetchRelease: async () => ({ tag: 'v0.42.9', assets: assets(`${base}/good-asset`) }),
+        platform: 'linux',
+        arch: 'x64',
+      });
+      expect(result).toMatchObject({ ok: false, reason: 'smoke_failed' });
+      expect(versionOf(target)).toBe('gbrain 0.42.0');
+      expect(tmpLeftovers(dir)).toEqual([]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

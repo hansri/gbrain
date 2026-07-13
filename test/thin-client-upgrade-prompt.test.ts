@@ -28,6 +28,8 @@ import {
   _setVerifierForTest,
   _setPromptReaderForTest,
   _setUpgradeRunnerForTest,
+  resolveThinClientUpgradeInvocation,
+  isExactApprovedUpgrade,
   type PromptState,
 } from '../src/core/thin-client-upgrade-prompt.ts';
 import type { CliOptions } from '../src/core/cli-options.ts';
@@ -75,13 +77,10 @@ describe('safeCompare', () => {
     expect(safeCompare('0.32.0', '0.31.11')).toBe(1);
     expect(safeCompare('1.0.0', '0.99.99')).toBe(1);
   });
-  test('4-segment versions parse (4th segment ignored by underlying comparator)', () => {
-    // Underlying compareVersions from src/commands/migrations/index.ts only
-    // compares segments 0-2 — the 4th segment is intentionally ignored. This
-    // matches gbrain's actual 3-segment release practice (VERSION file).
+  test('4-segment versions compare all release components', () => {
     expect(safeCompare('0.31.4.0', '0.31.4.0')).toBe(0);
-    expect(safeCompare('0.31.4.1', '0.31.4.2')).toBe(0); // 4th segment ignored
-    expect(safeCompare('0.31.4.0', '0.31.5.0')).toBe(-1); // segment 2 differs
+    expect(safeCompare('0.31.4.1', '0.31.4.2')).toBe(-1);
+    expect(safeCompare('0.31.4.0', '0.31.5.0')).toBe(-1);
   });
   test('empty / missing / non-numeric returns null', () => {
     expect(safeCompare('', '0.31.4')).toBe(null);
@@ -92,6 +91,15 @@ describe('safeCompare', () => {
     expect(safeCompare('0.31.x', '0.31.4')).toBe(null);
     expect(safeCompare('a.b.c', '0.31.4')).toBe(null);
     expect(safeCompare('0.31.4.5.6', '0.31.4')).toBe(null); // 5-segment
+  });
+});
+
+describe('exact approved upgrade target', () => {
+  test('accepts only equality, never a stale or raced-ahead install', () => {
+    expect(isExactApprovedUpgrade('0.32.0', '0.32.0')).toBe(true);
+    expect(isExactApprovedUpgrade('0.31.9', '0.32.0')).toBe(false);
+    expect(isExactApprovedUpgrade('0.33.0', '0.32.0')).toBe(false);
+    expect(isExactApprovedUpgrade('invalid', '0.32.0')).toBe(false);
   });
 });
 
@@ -360,6 +368,20 @@ describe('decideAction', () => {
     expect(decideAction({ ...baseInput, state })).toEqual({ kind: 'noop' });
   });
 
+  test('sticky supervised boundary (same remote version) → noop', () => {
+    const state: PromptState = {
+      schema_version: 1,
+      entries: {
+        'https://brain.example.com': {
+          last_prompted_remote_version: '0.32.0',
+          last_response: 'supervised',
+          last_prompted_at_iso: '2026-05-10T12:00:00Z',
+        },
+      },
+    };
+    expect(decideAction({ ...baseInput, state })).toEqual({ kind: 'noop' });
+  });
+
   test('failed prior attempt → re-prompt fresh', () => {
     const state: PromptState = {
       schema_version: 1,
@@ -387,6 +409,35 @@ describe('decideAction', () => {
     };
     // Remote bumped from 0.32.0 to 0.33.0
     expect(decideAction({ ...baseInput, state, remoteVersion: '0.33.0' })).toEqual({ kind: 'prompt', level: 'minor' });
+  });
+});
+
+describe('exact current-release invocation', () => {
+  test('hostile PATH cannot replace upgrade or version verification argv', async () => {
+    await withEnv({ PATH: '/tmp/hostile-path-only' }, () => {
+      const compiledRuntime = {
+        execPath: '/trusted/release/gbrain',
+        main: '/ignored/source.ts',
+      };
+      expect(resolveThinClientUpgradeInvocation(
+        ['upgrade', '--target', '0.32.0'], compiledRuntime,
+      )).toEqual(['/trusted/release/gbrain', 'upgrade', '--target', '0.32.0']);
+      expect(resolveThinClientUpgradeInvocation(['--version'], compiledRuntime))
+        .toEqual(['/trusted/release/gbrain', '--version']);
+
+      const sourceRuntime = {
+        execPath: '/trusted/runtime/bun',
+        main: '/trusted/release/src/cli.ts',
+      };
+      expect(resolveThinClientUpgradeInvocation(
+        ['upgrade', '--target', '0.32.0'], sourceRuntime,
+      )).toEqual([
+        '/trusted/runtime/bun', '/trusted/release/src/cli.ts',
+        'upgrade', '--target', '0.32.0',
+      ]);
+      expect(resolveThinClientUpgradeInvocation(['--version'], sourceRuntime))
+        .toEqual(['/trusted/runtime/bun', '/trusted/release/src/cli.ts', '--version']);
+    });
   });
 });
 
@@ -507,11 +558,53 @@ describe('maybePromptForUpgrade orchestrator', () => {
     });
   });
 
+  test('supervised release is recorded once and never prompts or runs inline upgrade', async () => {
+    await withEnv({ GBRAIN_HOME: tmpHome }, async () => {
+      let prompted = false;
+      let upgradeRan = false;
+      const logs: string[] = [];
+      _setPromptReaderForTest(async () => { prompted = true; return 'y'; });
+      _setUpgradeRunnerForTest(() => { upgradeRan = true; });
+
+      const run = () => maybePromptForUpgrade(
+        cfg,
+        { version: '0.42.59.0' },
+        DEFAULT_CLI_OPTS,
+        false,
+        {
+          localVersion: '0.41.0.0',
+          exit: ((code: number) => {
+            throw new Error(`unexpected exit ${code}`);
+          }) as (code: number) => never,
+          log: (message: string) => { logs.push(message); },
+          stdinIsTty: true,
+          stdoutIsTty: true,
+        },
+      );
+
+      await run();
+      await run();
+
+      expect(prompted).toBe(false);
+      expect(upgradeRan).toBe(false);
+      expect(logs).toHaveLength(1);
+      expect(logs[0]).toContain('supervised staged promotion');
+      expect(loadPromptState().entries[cfg.remote_mcp!.mcp_url]).toMatchObject({
+        last_prompted_remote_version: '0.42.59.0',
+        last_response: 'supervised',
+      });
+    });
+  });
+
   test('prompt → "y" → upgrade runs → advanced → state=yes, exit 0', async () => {
     await withEnv({ GBRAIN_HOME: tmpHome }, async () => {
       _setPromptReaderForTest(async () => 'y');
       let upgradeRan = false;
-      _setUpgradeRunnerForTest(() => { upgradeRan = true; });
+      let upgradeTarget = '';
+      _setUpgradeRunnerForTest((target) => {
+        upgradeRan = true;
+        upgradeTarget = target;
+      });
       _setVerifierForTest(() => ({ advanced: true, newVersion: '0.32.0' }));
 
       let exitCode = -1;
@@ -529,6 +622,7 @@ describe('maybePromptForUpgrade orchestrator', () => {
       }
 
       expect(upgradeRan).toBe(true);
+      expect(upgradeTarget).toBe('0.32.0');
       expect(exitCode).toBe(0);
       const state = loadPromptState();
       expect(state.entries[cfg.remote_mcp!.mcp_url].last_response).toBe('yes');

@@ -22,7 +22,7 @@
  */
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
@@ -213,15 +213,27 @@ describe('Lane C.3 — env ZEROENTROPY_API_KEY merges into loadConfig', () => {
 // ─────────────────────────────────────────────────────────────────────
 describe('Lane D.2 — embed pre-flight catches dim mismatch before worker pool', () => {
   let engine: PGLiteEngine;
+  let priorHome: string | undefined;
+  let testHome: string;
 
   // Fully self-contained: configure gateway EXPLICITLY so schema dim is
   // deterministic regardless of earlier tests' state. resetGateway() at
   // teardown so we don't poison downstream tests.
   beforeAll(async () => {
+    priorHome = process.env.GBRAIN_HOME;
+    testHome = mkdtempSync(join(tmpdir(), 'gbrain-v37-d2-'));
+    mkdirSync(join(testHome, '.gbrain'), { recursive: true, mode: 0o700 });
+    writeFileSync(join(testHome, '.gbrain', 'config.json'), JSON.stringify({
+      engine: 'pglite',
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: 1536,
+      embedding_disabled: false,
+    }));
+    process.env.GBRAIN_HOME = testHome;
     configureGateway({
       embedding_model: 'openai:text-embedding-3-large',
       embedding_dimensions: 1536,
-      env: { ...process.env },
+      env: { ...process.env, OPENAI_API_KEY: 'test-key' },
     });
     engine = new PGLiteEngine();
     await engine.connect({});
@@ -238,8 +250,11 @@ describe('Lane D.2 — embed pre-flight catches dim mismatch before worker pool'
     configureGateway({
       embedding_model: 'openai:text-embedding-3-large',
       embedding_dimensions: 1536,
-      env: { ...process.env },
+      env: { ...process.env, OPENAI_API_KEY: 'test-key' },
     });
+    rmSync(testHome, { recursive: true, force: true });
+    if (priorHome === undefined) delete process.env.GBRAIN_HOME;
+    else process.env.GBRAIN_HOME = priorHome;
   });
 
   test('schema=1536 + gateway=ZE/1280 → runEmbedCore throws EmbeddingDimMismatchError before transport fires', async () => {

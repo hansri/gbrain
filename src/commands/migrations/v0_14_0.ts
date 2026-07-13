@@ -25,9 +25,9 @@ import { existsSync, readFileSync, mkdirSync, appendFileSync } from 'fs';
 import { join } from 'path';
 
 import type { Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult } from './types.ts';
-import { loadConfig, toEngineConfig, gbrainPath } from '../../core/config.ts';
-import { createEngine } from '../../core/engine-factory.ts';
+import { gbrainPath } from '../../core/config.ts';
 import type { BrainEngine } from '../../core/engine.ts';
+import { openMigrationEngine } from './snapshot.ts';
 
 // gbrainPath() honors GBRAIN_HOME at call time (not module-load) and routes
 // through the centralized config dir, so the prior resolveHome()/HOME-env
@@ -43,16 +43,9 @@ async function phaseASchema(opts: OrchestratorOpts): Promise<{ result: Orchestra
   if (opts.dryRun) {
     return { result: { name: 'schema', status: 'skipped', detail: 'dry-run' }, engine: null };
   }
+  let engine: BrainEngine | null = null;
   try {
-    const config = loadConfig();
-    if (!config) {
-      return {
-        result: { name: 'schema', status: 'skipped', detail: 'no brain configured (run gbrain init first)' },
-        engine: null,
-      };
-    }
-    const engine = await createEngine(toEngineConfig(config));
-    await engine.connect(toEngineConfig(config));
+    engine = (await openMigrationEngine(opts)).engine;
     try {
       // Both Postgres and PGLite accept this ALTER. Idempotent at the
       // table level — setting the default to 3 twice is fine.
@@ -72,6 +65,9 @@ async function phaseASchema(opts: OrchestratorOpts): Promise<{ result: Orchestra
     }
     return { result: { name: 'schema', status: 'complete' }, engine };
   } catch (e) {
+    if (engine) {
+      try { await engine.disconnect(); } catch { /* best-effort */ }
+    }
     return {
       result: { name: 'schema', status: 'failed', detail: e instanceof Error ? e.message : String(e) },
       engine: null,

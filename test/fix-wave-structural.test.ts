@@ -96,21 +96,21 @@ describe('v0.36.1.x #1077 — admin register-client supports PKCE public clients
 });
 
 describe('v0.41.37.0 #1605 — v0.11.0 phaseASchema routes in-process for ALL engines', () => {
-  test('phaseASchema calls runMigrateOnlyCore (in-process) + is awaited', () => {
+  test('phaseASchema calls the snapshotted in-process helper + is awaited', () => {
     // Supersedes #1100's PGLite-only in-process branch. v0.41.37.0 #1605 routes
-    // EVERY engine through runMigrateOnlyCore (no execSync subprocess at all),
+    // EVERY engine through the runMigrateOnlyCore-backed snapshot helper,
     // which is strictly stronger: PGLite still never subprocesses, AND the
     // Windows+Postgres getaddrinfo-ENOTFOUND spawn bug is closed too.
     // The eng.initSchema() call moved into src/commands/migrations/in-process.ts.
     const src = readFileSync('src/commands/migrations/v0_11_0.ts', 'utf8');
-    expect(src).toContain('runMigrateOnlyCore()');
+    expect(src).toContain('runSnapshotMigrateOnly(opts)');
     expect(src).not.toContain("execSync('gbrain init --migrate-only'");
     expect(src).toMatch(/await\s+phaseASchema/);
   });
 
   test('apply-migrations skips pre-flight schema-version probe on PGLite', () => {
     const src = readFileSync('src/commands/apply-migrations.ts', 'utf8');
-    expect(src).toMatch(/skipPreflight\s*=\s*cfg\.engine\s*===\s*'pglite'/);
+    expect(src).toContain("if (snapshot.engineConfig.engine !== 'pglite')");
   });
 });
 

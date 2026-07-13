@@ -4,18 +4,13 @@
  * handler) and routes it through `importFromContent` to land as a brain
  * page.
  *
- * Trust posture (E1 + eng-review decisions):
- *   - The event's `untrusted_payload` flag is preserved on the job's
- *     result for audit, but does NOT change the importFromContent call
- *     itself — auto-link runs at the put_page operation layer, which we
- *     deliberately bypass here. The handler calls importFromContent
- *     directly. v1 path: webhook OAuth gate is the trust boundary; the
- *     handler trusts the event-shape but treats content as user-authored
- *     markdown.
- *   - Auto-link integration with the untrusted_payload tag is a v2
- *     improvement (would require routing through the put_page op AND
- *     extending OperationContext with the trust tag). See TODOs in the
- *     plan.
+ * Trust posture:
+ *   - source_id and evidence provenance are threaded into importFromContent;
+ *     the handler never falls back to the process/default source.
+ *   - HTTP submitters must carry the exact server-built envelope:
+ *     job.data.remote=true, untrusted_payload=true, and matching source ids.
+ *   - Local daemon/CLI submissions must carry the queue-stamped local marker.
+ *     Missing/legacy envelopes are rejected instead of being treated trusted.
  *
  * Slug resolution (in order):
  *   1. `job.data.slug` if caller provided one
@@ -34,6 +29,7 @@ import type { BrainEngine } from '../../engine.ts';
 import type { IngestionEvent } from '../../ingestion/types.ts';
 import { validateIngestionEvent } from '../../ingestion/types.ts';
 import { importFromContent } from '../../import-file.ts';
+import { isTrustedLocalIngestJobData } from '../ingest-boundary.ts';
 
 export interface IngestCaptureResult {
   slug: string;
@@ -55,7 +51,13 @@ export function defaultSlugForEvent(event: IngestionEvent, now: Date = new Date(
 
 export function makeIngestCaptureHandler(engine: BrainEngine) {
   return async function ingestCaptureHandler(job: MinionJobContext): Promise<IngestCaptureResult> {
-    const data = job.data as { event?: unknown; slug?: unknown };
+    const data = job.data as {
+      event?: unknown;
+      sourceId?: unknown;
+      slug?: unknown;
+      remote?: unknown;
+      noEmbed?: unknown;
+    };
     const event = data.event as IngestionEvent | undefined;
     if (!event) {
       throw new Error('ingest_capture: job.data.event is required');
@@ -78,10 +80,36 @@ export function makeIngestCaptureHandler(engine: BrainEngine) {
       slug = defaultSlugForEvent(event);
     }
 
-    // Untrusted-payload posture. For v1, the flag is propagated for audit
-    // but not enforced at this layer (see file header). Future v2 wiring
-    // through put_page will use this flag.
-    const untrustedPayload = event.untrusted_payload === true;
+    if (data.remote !== undefined && typeof data.remote !== 'boolean') {
+      throw new Error('ingest_capture: job.data.remote must be boolean when present');
+    }
+    if (data.sourceId !== undefined && typeof data.sourceId !== 'string') {
+      throw new Error('ingest_capture: job.data.sourceId must be string when present');
+    }
+    const sourceId = typeof data.sourceId === 'string' ? data.sourceId : event.source_id;
+    if (sourceId !== event.source_id) {
+      throw new Error('ingest_capture: job sourceId does not match event.source_id');
+    }
+
+    // Fail closed across the durable queue boundary. A job is accepted only as:
+    //   1) a queue-stamped local submission with explicit remote=false, or
+    //   2) the exact HTTP envelope built after authentication.
+    // Legacy/spoofed rows with remote=false + untrusted_payload=false but no
+    // queue marker are rejected, so a pre-fix remote submission cannot be
+    // claimed later and silently upgraded to trusted content.
+    const trustedLocal = isTrustedLocalIngestJobData(job.data) && data.remote === false;
+    const authenticatedRemoteEnvelope =
+      !isTrustedLocalIngestJobData(job.data) &&
+      data.remote === true &&
+      event.untrusted_payload === true &&
+      typeof data.sourceId === 'string';
+    if (!trustedLocal && !authenticatedRemoteEnvelope) {
+      throw new Error(
+        'ingest_capture: missing trusted local marker or authenticated remote envelope',
+      );
+    }
+    const untrustedPayload = !trustedLocal || event.untrusted_payload === true;
+    const remote = untrustedPayload;
 
     // For text-typed events, content is the inline markdown/text. For
     // binary types (image/audio/video/pdf), content is a path-or-URI that
@@ -111,9 +139,16 @@ export function makeIngestCaptureHandler(engine: BrainEngine) {
     // embed runs as a separate Minion job (autopilot's embed phase OR an
     // explicit `gbrain embed --stale`). Callers can opt in to inline embed
     // by passing { noEmbed: false } in job.data.
-    const noEmbed = (data as { noEmbed?: unknown }).noEmbed !== false;
+    const noEmbed = data.noEmbed !== false;
 
-    const result = await importFromContent(engine, slug, event.content, { noEmbed });
+    const result = await importFromContent(engine, slug, event.content, {
+      noEmbed,
+      sourceId,
+      source_kind: event.source_kind,
+      source_uri: event.source_uri,
+      ingested_via: remote ? 'http:ingest' : `ingestion:${event.source_kind}`,
+      remote,
+    });
 
     return {
       slug,

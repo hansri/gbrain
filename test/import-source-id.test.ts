@@ -13,7 +13,7 @@
  * Hermetic PGLite in-memory.
  */
 
-import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeAll, afterAll, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -37,6 +37,7 @@ async function truncatePages(): Promise<void> {
     await (engine as any).db.exec(`DELETE FROM ${t}`);
   }
   await (engine as any).db.exec(`DELETE FROM sources WHERE id <> 'default'`);
+  await (engine as any).db.exec(`DELETE FROM config WHERE key = 'sources.default'`);
 }
 
 describe('import --source-id (#1167)', () => {
@@ -56,6 +57,10 @@ describe('import --source-id (#1167)', () => {
       join(scratchDir, 'wiki', 'beta.md'),
       '---\ntype: note\n---\n# Beta\n\nContent of beta.',
     );
+  });
+
+  afterEach(() => {
+    rmSync(scratchDir, { recursive: true, force: true });
   });
 
   test('without --source-id, pages land in default source', async () => {
@@ -98,5 +103,59 @@ describe('import --source-id (#1167)', () => {
       `SELECT source_id FROM pages LIMIT 1`,
     );
     expect(rows[0]?.source_id).toBe('dept-x');
+  });
+
+  test('implicit import honors a trusted .gbrain-source in the imported tree', async () => {
+    writeFileSync(join(scratchDir, '.gbrain-source'), 'dept-x\n');
+
+    await runImport(engine, [scratchDir, '--no-embed', '--json']);
+
+    const rows = await engine.executeRaw<{ source_id: string }>(
+      `SELECT source_id FROM pages`,
+    );
+    expect(rows.length).toBeGreaterThanOrEqual(2);
+    expect(rows.every(row => row.source_id === 'dept-x')).toBe(true);
+  });
+
+  test('implicit import honors the source whose local_path owns the imported tree', async () => {
+    await engine.executeRaw(
+      `UPDATE sources SET local_path = $1 WHERE id = 'dept-x'`,
+      [scratchDir],
+    );
+
+    await runImport(engine, [scratchDir, '--no-embed', '--json']);
+
+    const rows = await engine.executeRaw<{ source_id: string }>(
+      `SELECT source_id FROM pages`,
+    );
+    expect(rows.length).toBeGreaterThanOrEqual(2);
+    expect(rows.every(row => row.source_id === 'dept-x')).toBe(true);
+  });
+
+  test('implicit import honors sources.default when no path signal exists', async () => {
+    await engine.setConfig('sources.default', 'dept-x');
+
+    await runImport(engine, [scratchDir, '--no-embed', '--json']);
+
+    const rows = await engine.executeRaw<{ source_id: string }>(
+      `SELECT source_id FROM pages`,
+    );
+    expect(rows.length).toBeGreaterThanOrEqual(2);
+    expect(rows.every(row => row.source_id === 'dept-x')).toBe(true);
+  });
+
+  test('--json emits exactly one JSON document on stdout', async () => {
+    const stdout: string[] = [];
+    const originalLog = console.log;
+    console.log = (...parts: unknown[]) => { stdout.push(parts.map(String).join(' ')); };
+    try {
+      await runImport(engine, [scratchDir, '--no-embed', '--json']);
+    } finally {
+      console.log = originalLog;
+    }
+
+    expect(stdout).toHaveLength(1);
+    expect(() => JSON.parse(stdout[0]!)).not.toThrow();
+    expect(JSON.parse(stdout[0]!).status).toBe('success');
   });
 });

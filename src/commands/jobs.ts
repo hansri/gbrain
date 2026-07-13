@@ -297,18 +297,34 @@ HANDLER TYPES (built in)
         process.exit(1);
       }
 
-      // The CLI path is a trusted submitter. Pass {allowProtectedSubmit: true}
-      // ONLY for protected names, not blanket-set for every submission, so any
-      // future protected name forces explicit opt-in at the call site.
+      // The CLI process is a trusted local submitter. Keep both capabilities
+      // out of caller-controlled --params JSON: protected names opt in
+      // explicitly, and ingest_capture receives the durable local marker only
+      // through MinionQueue.add's separate trusted argument.
       const { isProtectedJobName } = await import('../core/minions/protected-names.ts');
-      const trusted = isProtectedJobName(name) ? { allowProtectedSubmit: true } : undefined;
+      const jobName = name.trim();
+      const protectedJob = isProtectedJobName(jobName);
+      const localIngest = jobName === 'ingest_capture';
+      const trusted = protectedJob || localIngest
+        ? {
+            ...(protectedJob ? { allowProtectedSubmit: true } : {}),
+            ...(localIngest ? { allowTrustedLocalIngest: true } : {}),
+          }
+        : undefined;
+
+      // remote/local classification is also server-owned. A local operator
+      // does not need to remember an internal trust field, and --params cannot
+      // make this local CLI call look like the authenticated HTTP envelope.
+      if (localIngest) {
+        data = { ...data, remote: false };
+      }
 
       // v0.35.8.0: pre-enqueue shell-job validation. Validates `inherit:`
       // closed enum, rejects secret env-keys, fail-fasts on missing config.
       // Throws UnrecoverableError BEFORE `queue.add` so a bad payload never
       // lands in `minion_jobs.data`. Defense-in-depth re-validation happens
       // in the worker handler. See: src/core/minions/handlers/shell-validate.ts
-      if (name.trim() === 'shell') {
+      if (jobName === 'shell') {
         try {
           const { validateShellJobParams } = await import('../core/minions/handlers/shell-validate.ts');
           validateShellJobParams(data);
@@ -1580,16 +1596,35 @@ export async function registerBuiltinHandlers(
   });
 
   worker.register('import', async (job) => {
-    // import.ts Core extraction deferred to v0.12.0 (import has parallel
-    // workers + checkpointing). Keep the CLI wrapper call but note the
-    // worker-kill risk is bounded: import's only process.exit fires on
-    // a missing dir arg, which this handler always passes.
-    const { runImport } = await import('./import.ts');
+    const { runImport, ImportInvocationError } = await import('./import.ts');
     const importArgs: string[] = [];
     if (job.data.dir) importArgs.push(String(job.data.dir));
     if (job.data.noEmbed) importArgs.push('--no-embed');
-    await runImport(engine, importArgs);
-    return { imported: true };
+    if (job.data.workers !== undefined) importArgs.push('--workers', String(job.data.workers));
+    const sourceId = typeof job.data.sourceId === 'string' ? job.data.sourceId : undefined;
+    let result;
+    try {
+      result = await runImport(engine, importArgs, { sourceId });
+    } catch (error) {
+      if (!(error instanceof ImportInvocationError)) throw error;
+      const failed = new Error(
+        `Import job rejected (${error.importResult.code}): ${error.message}`,
+        { cause: error },
+      ) as Error & { importResult?: typeof error.importResult; exitCode?: number };
+      failed.importResult = error.importResult;
+      failed.exitCode = error.exitCode;
+      throw failed;
+    }
+    if (result.exitCode !== 0 || result.status !== 'success') {
+      const error = new Error(
+        `Import job ${result.status} (exitCode=${result.exitCode}, ` +
+        `${result.failures.length} failure(s)); checkpoint preserved for retry`,
+      ) as Error & { importResult?: typeof result; exitCode?: number };
+      error.importResult = result;
+      error.exitCode = result.exitCode;
+      throw error;
+    }
+    return result;
   });
 
   worker.register('extract', async (job) => {

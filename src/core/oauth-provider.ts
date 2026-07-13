@@ -178,7 +178,8 @@ interface GBrainOAuthProviderOptions {
   refreshTtl?: number;
   /**
    * Disable Dynamic Client Registration (RFC 7591) while keeping the rest of
-   * the OAuth surface intact. When true, `clientsStore.registerClient` is not
+   * the OAuth surface intact. Defaults to true. When true,
+   * `clientsStore.registerClient` is not
    * surfaced to the SDK router, so POST `/register` returns 404 even though
    * the underlying provider can still register clients programmatically via
    * `registerClientManual`. Replaces the previous monkey-patching pattern in
@@ -187,13 +188,14 @@ interface GBrainOAuthProviderOptions {
    */
   dcrDisabled?: boolean;
   /**
-   * Allow the consent-bypassing `client_credentials` grant on the unauthenticated
-   * Dynamic Client Registration path. Default false (#1353): a self-registered
+   * Internal compatibility seam for the consent-bypassing `client_credentials`
+   * grant on a DCR store. Default false. The production HTTP server does not
+   * expose DCR at all; this option is retained for isolated protocol tests and
+   * a future operator-consent implementation. A self-registered
    * DCR client defaults to `authorization_code` (which goes through /authorize
    * consent), and an explicit `client_credentials` request is rejected. Operators
-   * who genuinely need machine-to-machine DCR clients opt in via
-   * `--enable-dcr-insecure`. Manual CLI / admin registration is unaffected
-   * (operator-trusted, registers grants directly).
+   * Manual CLI / admin registration is unaffected (operator-trusted,
+   * registers grants directly).
    */
   allowClientCredentialsDcr?: boolean;
 }
@@ -244,24 +246,21 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
       validateRedirectUri(String(uri));
     }
 
-    // v0.28: ALLOWED_SCOPES allowlist. RFC 6749 §5.2 invalid_scope. The DCR
-    // path is reachable by any unauthenticated network caller when --enable-dcr
-    // is on, so this is the security-relevant gate (manual CLI registration
-    // is operator-trusted).
+    // v0.28: ALLOWED_SCOPES allowlist. RFC 6749 §5.2 invalid_scope. Keep the
+    // internal DCR store strict even though production HTTP never surfaces it;
+    // manual CLI registration is operator-trusted.
     assertAllowedScopes(parseScopeString(client.scope));
 
-    // v0.41.3 (T5): validate token_endpoint_auth_method on the DCR path so
-    // `--enable-dcr` is not the looser entry point. CLI and admin paths gate
-    // through the same `validateTokenEndpointAuthMethod` helper — all three
-    // registration entry points share one allow-list.
+    // v0.41.3 (T5): validate token_endpoint_auth_method on the internal DCR
+    // path too. CLI and admin paths gate through the same helper.
     const authMethod = validateTokenEndpointAuthMethod(client.token_endpoint_auth_method);
 
     // v0.42 (#1353): the DCR path is the unauthenticated network entry point.
     // `client_credentials` skips /authorize consent entirely, so a self-
     // registered DCR client must NOT get it by default. Default the grant to
-    // `authorization_code` (the consent-bearing flow) when unspecified, and
-    // reject an explicit `client_credentials` request unless the operator opted
-    // in via `--enable-dcr-insecure`. Manual CLI/admin registration bypasses
+    // `authorization_code` when unspecified, and reject an explicit
+    // `client_credentials` request unless an internal caller explicitly opted
+    // into this compatibility seam. Manual CLI/admin registration bypasses
     // this store method, so operators can still mint machine clients directly.
     const grantTypes = (client.grant_types && client.grant_types.length > 0)
       ? client.grant_types
@@ -269,8 +268,7 @@ class GBrainClientsStore implements OAuthRegisteredClientsStore {
     if (!this.allowClientCredentialsDcr && grantTypes.includes('client_credentials')) {
       throw new InvalidClientMetadataError(
         'client_credentials grant is not permitted via dynamic client registration; ' +
-        'restart the server with --enable-dcr-insecure to allow it, or register the ' +
-        'client via the gbrain CLI / admin API.',
+        'register the client via the trusted gbrain CLI / admin API instead.',
       );
     }
 
@@ -382,7 +380,10 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
   constructor(options: GBrainOAuthProviderOptions) {
     this.sql = options.sql;
     this._clientsStore = new GBrainClientsStore(this.sql, options.allowClientCredentialsDcr === true);
-    this.dcrDisabled = options.dcrDisabled === true;
+    // Secure default: callers must make an explicit code-level decision to
+    // expose DCR. The production HTTP server never opts in; its /register
+    // route is additionally blocked until operator consent exists.
+    this.dcrDisabled = options.dcrDisabled !== false;
     this.tokenTtl = options.tokenTtl || 3600;
     this.refreshTtl = options.refreshTtl || 30 * 24 * 3600;
   }
@@ -801,6 +802,36 @@ export class GBrainOAuthProvider implements OAuthServerProvider {
     // Soft-delete probe — same shape as exchangeClientCredentials.
     try {
       const [revoked] = await this.sql`SELECT deleted_at FROM oauth_clients WHERE client_id = ${clientId} AND deleted_at IS NOT NULL`;
+      if (revoked) throw new Error('Client has been revoked');
+    } catch (e) {
+      if (e instanceof Error && e.message === 'Client has been revoked') throw e;
+      if (!isUndefinedColumnError(e, 'deleted_at')) throw e;
+    }
+    return client;
+  }
+
+  /**
+   * Resolve a public client without turning client existence into a network
+   * oracle. The HTTP boundary maps every failure here to the same
+   * `invalid_client` envelope. Only explicit `none` clients with a NULL secret
+   * are accepted; malformed rows and confidential clients fail closed.
+   */
+  async verifyPublicClient(clientId: string): Promise<OAuthClientInformationFull> {
+    const client = await this._clientsStore.getClient(clientId);
+    if (
+      !client ||
+      client.client_secret !== undefined ||
+      client.token_endpoint_auth_method !== 'none'
+    ) {
+      throw new Error('Invalid client');
+    }
+    try {
+      const [revoked] = await this.sql`
+        SELECT deleted_at
+        FROM oauth_clients
+        WHERE client_id = ${clientId}
+          AND deleted_at IS NOT NULL
+      `;
       if (revoked) throw new Error('Client has been revoked');
     } catch (e) {
       if (e instanceof Error && e.message === 'Client has been revoked') throw e;

@@ -6,8 +6,9 @@
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
-import type { BrainEngine } from '../src/core/engine.ts';
+import type { BrainEngine, TimelineBatchInput } from '../src/core/engine.ts';
 import type { PageInput, ChunkInput } from '../src/core/types.ts';
+import { importFromContent } from '../src/core/import-file.ts';
 
 let engine: PGLiteEngine;
 
@@ -41,7 +42,7 @@ afterAll(async () => {
 // Helper to reset data between test groups
 async function truncateAll() {
   const tables = [
-    'content_chunks', 'links', 'tags', 'raw_data',
+    'content_chunks', 'links', 'tags', 'raw_data', 'slug_aliases',
     'timeline_entries', 'page_versions', 'ingest_log', 'pages',
   ];
   for (const t of tables) {
@@ -167,6 +168,177 @@ describe('PGLiteEngine: Pages', () => {
     await engine.updateSlug('test/old-name', 'test/new-name');
     expect(await engine.getPage('test/old-name')).toBeNull();
     expect((await engine.getPage('test/new-name'))?.title).toBe('Test Page');
+  });
+
+  test('updateSlug is a true no-op when old and new slugs are identical', async () => {
+    const slug = 'test/already-canonical';
+    await engine.putPage(slug, testPage);
+    await engine.setPageAliases(slug, 'default', ['canonical alias', 'second alias']);
+    const before = await engine.executeRaw<{ alias_norm: string; slug: string }>(
+      `SELECT alias_norm, slug FROM page_aliases
+        WHERE source_id = 'default' AND slug = $1
+        ORDER BY alias_norm`,
+      [slug],
+    );
+
+    await engine.updateSlug(slug, slug, { sourceId: 'default' });
+
+    expect(await engine.getPage(slug, { sourceId: 'default' })).not.toBeNull();
+    expect(await engine.executeRaw<{ alias_norm: string; slug: string }>(
+      `SELECT alias_norm, slug FROM page_aliases
+        WHERE source_id = 'default' AND slug = $1
+        ORDER BY alias_norm`,
+      [slug],
+    )).toEqual(before);
+  });
+
+  test('updateSlug same-slug no-op still fails closed when the selected origin is missing', async () => {
+    await expect(engine.updateSlug(
+      'test/missing-already-canonical',
+      'test/missing-already-canonical',
+      { sourceId: 'default' },
+    )).rejects.toThrow('expected exactly one row for default:test/missing-already-canonical');
+  });
+
+  test('import remains fail-open before migration v110 creates page_aliases', async () => {
+    const rollback = new Error('rollback pre-v110 fixture');
+    await expect(engine.transaction(async (tx) => {
+      await tx.executeRaw('DROP TABLE page_aliases');
+      const result = await importFromContent(
+        tx,
+        'test/pre-v110-import',
+        '---\ntitle: Pre-v110 import\naliases: [Legacy Name]\n---\n\nBody survives.',
+        { noEmbed: true },
+      );
+      expect(result.status).toBe('imported');
+      expect(await tx.getPage('test/pre-v110-import', { sourceId: 'default' })).not.toBeNull();
+      throw rollback;
+    })).rejects.toBe(rollback);
+  });
+
+  test('updateSlug rejects a destination owned by another alias and rolls back the transaction', async () => {
+    const oldSlug = 'test/alias-collision-old';
+    const newSlug = 'test/alias-collision-new';
+    const canonicalSlug = 'test/alias-owner';
+    const original = await engine.putPage(oldSlug, testPage);
+    await engine.putPage(canonicalSlug, { ...testPage, title: 'Alias owner' });
+    await engine.executeRaw(
+      `INSERT INTO slug_aliases (source_id, alias_slug, canonical_slug)
+       VALUES ('default', $1, $2)`,
+      [newSlug, canonicalSlug],
+    );
+
+    await expect(engine.updateSlug(oldSlug, newSlug, { sourceId: 'default' }))
+      .rejects.toThrow('updateSlug destination alias collision');
+
+    expect((await engine.getPage(oldSlug, { sourceId: 'default' }))?.id).toBe(original.id);
+    expect(await engine.getPage(newSlug, { sourceId: 'default' })).toBeNull();
+    expect(await engine.resolveSlugWithAlias(newSlug, 'default')).toBe(canonicalSlug);
+  });
+
+  test('updateSlug accepts its own destination redirect and retires the self-alias atomically', async () => {
+    const oldSlug = 'test/alias-self-old';
+    const newSlug = 'test/alias-self-new';
+    await engine.putPage(oldSlug, testPage);
+    await engine.executeRaw(
+      `INSERT INTO slug_aliases (source_id, alias_slug, canonical_slug)
+       VALUES ('default', $1, $2)`,
+      [newSlug, oldSlug],
+    );
+
+    await engine.updateSlug(oldSlug, newSlug, { sourceId: 'default' });
+
+    expect(await engine.getPage(oldSlug, { sourceId: 'default' })).toBeNull();
+    expect(await engine.getPage(newSlug, { sourceId: 'default' })).not.toBeNull();
+    expect(await engine.executeRaw(
+      `SELECT 1 FROM slug_aliases WHERE source_id = 'default' AND alias_slug = $1`,
+      [newSlug],
+    )).toHaveLength(0);
+  });
+
+  test('updateSlug fails closed when the origin row is missing', async () => {
+    await expect(engine.updateSlug('test/missing-origin', 'test/never-created'))
+      .rejects.toThrow('expected exactly one row');
+    expect(await engine.getPage('test/never-created')).toBeNull();
+  });
+
+  test('transaction-scoped batch writes do not retry inside an aborted transaction', async () => {
+    await engine.putPage('test/tx-batch', testPage);
+    const target = engine as unknown as {
+      _addTimelineEntriesBatchOnce(entries: TimelineBatchInput[]): Promise<number>;
+    };
+    const original = target._addTimelineEntriesBatchOnce;
+    let batchAttempts = 0;
+    let transactionAttempts = 0;
+    target._addTimelineEntriesBatchOnce = async function (
+      this: PGLiteEngine,
+      entries: TimelineBatchInput[],
+    ): Promise<number> {
+      batchAttempts++;
+      const error = Object.assign(new Error('simulated transient batch failure'), {
+        code: 'ECONNRESET',
+      });
+      void this;
+      void entries;
+      throw error;
+    };
+    try {
+      await expect(engine.transaction(async tx => {
+        transactionAttempts++;
+        await tx.addTimelineEntriesBatch([{
+          slug: 'test/tx-batch',
+          date: '2026-07-10',
+          source: 'test',
+          summary: 'must roll back',
+          source_id: 'default',
+        }]);
+      })).rejects.toThrow('simulated transient batch failure');
+    } finally {
+      target._addTimelineEntriesBatchOnce = original;
+    }
+    expect(batchAttempts).toBe(1);
+    expect(transactionAttempts).toBe(1);
+    expect(await engine.getTimeline('test/tx-batch', { sourceId: 'default' })).toHaveLength(0);
+  });
+
+  test('updateSlug migrates fact entity and source-page keys independently within one source', async () => {
+    const oldSlug = 'test/fact-old';
+    const newSlug = 'test/fact-new';
+    await engine.executeRaw(`DELETE FROM facts WHERE source LIKE 'update-slug-independent-%'`);
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config)
+       VALUES ('fact-other-source', 'fact-other-source', '{}'::jsonb)
+       ON CONFLICT (id) DO NOTHING`,
+    );
+    await engine.putPage(oldSlug, testPage);
+    await engine.executeRaw(
+      `INSERT INTO facts
+         (source_id, entity_slug, fact, source, source_markdown_slug, row_num)
+       VALUES
+         ('default', $1, 'entity-only', 'update-slug-independent-entity', 'other/page', 1),
+         ('default', 'people/other', 'source-only', 'update-slug-independent-source', $1, 1),
+         ('default', $1, 'both', 'update-slug-independent-both', $1, 2),
+         ('fact-other-source', $1, 'foreign-source', 'update-slug-independent-foreign', $1, 1)`,
+      [oldSlug],
+    );
+
+    await engine.updateSlug(oldSlug, newSlug, { sourceId: 'default' });
+    const rows = await engine.executeRaw<{
+      fact: string;
+      source_id: string;
+      entity_slug: string;
+      source_markdown_slug: string;
+    }>(
+      `SELECT fact, source_id, entity_slug, source_markdown_slug
+         FROM facts WHERE source LIKE 'update-slug-independent-%'
+         ORDER BY fact`,
+    );
+    expect(rows).toEqual([
+      { fact: 'both', source_id: 'default', entity_slug: newSlug, source_markdown_slug: newSlug },
+      { fact: 'entity-only', source_id: 'default', entity_slug: newSlug, source_markdown_slug: 'other/page' },
+      { fact: 'foreign-source', source_id: 'fact-other-source', entity_slug: oldSlug, source_markdown_slug: oldSlug },
+      { fact: 'source-only', source_id: 'default', entity_slug: 'people/other', source_markdown_slug: newSlug },
+    ]);
   });
 
   test('validateSlug rejects path traversal', async () => {
@@ -991,6 +1163,20 @@ describe('PGLiteEngine: Transactions', () => {
     const page = await engine.getPage('test/tx-fail');
     expect(page).toBeNull();
   });
+
+  test('nested transaction joins the outer unit without deadlock or savepoint', async () => {
+    let sharedEngine = false;
+    await expect(engine.transaction(async (outer) => {
+      await outer.transaction(async (inner) => {
+        sharedEngine = inner === outer;
+        await inner.putPage('test/tx-nested', testPage);
+      });
+      throw new Error('rollback joined transaction');
+    })).rejects.toThrow('rollback joined transaction');
+
+    expect(sharedEngine).toBe(true);
+    expect(await engine.getPage('test/tx-nested')).toBeNull();
+  }, 2_000);
 });
 
 // ─────────────────────────────────────────────────────────────────
@@ -1312,8 +1498,10 @@ describe('PGLiteEngine: v0.13.1 error-wrap on connect() (#223)', () => {
     // as a cause (that was conflating #218 and #223 — migrations run AFTER
     // create()).
     // #2084 wrapped the create call in preservingProcessExitCode (Emscripten
-    // exitCode containment); the try/catch + error wrap around it is unchanged.
-    expect(src).toContain('this._db = await preservingProcessExitCode(() =>');
+    // exitCode containment). The result first lives in `createdDb` so an
+    // authority-check failure can close it before the engine publishes it.
+    expect(src).toContain('createdDb = await preservingProcessExitCode(() =>');
+    expect(src).toContain('this._db = createdDb;');
     expect(src).toContain('PGlite.create({');
     expect(src).toContain('https://github.com/garrytan/gbrain/issues/223');
     expect(src).toContain('gbrain doctor');
@@ -1321,9 +1509,10 @@ describe('PGLiteEngine: v0.13.1 error-wrap on connect() (#223)', () => {
     // Regression guard: the user-visible error MESSAGE must not re-introduce
     // the misleading "missing migrations" hint. (A source comment explaining
     // *why* we removed it is fine — match only inside the wrapped Error body.)
-    const wrapStart = src.indexOf('const wrapped = new Error(');
+    const wrapStart = src.indexOf('export function buildPgliteInitErrorMessage(');
     expect(wrapStart).toBeGreaterThan(-1);
-    const wrapEnd = src.indexOf(');', wrapStart);
+    const wrapEnd = src.indexOf('\n}\n', wrapStart);
+    expect(wrapEnd).toBeGreaterThan(wrapStart);
     const errBody = src.slice(wrapStart, wrapEnd);
     expect(errBody).not.toContain('missing migrations');
     expect(errBody).not.toContain('apply-migrations');

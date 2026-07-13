@@ -26,7 +26,7 @@ let tmp: string;
 let origHome: string | undefined;
 
 function run(args: string[]): { exitCode: number; stdout: string; stderr: string } {
-  const env = { ...process.env, HOME: tmp } as Record<string, string | undefined>;
+  const env = { ...process.env, HOME: tmp, GBRAIN_HOME: tmp } as Record<string, string | undefined>;
   delete env.DATABASE_URL;
   delete env.GBRAIN_DATABASE_URL;
   try {

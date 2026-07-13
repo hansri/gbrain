@@ -111,7 +111,7 @@ jobs:
         with:
           path: ~/.bun/install/cache
           key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
-      - run: bun install
+      - run: bun install --frozen-lockfile
       - run: bun run verify
 
   serial-tests:
@@ -132,7 +132,7 @@ jobs:
         with:
           path: ~/.bun/install/cache
           key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
-      - run: bun install
+      - run: bun install --frozen-lockfile
       - run: bun run test:serial
 
   slow-eval-longmemeval:
@@ -157,7 +157,7 @@ jobs:
         with:
           path: ~/.bun/install/cache
           key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
-      - run: bun install
+      - run: bun install --frozen-lockfile
       - run: bun test test/eval-longmemeval-e2e.slow.test.ts --timeout=60000
 
   slow-entity-resolve-perf:
@@ -180,7 +180,7 @@ jobs:
         with:
           path: ~/.bun/install/cache
           key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
-      - run: bun install
+      - run: bun install --frozen-lockfile
       - run: bun test test/entity-resolve-perf.slow.test.ts --timeout=300000
 
   test:
@@ -220,7 +220,7 @@ jobs:
         with:
           path: ~/.bun/install/cache
           key: bun-cache-${{ runner.os }}-${{ hashFiles('bun.lock') }}
-      - run: bun install
+      - run: bun install --frozen-lockfile
       - name: Run test shard ${{ matrix.shard }}/10
         run: scripts/test-shard.sh ${{ matrix.shard }} 10
 

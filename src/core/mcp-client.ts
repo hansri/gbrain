@@ -3,14 +3,13 @@
  *
  * Wraps the official @modelcontextprotocol/sdk Client + StreamableHTTPClientTransport
  * with OAuth `client_credentials` minting + token caching + 401 retry. Used by:
- *   - `gbrain remote ping`   — submits autopilot-cycle, polls get_job
- *   - `gbrain remote doctor` — calls run_doctor MCP op
+ *   - `gbrain remote doctor` — calls the bounded run_doctor MCP op
  *
  * Token caching strategy: in-process Map keyed by mcp_url, value carries the
  * access_token + expires_at. CLI invocations are short-lived; the cache
- * amortizes when a single `gbrain remote ping` makes multiple calls (submit_job
- * + N × get_job). Persisting to disk would create a credential-on-disk
- * surface for marginal benefit — re-mint is a single sub-100ms /token call.
+ * amortizes when one thin-client workflow makes multiple calls. Persisting to
+ * disk would create a credential-on-disk surface for marginal benefit;
+ * re-mint is a single sub-100ms /token call.
  *
  * 401 handling: on a tool-call rejection, drop the cached token, mint fresh
  * once, retry the call. If the second attempt also 401s, surface a structured

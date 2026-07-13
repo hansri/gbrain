@@ -41,7 +41,8 @@ cd "$ROOT"
 ALLOWED=(
   "src/cli.ts"                                  # local CLI; user owns the machine, no trust boundary
   "src/mcp/dispatch.ts"                         # shared dispatch; sets ctx.remote from caller, handlers self-gate
-  "src/mcp/server.ts"                           # stdio MCP; local-trusted (binary on user's box)
+  "src/mcp/server.ts"                           # stdio MCP; delegates list + call enforcement to stdio-policy.ts
+  "src/mcp/stdio-policy.ts"                     # stdio MCP; secure profile filters localOnly/admin/mutating + exact tool/scope policy
   "src/mcp/http-transport.ts"                   # superseded by serve-http.ts; kept for back-compat tests
   "src/mcp/tool-defs.ts"                        # pure helper; takes ops as parameter, never exposes them
   "src/core/minions/tools/brain-allowlist.ts"   # subagent registry; has its own opt-in allowlist (separate from localOnly)

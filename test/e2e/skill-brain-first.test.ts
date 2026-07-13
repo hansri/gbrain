@@ -28,7 +28,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import { join } from 'path';
-import { tmpdir } from 'os';
+import { devNull, tmpdir } from 'os';
 import { execFileSync } from 'child_process';
 
 import { skillBrainFirstCheck } from '../../src/commands/doctor.ts';
@@ -40,6 +40,23 @@ interface Workspace {
   dir: string;
   skillsDir: string;
   cleanup: () => void;
+}
+
+function fixtureGit(cwd: string, ...args: string[]): void {
+  execFileSync('git', args, {
+    cwd,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: devNull,
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_TERMINAL_PROMPT: '0',
+      GIT_AUTHOR_NAME: 'e2e',
+      GIT_AUTHOR_EMAIL: 'e2e@test',
+      GIT_COMMITTER_NAME: 'e2e',
+      GIT_COMMITTER_EMAIL: 'e2e@test',
+    },
+  });
 }
 
 function copyFixturesIntoTempWorkspace(): Workspace {
@@ -62,13 +79,9 @@ function copyFixturesIntoTempWorkspace(): Workspace {
   // Init git so the dry-fix safety gate sees "clean tracked file" not
   // "not a repo." The auto-fix REFUSES writes when the file isn't under
   // git (would destroy the only copy with no rollback).
-  execFileSync('git', ['init', '-q'], { cwd: root });
-  execFileSync('git', ['add', '-A'], { cwd: root });
-  execFileSync(
-    'git',
-    ['-c', 'user.email=e2e@test', '-c', 'user.name=e2e', 'commit', '-q', '-m', 'fixtures'],
-    { cwd: root },
-  );
+  fixtureGit(root, 'init', '-q');
+  fixtureGit(root, 'add', '-A');
+  fixtureGit(root, 'commit', '-q', '-m', 'fixtures');
 
   return {
     dir: root,

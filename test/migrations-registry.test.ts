@@ -16,7 +16,7 @@ describe('migration registry', () => {
   test('every migration has version + featurePitch.headline + orchestrator', () => {
     for (const m of migrations) {
       expect(typeof m.version).toBe('string');
-      expect(m.version).toMatch(/^\d+\.\d+\.\d+$/);
+      expect(m.version).toMatch(/^\d+(?:\.\d+){2,}$/);
       expect(typeof m.featurePitch.headline).toBe('string');
       expect(m.featurePitch.headline.length).toBeGreaterThan(0);
       expect(typeof m.orchestrator).toBe('function');
@@ -50,12 +50,14 @@ describe('compareVersions', () => {
     expect(compareVersions('1.2.4', '1.2.3')).toBe(1);
     expect(compareVersions('1.3.0', '1.2.9')).toBe(1);
     expect(compareVersions('2.0.0', '1.99.99')).toBe(1);
+    expect(compareVersions('0.42.59.1', '0.42.59.0')).toBe(1);
   });
 
   test('older returns -1', () => {
     expect(compareVersions('1.2.2', '1.2.3')).toBe(-1);
     expect(compareVersions('0.11.0', '0.11.1')).toBe(-1);
     expect(compareVersions('0.11.0', '0.12.0')).toBe(-1);
+    expect(compareVersions('0.42.59.0', '0.42.59.1')).toBe(-1);
   });
 
   test('handles single-digit versions', () => {

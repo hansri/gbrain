@@ -289,6 +289,30 @@ describe('#2084 — explicit-exit teardown: every swept site exits clean, exit c
     return copy;
   }
 
+  test('import returned-validation failure reports partial_failure and exits 1', async () => {
+    const copy = copyBrainHome('import-failure');
+    const brokenDir = mkdtempSync(join(tmpdir(), 'gbrain-import-failure-'));
+    try {
+      writeFileSync(
+        join(brokenDir, 'broken.md'),
+        '---\nslug: wrong/source\ntitle: Broken\n---\nRejected by path authority.\n',
+      );
+      const result = await runWithTimeout(
+        ['import', brokenDir, '--no-embed', '--json'],
+        30_000,
+        { GBRAIN_HOME: copy },
+      );
+      expect(result.durationMs).toBeLessThan(30_000);
+      expect(result.code).toBe(1);
+      expect(result.stdout).toContain('"status":"partial_failure"');
+      expect(result.stdout).toContain('"exit_code":1');
+      expect(result.stderr).not.toContain(TEARDOWN_BANNER);
+    } finally {
+      rmSync(copy, { recursive: true, force: true });
+      rmSync(brokenDir, { recursive: true, force: true });
+    }
+  }, 45_000);
+
   test('D5: failed op exits 1 with the error on stderr (exit code = op outcome)', async () => {
     const { code, stderr, durationMs } = await runWithTimeout(
       ['get', 'nonexistent-slug-2084'],

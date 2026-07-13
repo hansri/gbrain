@@ -14,10 +14,10 @@
  * containing one passing and one failing test, override the discovery
  * roots via env-vars, and run with --shards=2.
  *
- * NOT covered here: the heartbeat (timing-sensitive, not load-bearing
- * for correctness) and timeout / WEDGED markers (require synthesizing a
- * hung test which is fragile across machines). Those rely on the live
- * smoke tests captured in CHANGELOG measurements.
+ * NOT covered here: the heartbeat (timing-sensitive, not load-bearing for
+ * correctness). The portable manual-timeout path is covered with a bounded
+ * fixture that traps TERM and exits 0, pinning timeout provenance rather than
+ * relying on the child's eventual exit code.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
@@ -69,11 +69,14 @@ afterAll(() => {
   if (TMPROOT) rmSync(TMPROOT, { recursive: true, force: true });
 });
 
-function runWrapper(extraArgs: string[] = []): { code: number; stdout: string; stderr: string } {
+function runWrapper(
+  extraArgs: string[] = [],
+  env: Record<string, string | undefined> = {},
+): { code: number; stdout: string; stderr: string } {
   const result = spawnSync(
     'bash',
     [join(TMPROOT, 'scripts', 'run-unit-parallel.sh'), '--shards', '2', ...extraArgs],
-    { cwd: TMPROOT, encoding: 'utf-8', env: { ...process.env } },
+    { cwd: TMPROOT, encoding: 'utf-8', env: { ...process.env, ...env } },
   );
   return {
     code: result.status ?? -1,
@@ -81,6 +84,123 @@ function runWrapper(extraArgs: string[] = []): { code: number; stdout: string; s
     stderr: result.stderr || '',
   };
 }
+
+describe('run-unit-parallel.sh bounded worker budget', () => {
+  it('derives the default per-shard concurrency from the total budget', () => {
+    const r = runWrapper(['--dry-run'], {
+      GBRAIN_TEST_TOTAL_CONCURRENCY: '3',
+      GBRAIN_TEST_MAX_CONCURRENCY: undefined,
+    });
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain('--max-concurrency=1 (budgeted)');
+    expect(r.stderr).toContain('total=2 | budget=3');
+  });
+
+  it('allows a deliberate explicit per-shard override and reports the total', () => {
+    const r = runWrapper(['--dry-run', '--max-concurrency', '3'], {
+      GBRAIN_TEST_TOTAL_CONCURRENCY: '3',
+      GBRAIN_TEST_MAX_CONCURRENCY: undefined,
+    });
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain('--max-concurrency=3 (explicit)');
+    expect(r.stderr).toContain('total=6 | budget=3');
+  });
+
+  it('reduces shard processes when the automatic total budget is lower', () => {
+    const r = runWrapper(['--dry-run'], {
+      GBRAIN_TEST_TOTAL_CONCURRENCY: '1',
+      GBRAIN_TEST_MAX_CONCURRENCY: undefined,
+    });
+    expect(r.code).toBe(0);
+    expect(r.stderr).toContain('N=1 shards');
+    expect(r.stderr).toContain('total=1 | budget=1');
+  });
+
+  it('rejects invalid concurrency values before spawning tests', () => {
+    const r = runWrapper(['--dry-run', '--max-concurrency', '0']);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('ERROR: invalid max concurrency: 0');
+  });
+
+  it('rejects an invalid global serial timeout before spawning tests', () => {
+    const r = runWrapper(['--dry-run'], { GBRAIN_TEST_SERIAL_TIMEOUT: '0' });
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain('ERROR: invalid serial timeout: 0');
+  });
+});
+
+describe('run-unit-parallel.sh portable timeout fallback', () => {
+  it('marks a timed-out shard as WEDGED even when the child traps TERM and exits zero', () => {
+    const timeoutFixture = join(TMPROOT, 'test', 'z-timeout.test.ts');
+    rmSync(join(TMPROOT, 'test', 'd-fail.test.ts'));
+    writeFileSync(timeoutFixture, `import { test } from 'bun:test';
+test('timeout fixture', async () => {
+  process.once('SIGTERM', () => process.exit(0));
+  await new Promise<void>(() => { setInterval(() => undefined, 1000); });
+}, 20_000);`);
+    try {
+      const r = runWrapper([], {
+        GBRAIN_TEST_FORCE_MANUAL_TIMEOUT: '1',
+        GBRAIN_TEST_SHARD_TIMEOUT: '1',
+        GBRAIN_TEST_TIMEOUT_GRACE: '1',
+        GBRAIN_TEST_TOTAL_CONCURRENCY: '2',
+        GBRAIN_TEST_MAX_CONCURRENCY: undefined,
+      });
+      expect(r.code).toBe(1);
+      expect(r.stdout).toContain('WEDGED after 1s (rc=124)');
+      const failureLog = readFileSync(join(TMPROOT, '.context', 'test-failures.log'), 'utf-8');
+      expect(failureLog).toMatch(/--- shard \d+: WEDGED after 1s ---/);
+    } finally {
+      rmSync(timeoutFixture, { force: true });
+      const failing = `import { describe, it, expect } from 'bun:test';
+describe('failing-on-purpose', () => {
+  it('expects 1 to equal 2', () => { expect(1).toBe(2); });
+});`;
+      writeFileSync(join(TMPROOT, 'test', 'd-fail.test.ts'), failing);
+    }
+  }, 10_000);
+
+  it('marks the whole serial suite WEDGED and KILLs it when it ignores TERM', () => {
+    const failFixture = join(TMPROOT, 'test', 'd-fail.test.ts');
+    const serialFixture = join(TMPROOT, 'test', 'serial-timeout.serial.test.ts');
+    const serialScript = join(TMPROOT, 'scripts', 'run-serial-tests.sh');
+    rmSync(failFixture, { force: true });
+    writeFileSync(serialFixture, '// discovery sentinel; synthetic runner below owns the timeout\n');
+    writeFileSync(serialScript, `#!/usr/bin/env bash
+trap '' TERM
+while :; do sleep 1; done
+`);
+    chmodSync(serialScript, 0o755);
+    try {
+      const r = runWrapper([], {
+        GBRAIN_TEST_FORCE_MANUAL_TIMEOUT: '1',
+        GBRAIN_TEST_SHARD_TIMEOUT: '10',
+        GBRAIN_TEST_SERIAL_TIMEOUT: '1',
+        GBRAIN_TEST_TIMEOUT_GRACE: '1',
+        GBRAIN_TEST_TOTAL_CONCURRENCY: '2',
+        GBRAIN_TEST_MAX_CONCURRENCY: undefined,
+      });
+      expect(r.code).toBe(1);
+      expect(r.stderr).toContain('SERIAL WEDGED after 1s (rc=124)');
+      const logDir = join(TMPROOT, '.context', 'test-shards');
+      expect(existsSync(join(logDir, 'serial.timeout-fired'))).toBe(true);
+      expect(existsSync(join(logDir, 'serial.wedged'))).toBe(true);
+      const summary = readFileSync(join(TMPROOT, '.context', 'test-summary.txt'), 'utf-8');
+      expect(summary).toContain('serial: WEDGED after 1s (rc=124)');
+      const failureLog = readFileSync(join(TMPROOT, '.context', 'test-failures.log'), 'utf-8');
+      expect(failureLog).toContain('--- serial suite: WEDGED after 1s ---');
+    } finally {
+      copyFileSync(SERIAL_SH_SRC, serialScript);
+      chmodSync(serialScript, 0o755);
+      rmSync(serialFixture, { force: true });
+      const failing = `import { describe, it, expect } from 'bun:test';
+describe('failing-on-purpose', () => {
+  it('expects 1 to equal 2', () => { expect(1).toBe(2); });
+});`;
+      writeFileSync(failFixture, failing);
+    }
+  }, 15_000);
+});
 
 describe('run-unit-parallel.sh exit-code propagation (a)', () => {
   it('exits non-zero when any shard contains a failing test', () => {
@@ -92,7 +212,7 @@ describe('run-unit-parallel.sh exit-code propagation (a)', () => {
     rmSync(join(TMPROOT, 'test', 'd-fail.test.ts'));
     try {
       const r = runWrapper();
-      expect(r.code).toBe(0);
+      expect(r.code, `${r.stdout}\n${r.stderr}`).toBe(0);
     } finally {
       // Restore the failing fixture for any downstream tests in the same
       // describe block (afterAll cleans the whole tempdir; this is belt-
@@ -134,7 +254,7 @@ describe('run-unit-parallel.sh failure-log contract (d)', () => {
     rmSync(join(TMPROOT, 'test', 'd-fail.test.ts'));
     try {
       const r = runWrapper();
-      expect(r.code).toBe(0);
+      expect(r.code, `${r.stdout}\n${r.stderr}`).toBe(0);
       const contents = readFileSync(join(TMPROOT, '.context', 'test-failures.log'), 'utf-8');
       expect(contents).toBe('');
     } finally {

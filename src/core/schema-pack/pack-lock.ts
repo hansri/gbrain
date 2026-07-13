@@ -1,70 +1,77 @@
-// v0.40.6.0 Schema Cathedral v3 — per-pack file lock primitive.
+// v0.40.6.0 Schema Cathedral v3 — per-pack directory lock primitive.
 //
-// `withPackLock(packName, opts, fn)` serializes concurrent mutations of
-// the same pack file across processes. Two `gbrain schema add-type foo`
-// invocations on the same pack are made safe: the second blocks until the
-// first releases (or refuses with `LOCK_BUSY` if a timeout is set).
+// `withPackLock(packName, opts, fn)` serializes concurrent mutations of the
+// same pack across processes. The lock name remains
+// `~/.gbrain/schema-packs/.locks/<packName>.lock`, but that path is now a
+// directory containing one immutable, uniquely named owner sentinel:
 //
-// Design (codex C8 from /plan-eng-review):
-//   - Atomic acquire via `openSync(lockPath, 'wx')` — the 'wx' flag is
-//     POSIX `O_CREAT | O_EXCL`, kernel-level atomic. The acquire either
-//     creates the file or throws EEXIST. There is NO check-then-write
-//     window. Do NOT copy `src/core/page-lock.ts:79+96`'s
-//     `existsSync` + `writeFileSync` shape — that's TOCTOU.
-//   - Stale-lock detection: a holder process may crash without releasing.
-//     On EEXIST, read the lockfile, check `kill(pid, 0)` for liveness,
-//     and check `Date.now() - ts > ttlMs`. If either is true, steal.
-//   - TTL refresh: long-running DB-aware lint/stats can outlive the
-//     default 60s ttl. While `fn()` runs, a background `setInterval`
-//     rewrites `ts` every 10s so the lock stays fresh.
-//   - `--force` semantics: "steal stale lock", NOT "skip locking". Even
-//     forced acquires go through the same atomic open path — the only
-//     difference is that on EEXIST + non-stale, force succeeds by
-//     stealing instead of throwing.
-//   - Cleanup: `try/finally` unconditionally releases. Refresh interval
-//     is cleared. Lockfile is unlinked.
+//   <packName>.lock/owner-<uuid>.json
 //
-// Lock path: `~/.gbrain/schema-packs/.locks/<packName>.lock`. Per-pack
-// so two different packs never block each other. Honors `GBRAIN_HOME`
-// via the shared `gbrainPath()` helper.
+// Why a directory + unique sentinel instead of the former JSON lock file:
+//   - `mkdir` is the atomic acquisition boundary.
+//   - Release/recovery first unlinks the exact owner's unique sentinel and may
+//     remove the directory only if that unlink succeeded. A delayed release
+//     therefore cannot delete a replacement owner.
+//   - A provably dead holder may be recovered. A live holder is never stolen,
+//     even when its TTL has elapsed or `force` is supplied. PID reuse therefore
+//     fails closed instead of permitting two live callbacks.
+//   - Empty/publishing, malformed, symlink, and legacy file locks fail closed.
+//     They are diagnosed separately, but are never removed via an unsafe
+//     inspect-then-unlink sequence.
+//
+// Nested `withPackLock` calls reuse ownership only inside the descendant async
+// context that acquired it. Unrelated top-level work in the same process still
+// contends normally and receives LOCK_BUSY.
 
-import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { randomUUID } from 'node:crypto';
+import {
+  closeSync,
+  fsyncSync,
+  ftruncateSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  rmdirSync,
+  unlinkSync,
+  writeFileSync,
+  writeSync,
+} from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { gbrainPath } from '../config.ts';
 
 export const DEFAULT_LOCK_TTL_MS = 60_000;
 export const REFRESH_INTERVAL_MS = 10_000;
-export const DEFAULT_WAIT_TIMEOUT_MS = 0; // 0 = fail-immediately on EEXIST
+export const DEFAULT_WAIT_TIMEOUT_MS = 0; // reserved; acquisition is fail-fast
+/** Grace used to distinguish a just-created directory from abandoned state. */
+export const LOCK_PUBLISH_GRACE_MS = 1_000;
 
+/** `forced` is retained in the public type for source compatibility only. */
 export type LockOutcome = 'acquired' | 'stolen_stale' | 'forced';
 
 export interface PackLockOpts {
-  /** TTL in ms before another acquirer considers the lock stale. Default 60s. */
+  /** Holder freshness/diagnostic TTL. It never overrides a live PID. */
   ttlMs?: number;
-  /** Steal the lock even if non-stale + live PID. Default false. */
+  /** Request stale recovery. A live holder is never stolen. */
   force?: boolean;
   /** Override the lock directory for tests. */
   lockDir?: string;
-  /**
-   * Inject a clock for tests (returns ms since epoch).
-   * Production callers leave undefined.
-   */
+  /** Inject a clock for tests (ms since epoch). */
   now?: () => number;
-  /**
-   * Inject a PID-liveness probe for tests. Returns true if the PID is alive.
-   * Production callers leave undefined (defaults to `kill(pid, 0)`).
-   */
+  /** Inject a PID-liveness probe for tests. */
   isPidAlive?: (pid: number) => boolean;
 }
 
 export interface LockFileRecord {
-  /** Holder process PID. */
+  /** Per-acquisition owner/fencing token. Required by the directory protocol. */
+  owner?: string;
   pid: number;
-  /** Holder hostname (informational only). */
   hostname: string;
   /** Last refresh timestamp (ms since epoch). */
   ts: number;
-  /** Holder's declared TTL in ms. */
+  /** Holder's declared diagnostic TTL in ms. */
   ttlMs: number;
 }
 
@@ -84,29 +91,49 @@ export class PackLockBusyError extends Error {
 
 function defaultIsPidAlive(pid: number): boolean {
   try {
-    // Signal 0 doesn't deliver, but throws ESRCH if the process is dead.
     process.kill(pid, 0);
     return true;
   } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    // EPERM means the process exists but we lack permission to signal.
-    return code === 'EPERM';
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
   }
 }
 
 function resolveLockPath(packName: string, lockDir?: string): string {
   const dir = lockDir ?? gbrainPath('schema-packs', '.locks');
-  return join(dir, `${packName}.lock`);
+  const canonicalDir = resolve(dir);
+  if (
+    packName.length === 0 ||
+    packName.includes('/') ||
+    packName.includes('\\') ||
+    packName.includes('\0') ||
+    packName === '.' ||
+    packName === '..'
+  ) {
+    throw new Error(`invalid pack lock name: ${JSON.stringify(packName)}`);
+  }
+  const candidate = resolve(join(canonicalDir, `${packName}.lock`));
+  if (dirname(candidate) !== canonicalDir) {
+    throw new Error(`pack lock path escapes lock directory: ${JSON.stringify(packName)}`);
+  }
+  return candidate;
 }
 
-function readLockFile(path: string): LockFileRecord | null {
+function ownerSentinelName(owner: string): string {
+  return `owner-${owner}.json`;
+}
+
+function ownerSentinelPath(lockPath: string, owner: string): string {
+  return join(lockPath, ownerSentinelName(owner));
+}
+
+function parseLockRecord(raw: string): LockFileRecord | null {
   try {
-    const raw = readFileSync(path, 'utf-8');
     const parsed = JSON.parse(raw) as Partial<LockFileRecord>;
     if (
-      typeof parsed.pid === 'number' &&
-      typeof parsed.ts === 'number' &&
-      typeof parsed.ttlMs === 'number' &&
+      typeof parsed.owner === 'string' && parsed.owner.length > 0 &&
+      typeof parsed.pid === 'number' && Number.isSafeInteger(parsed.pid) && parsed.pid > 0 &&
+      typeof parsed.ts === 'number' && Number.isFinite(parsed.ts) &&
+      typeof parsed.ttlMs === 'number' && Number.isFinite(parsed.ttlMs) && parsed.ttlMs > 0 &&
       typeof parsed.hostname === 'string'
     ) {
       return parsed as LockFileRecord;
@@ -117,54 +144,150 @@ function readLockFile(path: string): LockFileRecord | null {
   }
 }
 
-function writeLockRecord(path: string, fd: number, record: LockFileRecord): void {
-  // We hold an open fd from the atomic create; truncate-and-write via fd.
-  // Bun's fs.writeFileSync(path, ...) when the file exists is fine here
-  // because we already own the lock (exclusive create succeeded).
-  writeFileSync(path, JSON.stringify(record), 'utf-8');
-  // Keep the fd open until release so file is held by this process; some
-  // FS layers prefer this for crash detection. (Functionally a no-op on
-  // POSIX where unlink() works regardless.)
-  closeSync(fd);
+type LockPathSnapshot =
+  | { kind: 'missing' }
+  | { kind: 'legacy_file'; mtimeMs: number; record: LockFileRecord | null }
+  | { kind: 'empty_directory'; mtimeMs: number }
+  | { kind: 'invalid_directory'; mtimeMs: number }
+  | { kind: 'owned_directory'; mtimeMs: number; record: LockFileRecord; ownerPath: string };
+
+function inspectLockPath(lockPath: string): LockPathSnapshot {
+  let rootStats: ReturnType<typeof lstatSync>;
+  try {
+    rootStats = lstatSync(lockPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'missing' };
+    throw err;
+  }
+
+  if (!rootStats.isDirectory() || rootStats.isSymbolicLink()) {
+    let record: LockFileRecord | null = null;
+    if (rootStats.isFile()) {
+      try { record = parseLockRecord(readFileSync(lockPath, 'utf-8')); } catch { /* fail closed */ }
+    }
+    return { kind: 'legacy_file', mtimeMs: rootStats.mtimeMs, record };
+  }
+
+  let entries: string[];
+  try {
+    entries = readdirSync(lockPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'missing' };
+    throw err;
+  }
+  if (entries.length === 0) return { kind: 'empty_directory', mtimeMs: rootStats.mtimeMs };
+  if (entries.length !== 1) return { kind: 'invalid_directory', mtimeMs: rootStats.mtimeMs };
+
+  const match = /^owner-([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.json$/i.exec(entries[0]!);
+  if (!match) return { kind: 'invalid_directory', mtimeMs: rootStats.mtimeMs };
+  const ownerPath = join(lockPath, entries[0]!);
+  try {
+    const ownerStats = lstatSync(ownerPath);
+    if (!ownerStats.isFile() || ownerStats.isSymbolicLink()) {
+      return { kind: 'invalid_directory', mtimeMs: rootStats.mtimeMs };
+    }
+    const record = parseLockRecord(readFileSync(ownerPath, 'utf-8'));
+    if (!record || record.owner !== match[1]) {
+      return { kind: 'invalid_directory', mtimeMs: rootStats.mtimeMs };
+    }
+    return { kind: 'owned_directory', mtimeMs: rootStats.mtimeMs, record, ownerPath };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return inspectLockPath(lockPath);
+    throw err;
+  }
 }
 
-/**
- * Try to atomically acquire the lock. Returns the descriptor on success;
- * throws on EEXIST (caller decides whether to steal). Handles ENOENT on
- * the parent dir by creating it once.
- */
-function atomicAcquire(lockPath: string): number {
+function fsyncDirectory(path: string): void {
   try {
-    return openSync(lockPath, 'wx');
+    const fd = openSync(path, 'r');
+    try { fsyncSync(fd); } finally { closeSync(fd); }
+  } catch {
+    // Some filesystems/platforms do not support directory fsync.
+  }
+}
+
+function atomicAcquireDirectory(lockPath: string): boolean {
+  try {
+    mkdirSync(lockPath, { mode: 0o700 });
+    return true;
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
     if (code === 'ENOENT') {
-      mkdirSync(dirname(lockPath), { recursive: true });
-      return openSync(lockPath, 'wx');
+      mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
+      try {
+        mkdirSync(lockPath, { mode: 0o700 });
+        return true;
+      } catch (retryErr) {
+        if ((retryErr as NodeJS.ErrnoException).code === 'EEXIST') return false;
+        throw retryErr;
+      }
     }
+    if (code === 'EEXIST') return false;
+    throw err;
+  }
+}
+
+function publishOwner(lockPath: string, record: LockFileRecord): void {
+  const owner = record.owner!;
+  const ownerPath = ownerSentinelPath(lockPath, owner);
+  const fd = openSync(ownerPath, 'wx', 0o600);
+  try {
+    writeFileSync(fd, JSON.stringify(record), 'utf-8');
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  fsyncDirectory(lockPath);
+  fsyncDirectory(dirname(lockPath));
+}
+
+/**
+ * Remove only `owner`'s directory generation. The unique sentinel unlink is
+ * the ownership claim: if it is missing, this function never calls rmdir and
+ * therefore cannot remove a replacement generation.
+ */
+function removeOwnedDirectory(lockPath: string, owner: string): boolean {
+  const ownerPath = ownerSentinelPath(lockPath, owner);
+  try {
+    unlinkSync(ownerPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw err;
+  }
+
+  try {
+    rmdirSync(lockPath);
+    fsyncDirectory(dirname(lockPath));
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return true;
+    // ENOTEMPTY means another/unknown sentinel appeared. Never remove it.
+    if (code === 'ENOTEMPTY' || code === 'EEXIST') return false;
     throw err;
   }
 }
 
 /**
- * Decide whether a held lock is stale based on TTL + PID liveness.
- * Exported for unit testing the policy in isolation.
+ * A live PID always owns the lock, even beyond TTL. TTL now classifies a dead
+ * holder for diagnostics; it is never sufficient by itself to steal.
  */
 export function isLockStale(
   record: LockFileRecord,
   now: number,
   isPidAlive: (pid: number) => boolean,
 ): { stale: boolean; reason: 'ttl_expired' | 'pid_dead' | 'live' } {
-  const ageMs = now - record.ts;
-  if (ageMs > record.ttlMs) return { stale: true, reason: 'ttl_expired' };
-  if (!isPidAlive(record.pid)) return { stale: true, reason: 'pid_dead' };
-  return { stale: false, reason: 'live' };
+  if (isPidAlive(record.pid)) return { stale: false, reason: 'live' };
+  return {
+    stale: true,
+    reason: now - record.ts > record.ttlMs ? 'ttl_expired' : 'pid_dead',
+  };
 }
 
 /**
- * Acquire the lock OR throw `PackLockBusyError`. Steals stale locks
- * (per TTL + PID liveness) or when `opts.force` is set. Returns the
- * outcome so callers can audit how the acquire resolved.
+ * Acquire the lock or throw `PackLockBusyError`. `force` is deliberately not a
+ * live-lock bypass: only a valid owner record whose PID is confirmed dead may
+ * be recovered automatically.
  */
 export function acquirePackLock(
   packName: string,
@@ -174,125 +297,206 @@ export function acquirePackLock(
   const now = opts.now ?? Date.now;
   const isPidAlive = opts.isPidAlive ?? defaultIsPidAlive;
   const lockPath = resolveLockPath(packName, opts.lockDir);
+  let nextOutcome: LockOutcome = 'acquired';
 
-  const tryOnce = (): number | 'EEXIST' => {
-    try {
-      return atomicAcquire(lockPath);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'EEXIST') return 'EEXIST';
-      throw err;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    if (atomicAcquireDirectory(lockPath)) {
+      const record: LockFileRecord = {
+        owner: randomUUID(),
+        pid: process.pid,
+        hostname: process.env.HOSTNAME ?? 'unknown',
+        ts: now(),
+        ttlMs,
+      };
+      try {
+        publishOwner(lockPath, record);
+      } catch (err) {
+        // We created the directory and no conforming contender can enter it.
+        // Clean up only our unique sentinel (if published), then the empty dir.
+        if (!removeOwnedDirectory(lockPath, record.owner!)) {
+          try { rmdirSync(lockPath); } catch { /* leave ambiguous state fail-closed */ }
+        }
+        throw err;
+      }
+      return { lockPath, outcome: nextOutcome, record };
     }
-  };
 
-  const writeNew = (fd: number, outcome: LockOutcome): { lockPath: string; outcome: LockOutcome; record: LockFileRecord } => {
-    const record: LockFileRecord = {
-      pid: process.pid,
-      hostname: process.env.HOSTNAME ?? 'unknown',
-      ts: now(),
-      ttlMs,
-    };
-    writeLockRecord(lockPath, fd, record);
-    return { lockPath, outcome, record };
-  };
+    const snapshot = inspectLockPath(lockPath);
+    if (snapshot.kind === 'missing') continue;
+    const observedNow = now();
 
-  // First attempt: clean acquire.
-  const first = tryOnce();
-  if (first !== 'EEXIST') return writeNew(first, 'acquired');
-
-  // EEXIST: inspect.
-  const existing = readLockFile(lockPath);
-  if (existing === null) {
-    // Lockfile is corrupt — treat as stale and steal.
-    try { unlinkSync(lockPath); } catch { /* race with another stealer; retry below */ }
-    const retry = tryOnce();
-    if (retry === 'EEXIST') {
+    if (snapshot.kind === 'legacy_file') {
+      const ageMs = Math.max(0, observedNow - snapshot.mtimeMs);
       throw new PackLockBusyError(
-        `pack ${packName} lock is corrupt and another process re-acquired it during recovery`,
-        { heldBy: -1, ageMs: 0, ttlMs },
+        `pack ${packName} has a legacy/unsupported lock file; refusing unsafe automatic removal (manual recovery requires first verifying no old holder is running)`,
+        {
+          heldBy: snapshot.record?.pid ?? -1,
+          ageMs,
+          ttlMs: snapshot.record?.ttlMs ?? ttlMs,
+        },
       );
     }
-    return writeNew(retry, 'stolen_stale');
-  }
 
-  const staleness = isLockStale(existing, now(), isPidAlive);
-  if (staleness.stale || opts.force) {
-    try { unlinkSync(lockPath); } catch { /* race with another stealer; retry below */ }
-    const retry = tryOnce();
-    if (retry === 'EEXIST') {
-      // Another stealer won. Surface as busy with the current holder.
-      const current = readLockFile(lockPath);
-      const ageMs = current ? now() - current.ts : 0;
+    if (snapshot.kind === 'empty_directory') {
+      const ageMs = Math.max(0, observedNow - snapshot.mtimeMs);
+      const publishing = ageMs <= LOCK_PUBLISH_GRACE_MS;
       throw new PackLockBusyError(
-        `pack ${packName} lock was stolen by another process during our recovery (pid=${current?.pid ?? '?'})`,
-        { heldBy: current?.pid ?? -1, ageMs, ttlMs: current?.ttlMs ?? ttlMs },
+        publishing
+          ? `pack ${packName} lock owner is still being published (${Math.round(ageMs)}ms old)`
+          : `pack ${packName} lock has no owner sentinel; refusing unsafe automatic recovery`,
+        { heldBy: -1, ageMs, ttlMs: LOCK_PUBLISH_GRACE_MS },
       );
     }
-    return writeNew(retry, opts.force ? 'forced' : 'stolen_stale');
+
+    if (snapshot.kind === 'invalid_directory') {
+      const ageMs = Math.max(0, observedNow - snapshot.mtimeMs);
+      throw new PackLockBusyError(
+        `pack ${packName} lock has malformed or multiple owner sentinels; refusing unsafe automatic recovery`,
+        { heldBy: -1, ageMs, ttlMs },
+      );
+    }
+
+    const staleness = isLockStale(snapshot.record, observedNow, isPidAlive);
+    if (staleness.stale) {
+      if (!removeOwnedDirectory(lockPath, snapshot.record.owner!)) continue;
+      nextOutcome = 'stolen_stale';
+      continue;
+    }
+
+    const ageMs = Math.max(0, observedNow - snapshot.record.ts);
+    throw new PackLockBusyError(
+      `pack ${packName} is locked by live pid=${snapshot.record.pid} (held ${Math.round(ageMs / 1000)}s, ttl=${Math.round(snapshot.record.ttlMs / 1000)}s; force cannot steal a live holder)`,
+      { heldBy: snapshot.record.pid, ageMs, ttlMs: snapshot.record.ttlMs },
+    );
   }
 
-  // Live and non-stale: refuse.
+  const current = inspectLockPath(lockPath);
+  const record = current.kind === 'owned_directory' ? current.record : null;
   throw new PackLockBusyError(
-    `pack ${packName} is locked by pid=${existing.pid} (held ${Math.round((now() - existing.ts) / 1000)}s, ttl=${Math.round(existing.ttlMs / 1000)}s; --force to steal)`,
-    { heldBy: existing.pid, ageMs: now() - existing.ts, ttlMs: existing.ttlMs },
+    `pack ${packName} lock changed repeatedly during acquisition`,
+    {
+      heldBy: record?.pid ?? -1,
+      ageMs: record ? Math.max(0, now() - record.ts) : 0,
+      ttlMs: record?.ttlMs ?? ttlMs,
+    },
   );
 }
 
-/**
- * Refresh the lock's `ts` field so long-running operations don't appear
- * stale to a concurrent acquirer. Best-effort: write failures are
- * swallowed silently. Returns true on success, false if the lockfile is
- * gone (we lost the lock).
- */
 function refreshLock(lockPath: string, record: LockFileRecord, now: number): boolean {
+  if (!record.owner) return false;
+  const path = ownerSentinelPath(lockPath, record.owner);
+  let fd: number | null = null;
   try {
+    fd = openSync(path, 'r+');
+    const current = parseLockRecord(readFileSync(fd, 'utf-8'));
+    if (current?.owner !== record.owner) return false;
     const next: LockFileRecord = { ...record, ts: now };
-    writeFileSync(lockPath, JSON.stringify(next), 'utf-8');
-    return true;
+    const bytes = Buffer.from(JSON.stringify(next), 'utf-8');
+    writeSync(fd, bytes, 0, bytes.length, 0);
+    ftruncateSync(fd, bytes.length);
+    fsyncSync(fd);
+    // A replacement directory cannot contain this cryptographically unique
+    // sentinel name, so successful re-read is an owner fence.
+    return parseLockRecord(readFileSync(path, 'utf-8'))?.owner === record.owner;
   } catch {
     return false;
+  } finally {
+    if (fd !== null) closeSync(fd);
   }
 }
 
-/**
- * Release the lock by unlinking the file. Idempotent — missing file is
- * not an error (the holder may have crashed and another process stole).
- */
-function releasePackLock(lockPath: string): void {
+function releasePackLock(lockPath: string, owner: string | undefined): void {
+  if (!owner) return;
   try {
-    unlinkSync(lockPath);
+    removeOwnedDirectory(lockPath, owner);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      // Don't throw from a finally path — log to stderr and move on.
       process.stderr.write(`[pack-lock] release failed for ${lockPath}: ${(err as Error).message}\n`);
     }
   }
 }
 
+/** Opaque, owner-aware handle. Callers cannot release by pathname. */
+export interface HeldPackLock {
+  /** Refresh immediately. Returns false once ownership has been lost. */
+  refresh(): boolean;
+  /** Idempotently release this exact owner generation. */
+  release(): void;
+}
+
+/** Acquire a long-lived lock handle for callers whose control flow has returns. */
+export function holdPackLock(packName: string, opts: PackLockOpts = {}): HeldPackLock {
+  const acquired = acquirePackLock(packName, opts);
+  const now = opts.now ?? Date.now;
+  let currentRecord = acquired.record;
+  let released = false;
+  let refreshTimer: ReturnType<typeof setInterval> | null = null;
+  const held: HeldPackLock = {
+    refresh(): boolean {
+      if (released) return false;
+      const refreshedAt = now();
+      const ok = refreshLock(acquired.lockPath, currentRecord, refreshedAt);
+      if (ok) currentRecord = { ...currentRecord, ts: refreshedAt };
+      return ok;
+    },
+    release(): void {
+      if (released) return;
+      released = true;
+      if (refreshTimer) clearInterval(refreshTimer);
+      releasePackLock(acquired.lockPath, currentRecord.owner);
+    },
+  };
+  refreshTimer = setInterval(() => {
+    if (!held.refresh() && refreshTimer) clearInterval(refreshTimer);
+  }, REFRESH_INTERVAL_MS);
+  if (typeof (refreshTimer as NodeJS.Timeout).unref === 'function') refreshTimer.unref();
+  return held;
+}
+
+interface ContextLock {
+  held: HeldPackLock;
+  refs: number;
+  active: boolean;
+}
+
+const packLockContext = new AsyncLocalStorage<Map<string, ContextLock>>();
+
+function releaseContextRef(entry: ContextLock): void {
+  entry.refs -= 1;
+  if (entry.refs === 0) {
+    entry.active = false;
+    entry.held.release();
+  }
+}
+
 /**
- * Run `fn()` with exclusive access to `packName`. Acquires the lock,
- * starts a TTL refresh timer, runs `fn`, then unconditionally releases.
- *
- * Throws `PackLockBusyError` if the lock is held by a live process and
- * neither stale nor forced.
+ * Run `fn()` with exclusive access to `packName`. Descendant async calls for
+ * the same canonical lock path reuse the exact owner and increment a refcount;
+ * unrelated top-level calls never inherit that authority.
  */
 export async function withPackLock<T>(
   packName: string,
   opts: PackLockOpts,
   fn: () => Promise<T> | T,
 ): Promise<T> {
-  const acquired = acquirePackLock(packName, opts);
-  const now = opts.now ?? Date.now;
-  let currentRecord = acquired.record;
-  const refresh = setInterval(() => {
-    currentRecord = { ...currentRecord, ts: now() };
-    refreshLock(acquired.lockPath, currentRecord, now());
-  }, REFRESH_INTERVAL_MS);
-  // Don't keep the process alive just for the refresh timer.
-  if (typeof (refresh as NodeJS.Timer).unref === 'function') (refresh as NodeJS.Timer).unref();
+  const canonicalPath = resolveLockPath(packName, opts.lockDir);
+  const inherited = packLockContext.getStore();
+  const existing = inherited?.get(canonicalPath);
+  if (existing?.active) {
+    existing.refs += 1;
+    try {
+      return await fn();
+    } finally {
+      releaseContextRef(existing);
+    }
+  }
+
+  const entry: ContextLock = { held: holdPackLock(packName, opts), refs: 1, active: true };
+  const context = new Map(inherited ?? []);
+  context.set(canonicalPath, entry);
   try {
-    return await fn();
+    return await packLockContext.run(context, async () => await fn());
   } finally {
-    clearInterval(refresh);
-    releasePackLock(acquired.lockPath);
+    releaseContextRef(entry);
   }
 }

@@ -29,7 +29,7 @@
 import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { gbrainPath } from './config.ts';
-import { acquirePackLock, type PackLockOpts } from './schema-pack/pack-lock.ts';
+import { holdPackLock, type HeldPackLock, type PackLockOpts } from './schema-pack/pack-lock.ts';
 import { isMinorOrMajorBump, isValidVersionString, parseSemver, semverGt, semverLte } from './semver.ts';
 
 // ── Constants ───────────────────────────────────────────────────────────────
@@ -70,6 +70,7 @@ export type SelfUpgradeAction =
   | 'busy'
   | 'outside_quiet_hours'
   | 'unsupported_install'
+  | 'supervised_release'
   | 'notify'
   | 'apply';
 
@@ -92,6 +93,8 @@ export interface DecideSelfUpgradeInputs {
   idle?: boolean;
   inQuietHours?: boolean;
   canSelfUpdate?: boolean;
+  /** True only when this OLD/running binary locally approves the target. */
+  releaseAllowsSilentUpgrade?: boolean;
   /** True when the last auto-check was < AUTO_CHECK_INTERVAL_MS ago. */
   throttledByInterval?: boolean;
   // invocation-channel gate (ignored for autopilot):
@@ -165,6 +168,13 @@ export function decideSelfUpgrade(inp: DecideSelfUpgradeInputs): SelfUpgradeDeci
   }
 
   // autopilot channel (silent auto)
+  if (inp.releaseAllowsSilentUpgrade !== true) {
+    return {
+      action: 'supervised_release',
+      reason: `${inp.latestVersion} requires operator-supervised staged promotion`,
+      ...base,
+    };
+  }
   if (inp.throttledByInterval) {
     return { action: 'throttled', reason: 'auto-check ran within 24h', ...base };
   }
@@ -387,29 +397,26 @@ export function clearSnooze(): void {
 
 /**
  * Try to acquire the short-lived refresh lock so only ONE detached refresh runs
- * when many invocations see a stale cache at once. Returns the lock path on
- * success (caller must release it), or null if another process holds it.
+ * when many invocations see a stale cache at once. Returns an opaque,
+ * owner-aware handle on success (caller must release it), or null if another
+ * process holds it. A pathname is intentionally never exposed: a delayed
+ * caller must not be able to unlink a replacement owner's lock.
  * Separate from the upgrade mutex.
  */
-export function tryAcquireRefreshLock(opts?: Pick<PackLockOpts, 'now' | 'isPidAlive'>): string | null {
+export function tryAcquireRefreshLock(opts?: Pick<PackLockOpts, 'now' | 'isPidAlive'>): HeldPackLock | null {
   try {
-    const { lockPath } = acquirePackLock('update-refresh', {
+    return holdPackLock('update-refresh', {
       lockDir: locksDir(),
       ttlMs: 30_000,
       ...opts,
     });
-    return lockPath;
   } catch {
     return null;
   }
 }
 
-export function releaseRefreshLock(lockPath: string): void {
-  try {
-    unlinkSync(lockPath);
-  } catch {
-    /* already gone */
-  }
+export function releaseRefreshLock(lock: HeldPackLock): void {
+  lock.release();
 }
 
 // ── Breadcrumb reconciliation (attribution for crash-on-launch) ──────────────

@@ -33,7 +33,9 @@ beforeAll(async () => {
     return result.rows;
   };
 
-  provider = new GBrainOAuthProvider({ sql, tokenTtl: 60, refreshTtl: 300 });
+  // This unit file exercises the internal DCR store contract directly.
+  // Production/default providers omit registerClient.
+  provider = new GBrainOAuthProvider({ sql, tokenTtl: 60, refreshTtl: 300, dcrDisabled: false });
 }, 30_000); // PGLITE_SCHEMA_SQL execution under full-suite load can exceed default 5s
 
 afterAll(async () => {
@@ -1241,8 +1243,10 @@ describe('F12 dcrDisabled constructor option', () => {
     expect((store as any).registerClient).toBeUndefined();
   });
 
-  test('clientsStore exposes registerClient when dcrDisabled is false/unset', () => {
-    const dcrOn = new GBrainOAuthProvider({ sql });
+  test('clientsStore hides registerClient by default and exposes it only on explicit false', () => {
+    const defaultOff = new GBrainOAuthProvider({ sql });
+    expect((defaultOff.clientsStore as any).registerClient).toBeUndefined();
+    const dcrOn = new GBrainOAuthProvider({ sql, dcrDisabled: false });
     expect(typeof dcrOn.clientsStore.registerClient).toBe('function');
   });
 
@@ -1327,6 +1331,28 @@ describe('PKCE DCR public-client gate (#909)', () => {
     expect(stored!.token_endpoint_auth_method).toBe('none');
   });
 
+  test('verifyPublicClient accepts only an active explicit public client', async () => {
+    const publicReg = await provider.clientsStore.registerClient!({
+      client_name: 'public-verifier',
+      redirect_uris: ['https://example.com/callback'],
+      grant_types: ['authorization_code', 'refresh_token'],
+      scope: 'read',
+      token_endpoint_auth_method: 'none',
+    });
+    const confidentialReg = await provider.clientsStore.registerClient!({
+      client_name: 'confidential-verifier',
+      redirect_uris: ['https://example.com/callback'],
+      grant_types: ['authorization_code'],
+      scope: 'read',
+      token_endpoint_auth_method: 'client_secret_post',
+    });
+
+    await expect(provider.verifyPublicClient(publicReg.client_id))
+      .resolves.toMatchObject({ client_id: publicReg.client_id });
+    await expect(provider.verifyPublicClient(confidentialReg.client_id)).rejects.toThrow('Invalid client');
+    await expect(provider.verifyPublicClient('gbrain_cl_unknown')).rejects.toThrow('Invalid client');
+  });
+
   test('PKCE flow end-to-end: public client /authorize then /token, no secret needed', async () => {
     // Full F7 regression #15: public client completes auth_code → token
     // exchange without ever presenting a client_secret.
@@ -1358,6 +1384,16 @@ describe('PKCE DCR public-client gate (#909)', () => {
     // SDK normalizes token_type per RFC 6750 §6.1.1 (case-insensitive);
     // implementations may emit "bearer" lowercase.
     expect(String(tokens.token_type).toLowerCase()).toBe('bearer');
+
+    // The HTTP boundary no longer delegates public clients to the SDK, but
+    // existing public refresh grants remain renewable through the same
+    // provider authority.
+    const verifiedPublic = await provider.verifyPublicClient(reg.client_id);
+    const rotated = await provider.exchangeRefreshToken(
+      verifiedPublic,
+      tokens.refresh_token!,
+    );
+    expect(rotated.access_token).toStartWith('gbrain_at_');
   });
 });
 
@@ -1566,7 +1602,11 @@ describe('#1353 DCR default-grant hardening', () => {
   });
 
   test('--enable-dcr-insecure (allowClientCredentialsDcr) permits client_credentials', async () => {
-    const insecure = new GBrainOAuthProvider({ sql, allowClientCredentialsDcr: true });
+    const insecure = new GBrainOAuthProvider({
+      sql,
+      dcrDisabled: false,
+      allowClientCredentialsDcr: true,
+    });
     const reg = await insecure.clientsStore.registerClient!({
       client_name: 'cc-allowed-test',
       grant_types: ['client_credentials'],

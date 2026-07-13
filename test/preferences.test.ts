@@ -8,6 +8,7 @@ import {
   savePreferences,
   validateMinionMode,
   appendCompletedMigration,
+  appendInflightMigration,
   loadCompletedMigrations,
   preferencesPaths,
   type Preferences,
@@ -21,12 +22,9 @@ beforeEach(() => {
   origHome = process.env.HOME;
   origGbrainHome = process.env.GBRAIN_HOME;
   tmp = mkdtempSync(join(tmpdir(), 'gbrain-prefs-test-'));
-  // preferences.ts's gbrainDir() returns `$HOME/.gbrain` when GBRAIN_HOME
-  // is unset. Test fixtures write to `$tmp/.gbrain/...`, so set HOME only
-  // and clear GBRAIN_HOME — setting GBRAIN_HOME would route prefs to $tmp
-  // directly (no .gbrain suffix), which doesn't match the fixture layout.
+  // Canonical configDir() treats GBRAIN_HOME as the parent of .gbrain.
   process.env.HOME = tmp;
-  delete process.env.GBRAIN_HOME;
+  process.env.GBRAIN_HOME = tmp;
 });
 
 afterEach(() => {
@@ -108,6 +106,12 @@ describe('savePreferences', () => {
     expect(existsSync(join(tmp, '.gbrain'))).toBe(true);
   });
 
+  test('GBRAIN_HOME is a parent and preferences live under its .gbrain directory', () => {
+    savePreferences({ minion_mode: 'off' });
+    expect(preferencesPaths.file()).toBe(join(tmp, '.gbrain', 'preferences.json'));
+    expect(existsSync(join(tmp, '.gbrain', 'preferences.json'))).toBe(true);
+  });
+
   test('concurrent save + load: reader never sees a half-written file', () => {
     // Save a valid file, then save a new one. In the middle, the file should
     // always be parseable (atomic rename guarantees this).
@@ -178,6 +182,34 @@ describe('appendCompletedMigration', () => {
   });
 });
 
+describe('appendInflightMigration', () => {
+  test('durably emits three legacy-compatible partial rows for one attempt', () => {
+    const attemptId = '11111111-1111-4111-8111-111111111111';
+    appendInflightMigration({
+      version: '0.42.59.0',
+      brain_id: 'db:22222222-2222-4222-8222-222222222222',
+      attempt_id: attemptId,
+    });
+
+    const entries = loadCompletedMigrations();
+    expect(entries).toHaveLength(3);
+    expect(entries.map(entry => entry.ambiguity_fence_part)).toEqual([1, 2, 3]);
+    for (const entry of entries) {
+      expect(entry.status).toBe('partial');
+      expect(entry.inflight_state).toBe(true);
+      expect(entry.attempt_id).toBe(attemptId);
+      expect(entry.brain_id).toBe('db:22222222-2222-4222-8222-222222222222');
+    }
+  });
+
+  test('rejects an attempt without a UUID fence token', () => {
+    expect(() => appendInflightMigration({
+      version: '0.42.59.0',
+      attempt_id: 'not-a-uuid',
+    })).toThrow(/attempt_id must be a UUID/);
+  });
+});
+
 describe('loadCompletedMigrations', () => {
   test('returns empty when file is missing', () => {
     expect(loadCompletedMigrations()).toEqual([]);
@@ -192,7 +224,7 @@ describe('loadCompletedMigrations', () => {
     expect(entries[1].status).toBe('partial');
   });
 
-  test('tolerates malformed lines with a warning, continuing past them', () => {
+  test('fails closed on a malformed or torn ledger line', () => {
     const dir = join(tmp, '.gbrain', 'migrations');
     mkdirSync(dir, { recursive: true });
     // Write a file with a good line, a malformed line, and another good line.
@@ -205,9 +237,6 @@ describe('loadCompletedMigrations', () => {
         '',
       ].join('\n'),
     );
-    const entries = loadCompletedMigrations();
-    expect(entries.length).toBe(2);
-    expect(entries[0].version).toBe('0.10.0');
-    expect(entries[1].version).toBe('0.11.0');
+    expect(() => loadCompletedMigrations()).toThrow(/corrupt at line 2.*invalid or torn JSON/i);
   });
 });

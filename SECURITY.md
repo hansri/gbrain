@@ -10,94 +10,67 @@ Do not open a public issue for security vulnerabilities.
 
 ## Remote MCP Security
 
-### ⚠️ Do NOT use open OAuth client registration for remote MCP
+### Recommended: pre-registered principals on `gbrain serve --http`
 
-If you deploy GBrain's MCP server behind an HTTP wrapper with OAuth 2.1
-support, **never allow unauthenticated client registration**. An attacker
-who discovers your server URL can:
+The built-in HTTP server accepts trusted machine clients registered locally or
+through the authenticated admin API. It supports scoped
+`client_credentials`, existing refresh grants, and legacy scoped bearer tokens.
+It does not expose network Dynamic Client Registration, and `/authorize` fails
+closed until GBrain has an interactive operator-consent flow.
 
-1. Register a new OAuth client via `POST /register`
-2. Use `client_credentials` grant to obtain a bearer token
-3. Access all brain data via the MCP tools
+Use one principal per integration, one write source, an explicit federated read
+set, and the smallest OAuth/tool scope that works. Prefer a private network such
+as Tailscale; if a proxy or tunnel is required, keep the application port
+firewalled and terminate TLS at the reviewed edge.
 
-### Recommended: `gbrain serve --http`
+Never open `/register`, auto-approve `/authorize`, share an admin bootstrap
+credential, or accept a request's actor/source fields as authority. An attacker
+who can mint its own client or redirect a write source can otherwise read or
+pollute brain data while appearing to be a trusted agent.
 
-As of v0.22.7, GBrain ships a built-in HTTP transport that uses the
-existing `access_tokens` table for authentication:
+### If you use a custom OAuth gateway
 
-```bash
-# Create a token
-gbrain auth create "my-client"
+1. Authenticate the operator before any client registration or authorization.
+2. Show the client, redirect URI, requested scopes, tools, and source boundary.
+3. Require explicit consent and bind the authorization code to redirect URI and
+   PKCE challenge.
+4. Make credentials short-lived, scoped, revocable, rate-limited, and audited.
+5. Never log raw credentials or pass provider/database errors to the caller.
 
-# Start the HTTP server
-gbrain serve --http --port 8787
+### Pre-registering trusted clients (v0.41.3+)
 
-# Connect via ngrok, Tailscale, or any tunnel
-ngrok http 8787 --url your-brain.ngrok.app
-```
-
-This is the recommended way to expose GBrain remotely. No OAuth, no
-registration endpoint, no self-service tokens. Tokens are managed
-exclusively via `gbrain auth create/list/revoke`.
-
-### If you must use a custom HTTP wrapper
-
-1. **Require a secret for client registration** — check a header or body
-   parameter before creating new OAuth clients
-2. **Disable `client_credentials` grant** — only allow `authorization_code`
-   with browser-based approval
-3. **Restrict scopes** — never issue tokens with unlimited scope
-4. **Log all token issuance** — alert on unexpected registrations
-5. **Rate-limit registration and token endpoints**
-
-### Pre-registering claude.ai / ChatGPT clients without DCR (v0.41.3+)
-
-The recommended hardening posture above is: ship `gbrain serve --http`
-**without** `--enable-dcr` and pre-register every client manually. As of
-v0.41.3, `gbrain auth register-client` accepts the OAuth fields
-browser-based clients need:
+`gbrain serve --http` does not expose network Dynamic Client Registration.
+Pre-register machine clients locally (or through the authenticated admin API):
 
 ```bash
-# Pre-register claude.ai (confidential client; two redirect URIs)
-gbrain auth register-client claude-ai \
+# Confidential machine client
+gbrain auth register-client trusted-agent \
+  --grant-types client_credentials \
   --scopes "read write" \
-  --redirect-uri https://claude.ai/api/mcp/auth_callback \
-  --redirect-uri https://claude.com/api/mcp/auth_callback
-# --grant-types is auto-set to authorization_code,refresh_token when
-# --redirect-uri is passed; pass --grant-types explicitly to override.
-
-# Pre-register ChatGPT (public PKCE client; no client_secret minted)
-gbrain auth register-client chatgpt \
-  --scopes "read write" \
-  --redirect-uri https://chatgpt.com/connector/oauth/<HASH> \
-  --token-endpoint-auth-method none
+  --source default
 ```
 
 Auth methods (`--token-endpoint-auth-method`):
 
 - `client_secret_post` (default) — confidential client, secret in body
 - `client_secret_basic` — confidential client, secret in `Authorization` header
-- `none` — public PKCE-only client (no secret minted; ChatGPT custom
-  connector, Claude Code, Cursor)
+- `none` — public PKCE client record with no secret. The built-in server cannot
+  authorize it until the operator-consent flow exists, so this is not a current
+  ChatGPT connector path.
 
-The validator rejects unknown methods at the registration boundary, and
-the same gate applies to the admin endpoint `POST /admin/api/register-client`
-and the DCR `POST /register` path. Pre-v0.41.3 the CLI hard-coded
-`redirect_uris = []` and `token_endpoint_auth_method = NULL`, forcing
-operators to UPDATE `oauth_clients` rows by hand to make claude.ai work
-without `--enable-dcr`. That footgun is gone.
+The validator rejects unknown methods at the trusted registration boundary;
+the same gate applies to `POST /admin/api/register-client`.
 
-### DCR consent default (v0.42.55+)
+### Network registration and authorization-code consent
 
-The "disable `client_credentials`, only allow `authorization_code`" guidance
-above is now the built-in default for the DCR path, not just advice for custom
-wrappers. With `--enable-dcr` on, a self-registered client defaults to the
-`authorization_code` (browser-approval) grant, and an explicit
-`client_credentials` request is rejected with `invalid_client_metadata`.
-Operators who genuinely need the machine-to-machine grant on the registration
-endpoint opt in with `--enable-dcr-insecure` (which implies `--enable-dcr`); a
-startup WARNING prints whenever DCR is enabled, and a second when the insecure
-grant is allowed. Pre-registering clients via the CLI / admin API is unchanged.
+`POST /register` is unavailable. `/authorize` fails closed until GBrain ships
+a real interactive operator-consent surface; it never auto-approves an OAuth
+code request. Consequently, browser connectors that require an authorization-
+code redirect are not supported by the built-in HTTP server yet. Do not add a
+wrapper that silently approves them. Use a pre-registered confidential
+`client_credentials` client, a legacy scoped bearer token, or a separately
+reviewed consent-capable OAuth gateway. Existing refresh tokens remain
+renewable during migration.
 
 ### Token Management
 
@@ -162,6 +135,31 @@ Origin); both are now consolidated through a single allowlist-gated path.
 A startup stderr WARN fires when `--bind 0.0.0.0` is set without
 `GBRAIN_HTTP_CORS_ORIGIN`, surfacing the default-deny posture before the
 first request.
+
+The Express server also enforces the allowlist as a hard request gate
+*before* the MCP SDK router. This matters because some SDK OAuth handlers
+install their own permissive CORS middleware: merely omitting the outer
+header would let a nested handler add `Access-Control-Allow-Origin: *`
+again. An unlisted browser Origin now receives `403 cors_origin_denied`
+before token, registration, or MCP handling. Same-origin calls and
+non-browser clients remain compatible.
+
+### Browser and response hardening
+
+The Express surface disables `X-Powered-By` and emits a restrictive CSP,
+`X-Content-Type-Options: nosniff`, clickjacking protection, a no-referrer
+policy, and a restrictive Permissions Policy. It deliberately does not set
+HSTS: transport pinning belongs at the explicitly managed HTTPS edge, where
+the operator controls certificate renewal and the long-lived lockout risk.
+
+Admin sessions remain HttpOnly, host-only, `SameSite=Strict` cookies.
+Cookie-authenticated admin writes additionally validate Origin/Referer and
+Fetch Metadata, rejecting cross-origin and sibling-site requests with
+`403 csrf_origin_denied`. Supervised non-browser clients that explicitly
+carry the admin cookie remain compatible when no browser metadata exists.
+Unknown routes, malformed bodies, oversized bodies, and unexpected
+middleware errors return generic JSON envelopes rather than Express HTML
+or stack details.
 
 ### Rate limiting
 
@@ -243,6 +241,17 @@ GBRAIN_HTTP_MAX_BODY_BYTES=2097152 gbrain serve --http   # 2 MiB
 
 Over-cap requests get `413 Payload Too Large` immediately, before any
 body is materialized in memory.
+
+The Express OAuth/admin server has explicit route ceilings as well:
+
+- OAuth forms and dynamic-registration JSON: 32 KiB
+- Admin JSON: 32 KiB
+- MCP JSON: 1 MiB
+- Webhook ingestion and GitHub webhook payloads: 1 MiB by default
+
+These limits are independent of implicit Express/MCP SDK defaults and map
+over-cap requests to the stable JSON envelope
+`{"error":"payload_too_large"}`.
 
 ### Audit log
 

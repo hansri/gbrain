@@ -2,6 +2,82 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.59.0] - 2026-07-12
+
+**Interrupted multi-source syncs now stop safely instead of guessing what to delete or where to resume.** Each source owns its own write lease, stages file objects before publication, and proves that its final commit still belongs to the same database, source, and writer. If a listing is partial, a file becomes unreadable, a rename fails, or another scheduler tick overlaps, GBrain preserves the last known-good data and records a resumable failure.
+
+This release also makes agent boundaries explicit. Remote reads and webhook writes stay inside the authenticated source grant. Imported text remains untrusted evidence. Routine stdio agents get a small source-bound tool surface, while filesystem and administration tools stay in an explicit local maintenance profile.
+
+Upgrading is deliberately supervised. v0.42.59.0 changes ownership and migration authority, so it is prerelease-only and must not be installed by an older binary following a moving `latest` target. Stage the exact new release, prove a matched database and state backup, run the new binary's preflight, then migrate and promote only when doctor is green.
+
+| Situation | Result in v0.42.59.0 |
+|---|---|
+| Complete source scan | Reconciles and advances its checkpoint atomically |
+| Partial or cancelled scan | Keeps prior pages and records resumable failure evidence |
+| Overlapping writer | Loses the lease cleanly and cannot publish stale state |
+| Remote source override | Rejected; authenticated source authority wins |
+| Missing or mismatched upgrade state | Stops before brain mutation |
+
+## To take advantage of v0.42.59.0
+
+The first hop from an older binary is a supervised cutover. Do not run the old
+binary's generic upgrade wrapper for this release.
+
+1. Stop every GBrain service, sync/import writer, and scheduled migration.
+2. Take and verify one matched recovery snapshot containing the database plus
+   canonical and legacy GBrain state roots.
+3. Stage the exact v0.42.59.0 release without starting it.
+4. Run the staged new binary's preflight:
+
+   ```bash
+   /path/to/v0.42.59.0/gbrain upgrade-preflight --json
+   ```
+
+5. Repair only explicitly reviewed duplicate `source_path` owners, then repeat
+   preflight until it exits 0.
+6. With all old writers still stopped, run:
+
+   ```bash
+   /path/to/v0.42.59.0/gbrain apply-migrations --yes --non-interactive
+   /path/to/v0.42.59.0/gbrain doctor
+   ```
+
+7. Promote and restart only when both are green, then run one
+   `gbrain sync --all` reconciliation.
+
+Migration v123 preserves the legacy global file conflict key for a short,
+fully stopped rollback window. It does not permit mixed-version writers. If
+migration state is partial, wedged, ambiguous, or inflight, restore the matched
+database and state snapshot together with the previous binary. Full repair and
+rollback details are in `skills/migrations/v0.42.59.0.md`.
+
+### Itemized changes
+
+#### Added
+
+- **Per-source writer leases and commit fences.** Import, sync, stale extraction, and file publication coordinate through one source-scoped lease. Final writes verify database identity and lease ownership before advancing checkpoints.
+- **Content-addressed staging with atomic publication.** File objects are source-qualified, verified before promotion, and never resolved outside a remote caller's source grant.
+- **Full-convergence evidence.** Destructive reconciliation requires a complete observed path set. Partial work retains the prior good state and records an actionable failure.
+- **Migrations v123-v126.** Existing Postgres and PGLite brains gain file/source identity, single-owner source paths, renewable lock ownership, and explicit timeline ownership.
+
+#### Fixed
+
+- **Upgrade handoffs are database-bound and fail closed.** Interrupted swaps, changed brain bindings, stale or newer handoffs, unresolved migrations, and schema-gate failures block before host setup.
+- **Every inline updater carries one exact approved version.** Manual upgrade, self-upgrade, autopilot, thin-client prompts, package installs, source checkouts, and binary downloads verify the same target through replacement. Supervised and unknown targets cannot silently opt themselves in.
+- **HTTP authority is supervised.** Network client registration and unattended browser authorization are unavailable. Public OAuth failures are opaque, expensive routes are bounded before and after authentication, and generated admin credentials never enter public or non-interactive logs.
+- **Remote source authority cannot be forged.** MCP, retrieval IPC, and webhook ingest reject caller-selected source widening. Ingest preserves server-derived source/provenance and marks the payload remote and untrusted.
+- **Read-only PGLite checks cannot create a replacement brain.** Missing, moved, unsafe, or symlinked persistent data directories fail before an engine opens.
+- **Sync and Git durability are deterministic.** Rename batches roll back as a unit, stale owners cannot release newer leases, no-change reruns stay clean, and repository recovery ignores machine-global hooks and signing configuration.
+- **Extraction and file reads remain source-isolated.** Equal slugs or basenames from different sources no longer collapse ownership.
+- **`gbrain init --non-interactive` never prompts on a terminal.** Automated installs cannot hang on the search-mode picker.
+
+#### Changed
+
+- **Routine stdio MCP is lean and source-bound.** Retrieval, chronology, links, source statistics, and source health are the default surface. Broad local maintenance requires the explicit `unsafe-local-maintenance` profile.
+- **Generic background-job submission is host-local.** `submit_job` and the old `gbrain remote ping` shortcut are no longer remote capabilities. Use a supervised host maintenance session or a dedicated bounded action with server-owned inputs.
+- **Operational health reports partial work honestly.** Doctor, source status, jobs, and failure ledgers distinguish active, resumable, partial, and fully converged states.
+- **CI and dependencies are reproducible.** Tests use bounded deterministic shards and explicit Postgres lifecycle checks; installs use the reviewed frozen lockfile and audited pinned dependencies.
+
 ## [0.42.58.0] - 2026-07-06
 
 **gbrain now runs cleanly on the stack you already have — a local Ollama box, a self-hosted LiteLLM proxy, llama.cpp's llama-server, or gbrain running as a Claude Code MCP subprocess — instead of silently degrading or hard-failing when you're not on a raw OpenAI/Anthropic key.** A provider-agnostic plumbing pass across the AI gateway: environment handling, base-URL normalization, and embedding-dimension validation all stop tripping on the non-frontier-vendor setups that used to fail without a clear signal.
@@ -14873,7 +14949,7 @@ gbrain backfill list
 
 **Connection routing** — `ConnectionManager` auto-detects Supabase via hostname `pooler.supabase.com` or port 6543. `read()` goes to the pooler (fast, 10 conns); `ddl()` and `bulk()` go to a direct connection (port 5432, 30-min statement_timeout, capped at 3 conns, `maintenance_work_mem='256MB'`). Override the direct URL with `GBRAIN_DIRECT_DATABASE_URL`. Disable the split with `GBRAIN_DISABLE_DIRECT_POOL=1` (kill-switch, falls back to single-pool legacy). Worker engines (cycle, sync) inherit kill-switch state from their parent ConnectionManager.
 
-**Migration retry + verify hooks** — every migration retries 3 times on statement_timeout (5s/15s/45s backoff), with `getIdleBlockers()` logged before each retry. On retry exhaustion, the error envelope names the most recent blocker by PID and prints the `pg_terminate_backend(<pid>)` recovery command. `Migration.verify` lets a migration declare a post-condition probe; if verify returns false on an idempotent migration, the runner re-runs it once. On non-idempotent migrations, `MigrationDriftError` requires `--skip-verify` to force.
+**Migration retry + verify hooks** — every migration retries 3 times on statement_timeout (5s/15s/45s backoff), with `getIdleBlockers()` logged before each retry. On retry exhaustion, the error envelope names the most recent blocker by PID and prints the `pg_terminate_backend(<pid>)` recovery command. `Migration.verify` lets a migration declare a post-condition probe; if verify returns false on an idempotent migration, the runner re-runs it once. On non-idempotent migrations, `MigrationDriftError` blocks advancement until `gbrain upgrade-preflight` identifies and the operator repairs the invariant. The former `--skip-verify` bypass is rejected.
 
 **HNSW atomic-swap rebuild** — `dropAndRebuild` builds a new index with a temp name, swaps atomically via `DROP INDEX old; ALTER INDEX temp RENAME TO old`. If the rebuild fails, the old index is intact and search keeps serving queries. No more "production-degraded silent failure" mode.
 

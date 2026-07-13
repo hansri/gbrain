@@ -205,9 +205,22 @@ describeMaybe('phantom-redirect E2E (Postgres)', () => {
       const engine = getEngine();
       // Seed a phantom fact in DB with an embedding (must round-trip
       // through postgres-js's text representation per round 12).
-      // Build a 1536-d vector (canonical OpenAI embedding shape) of small
-      // values so we can verify the parse doesn't mangle.
-      const vec = Array(1536).fill(0).map((_, i) => i / 1536).map((v) => v.toFixed(6)).join(',');
+      // Build the vector to the actual facts column width. The committed
+      // Postgres bootstrap schema remains 1536-d while configurable/runtime
+      // defaults can differ, so the database is the authority for this E2E.
+      const dimRows = await engine.executeRaw<{ format_type: string }>(
+        `SELECT format_type(atttypid, atttypmod) AS format_type
+         FROM pg_attribute
+         WHERE attrelid = 'public.facts'::regclass
+           AND attname = 'embedding'`,
+      );
+      const dimensionMatch = dimRows[0]?.format_type.match(/\((\d+)\)/);
+      expect(dimensionMatch).not.toBeNull();
+      const embeddingDimensions = Number(dimensionMatch![1]);
+      const vec = Array.from(
+        { length: embeddingDimensions },
+        (_, i) => (i / embeddingDimensions).toFixed(6),
+      ).join(',');
       await engine.executeRaw(
         `INSERT INTO facts (
            source_id, entity_slug, fact, kind, valid_from,

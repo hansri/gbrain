@@ -35,10 +35,10 @@ per cron, zero LLM tokens, unified visibility and retry.
 Shell exec is a large blast radius. We ship two independent gates, both must
 pass:
 
-1. **MCP boundary.** `submit_job` with `name: 'shell'` is rejected when
-   `ctx.remote === true` (MCP callers). Independent of the env flag. Remote
-   agents can never submit shell jobs. `MinionQueue.add('shell', ...)` has its
-   own guard too, so an in-process handler can't programmatically bypass this.
+1. **MCP boundary.** Generic `submit_job` is host-local and rejects every
+   non-local context before queue access. Remote agents can never choose a job
+   handler, local path, or worker payload. `MinionQueue.add('shell', ...)` has
+   an independent trusted-call guard for in-process callers.
 2. **Env flag.** The worker only registers the shell handler when
    `GBRAIN_ALLOW_SHELL_JOBS=1` is set on the worker process. Default: off. Your
    agent opts in per-host.
@@ -278,7 +278,7 @@ gbrain jobs list --status waiting --name shell
 | `shell: inherit name "<X>" must match [a-z][a-z0-9_]*` | Name failed snake_case regex (uppercase, leading digit/underscore, special char). | Use the config-key name verbatim — `database_url`, not `DATABASE_URL`. |
 | `shell: inherit requested "<X>" but worker has no <X> configured` | Worker can't resolve the requested name from `loadConfig()`. | Run `gbrain config set <X> <value>` on the worker host, OR check the config file at `~/.gbrain/config.json`. |
 | `shell: redact_secrets must be a boolean if set` | Caller passed a non-boolean for `redact_secrets`. | Pass `true` or `false` (or omit). The CLI `--redact-secrets` flag sets it automatically. |
-| `permission_denied: shell jobs cannot be submitted over MCP` | An MCP client tried to submit a shell job. By design CLI-only. | Submit from CLI or via a trusted operation handler (`ctx.remote === false`). |
+| `permission_denied: submit_job is host-local only` | A remote client tried to submit a generic worker job. | Submit from the trusted host CLI or build a separate bounded action with server-owned inputs. |
 | `protected job name 'shell' requires CLI or operation-local submitter` | A caller invoked `MinionQueue.add('shell', ...)` without the `trusted` opt-in. | Pass `{ allowProtectedSubmit: true }` as the 4th arg. CLI and `submit_job` do this automatically. |
 | `aborted: timeout` / `aborted: cancel` / `aborted: shutdown` / `aborted: lock-lost` | The worker's abort signal fired mid-execution. Child got SIGTERM, 5s grace, then SIGKILL. | Expected: timeout / user cancel / deploy restart / stall. Inspect `gbrain jobs get` to see which. |
 | `exit N: <stderr_tail_500>` | Script exited non-zero. | Read `stderr_tail` in `gbrain jobs get`. |

@@ -5,6 +5,7 @@
 
 import { describe, expect, test, beforeAll, afterAll, beforeEach } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import type { FileSpec } from '../src/core/engine.ts';
 import { resetPgliteState } from './helpers/reset-pglite.ts';
 
 let engine: PGLiteEngine;
@@ -24,8 +25,22 @@ beforeEach(async () => {
 });
 
 describe('BrainEngine.upsertFile (Phase 3 + Eng-3E)', () => {
+  test('legacy callers without source_id remain scoped to default', async () => {
+    // Deliberately bypass the current TypeScript contract to emulate an older
+    // JavaScript client on the wire. New typed callers must provide source_id.
+    const result = await engine.upsertFile({
+      filename: 'legacy.jpg',
+      storage_path: 'legacy/legacy.jpg',
+      content_hash: 'sha256:legacy',
+    } as unknown as FileSpec);
+
+    expect(result.created).toBe(true);
+    expect((await engine.getFile('default', 'legacy/legacy.jpg'))?.source_id).toBe('default');
+  });
+
   test('happy path: inserts a new files row', async () => {
     const result = await engine.upsertFile({
+      source_id: 'default',
       filename: 'photo.jpg',
       storage_path: 'originals/photos/photo.jpg',
       mime_type: 'image/jpeg',
@@ -46,6 +61,7 @@ describe('BrainEngine.upsertFile (Phase 3 + Eng-3E)', () => {
 
   test('Eng-3E: ON CONFLICT idempotency — same path, same hash is no-op-ish', async () => {
     const r1 = await engine.upsertFile({
+      source_id: 'default',
       filename: 'photo.jpg',
       storage_path: 'originals/photos/photo.jpg',
       mime_type: 'image/jpeg',
@@ -53,6 +69,7 @@ describe('BrainEngine.upsertFile (Phase 3 + Eng-3E)', () => {
       content_hash: 'sha256:original',
     });
     const r2 = await engine.upsertFile({
+      source_id: 'default',
       filename: 'photo.jpg',
       storage_path: 'originals/photos/photo.jpg',
       mime_type: 'image/jpeg',
@@ -71,6 +88,7 @@ describe('BrainEngine.upsertFile (Phase 3 + Eng-3E)', () => {
 
   test('Eng-3E: ON CONFLICT updates metadata when content_hash changes', async () => {
     await engine.upsertFile({
+      source_id: 'default',
       filename: 'photo.jpg',
       storage_path: 'originals/photos/photo.jpg',
       mime_type: 'image/jpeg',
@@ -79,6 +97,7 @@ describe('BrainEngine.upsertFile (Phase 3 + Eng-3E)', () => {
     });
     // Image was replaced — same path, different content.
     const r2 = await engine.upsertFile({
+      source_id: 'default',
       filename: 'photo.jpg',
       storage_path: 'originals/photos/photo.jpg',
       mime_type: 'image/jpeg',
@@ -100,6 +119,7 @@ describe('BrainEngine.upsertFile (Phase 3 + Eng-3E)', () => {
       timeline: '',
     });
     await engine.upsertFile({
+      source_id: 'default',
       page_id: page.id,
       page_slug: page.slug,
       filename: 'whiteboard.jpg',
@@ -109,6 +129,7 @@ describe('BrainEngine.upsertFile (Phase 3 + Eng-3E)', () => {
       content_hash: 'sha256:wb',
     });
     await engine.upsertFile({
+      source_id: 'default',
       page_id: page.id,
       page_slug: page.slug,
       filename: 'sketch.png',
@@ -127,19 +148,41 @@ describe('BrainEngine.upsertFile (Phase 3 + Eng-3E)', () => {
     expect(row).toBeNull();
   });
 
-  test('upsertFile honors source_id for multi-source brains', async () => {
-    // Insert into source 'default'.
-    await engine.upsertFile({
-      filename: 'a.jpg',
-      storage_path: 'photos/a.jpg',
-      content_hash: 'sha256:a-default',
+  test('canary keeps legacy global path uniqueness until the rollback window closes', async () => {
+    await engine.executeRaw(
+      `INSERT INTO sources (id, name, config)
+       VALUES ('source-a', 'source-a', '{}'::jsonb),
+              ('source-b', 'source-b', '{}'::jsonb)`,
+    );
+
+    const a = await engine.upsertFile({
+      source_id: 'source-a',
+      filename: 'shared.jpg',
+      storage_path: 'photos/shared.jpg',
+      content_hash: 'sha256:a-v1',
     });
-    // The (source_id, storage_path) UNIQUE pattern is enforced via the
-    // single UNIQUE(storage_path) constraint shared with Postgres — this
-    // mirrors the v0.18 design. Per-source path namespacing is the brain's
-    // responsibility (sources mount at distinct path prefixes). This test
-    // verifies the API returns the source_id field correctly.
-    const row = await engine.getFile('default', 'photos/a.jpg');
-    expect(row!.source_id).toBe('default');
+    expect(a.created).toBe(true);
+    expect((await engine.getFile('source-a', 'photos/shared.jpg'))?.content_hash).toBe('sha256:a-v1');
+    await expect(engine.upsertFile({
+      source_id: 'source-b',
+      filename: 'shared.jpg',
+      storage_path: 'photos/shared.jpg',
+      content_hash: 'sha256:b-v1',
+    })).rejects.toThrow();
+  });
+
+  test('previous binary ON CONFLICT(storage_path) writer remains compatible', async () => {
+    await engine.executeRaw(
+      `INSERT INTO files (source_id, filename, storage_path, content_hash, metadata)
+       VALUES ('default', 'legacy.jpg', 'legacy/rollback.jpg', 'sha256:v1', '{}'::jsonb)
+       ON CONFLICT (storage_path) DO UPDATE SET content_hash = EXCLUDED.content_hash`,
+    );
+    await engine.executeRaw(
+      `INSERT INTO files (source_id, filename, storage_path, content_hash, metadata)
+       VALUES ('default', 'legacy.jpg', 'legacy/rollback.jpg', 'sha256:v2', '{}'::jsonb)
+       ON CONFLICT (storage_path) DO UPDATE SET content_hash = EXCLUDED.content_hash`,
+    );
+
+    expect((await engine.getFile('default', 'legacy/rollback.jpg'))?.content_hash).toBe('sha256:v2');
   });
 });

@@ -20,6 +20,7 @@ import {
   PGVECTOR_COLUMN_MAX_DIMS,
 } from '../src/core/embedding-dim-check.ts';
 import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
+import { withEnv } from './helpers/with-env.ts';
 
 // Canonical pattern: single engine per file, init once, disconnect once.
 // The two tests below diverge in whether they want a migrated brain or a
@@ -71,17 +72,21 @@ describe('readContentChunksEmbeddingDim', () => {
   }, 30000);
 
   test('returns { exists: false, dims: null } on a fresh brain (no initSchema)', async () => {
-    // One-off engine for the fresh-brain case. Never call initSchema so
-    // content_chunks doesn't exist yet. Cleaned up at end of test.
-    const fresh = new PGLiteEngine();
-    await fresh.connect({});
-    try {
-      const result = await readContentChunksEmbeddingDim(fresh);
-      expect(result.exists).toBe(false);
-      expect(result.dims).toBeNull();
-    } finally {
-      await fresh.disconnect();
-    }
+    // ci:local sets GBRAIN_PGLITE_SNAPSHOT to a fully migrated fixture for
+    // ordinary in-memory engines. Disable that optimization for this one
+    // pre-schema assertion; otherwise connect() has already restored
+    // content_chunks before this test deliberately skips initSchema().
+    const result = await withEnv({ GBRAIN_PGLITE_SNAPSHOT: undefined }, async () => {
+      const fresh = new PGLiteEngine();
+      await fresh.connect({});
+      try {
+        return await readContentChunksEmbeddingDim(fresh);
+      } finally {
+        await fresh.disconnect();
+      }
+    });
+    expect(result.exists).toBe(false);
+    expect(result.dims).toBeNull();
   }, 30000);
 });
 

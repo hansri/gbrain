@@ -254,7 +254,7 @@ export async function verifySchema(engine: BrainEngine): Promise<VerifyResult> {
     const simpleDef = simplifyColumnDef(rawDef);
 
     try {
-      const sql = `ALTER TABLE ${m.table} ADD COLUMN IF NOT EXISTS ${m.column} ${simpleDef}`;
+      const sql = `ALTER TABLE public.${m.table} ADD COLUMN IF NOT EXISTS ${m.column} ${simpleDef}`;
       await engine.runMigration(0, sql);
       result.healed.push({ table: m.table, column: m.column });
       console.log(`  ✓ Added ${m.table}.${m.column}`);

@@ -7,7 +7,7 @@
  */
 
 import { describe, test, expect, beforeEach } from 'bun:test';
-import { runSources } from '../src/commands/sources.ts';
+import { buildManagedSourceHardenOptions, runSources } from '../src/commands/sources.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
 
 // ── Stub engine that records queries ───────────────────────
@@ -74,6 +74,20 @@ async function withExitCapture(fn: () => Promise<void>): Promise<number | null> 
 }
 
 describe('sources add', () => {
+  test('binds managed auto-hardening to the registered remote URL', () => {
+    const options = buildManagedSourceHardenOptions(
+      { id: 'wiki', local_path: '/private/brain/wiki' },
+      'https://github.com/example/wiki.git',
+      'test-pat',
+    );
+    expect(options).toMatchObject({
+      repoPath: '/private/brain/wiki',
+      sourceId: 'wiki',
+      expectedRemoteUrl: 'https://github.com/example/wiki.git',
+      pat: 'test-pat',
+    });
+  });
+
   test('rejects invalid ids', async () => {
     const { engine } = makeStub();
     const code = await withExitCapture(() => runSources(engine, ['add']));

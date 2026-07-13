@@ -54,7 +54,7 @@ function ctxOf(opts: { remote?: boolean; clientId?: string; sourceId?: string } 
     logger: { info: () => {}, warn: () => {}, error: () => {} },
     dryRun: false,
     remote: opts.remote ?? true,
-    sourceId: opts.sourceId,
+    sourceId: opts.sourceId ?? 'default',
     auth: opts.clientId ? { clientId: opts.clientId, scopes: ['admin'] } : undefined,
   } as unknown as OperationContext;
 }
@@ -117,6 +117,9 @@ describe('operation declarations', () => {
     expect(op.scope).toBe('admin');
     expect(op.localOnly).toBeUndefined();
     expect(op.mutating).toBe(true);
+    expect(op.description).toContain('serialized');
+    expect(op.description).toContain('partial_results');
+    expect(op.description).not.toContain('all roll back');
   });
 
   it('reload_schema_pack is admin scope, NOT localOnly (D2)', () => {
@@ -245,7 +248,7 @@ describe('schema_review_orphans', () => {
   });
 });
 
-// ── schema_apply_mutations — batched + atomic ──────────────────────────
+// ── schema_apply_mutations — batched + serialized ──────────────────────
 
 describe('schema_apply_mutations', () => {
   it('applies a single add_type mutation', async () => {
@@ -262,7 +265,7 @@ describe('schema_apply_mutations', () => {
     });
   });
 
-  it('applies multiple mutations atomically (one batch_id across all)', async () => {
+  it('applies multiple serialized mutations with one batch_id across all', async () => {
     await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_AUDIT_DIR: auditDir }, async () => {
       seedPack('mine');
       const result = await operationsByName.schema_apply_mutations!.handler(ctxOf(), {

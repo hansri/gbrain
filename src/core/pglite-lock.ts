@@ -14,8 +14,21 @@
  *   try { ... } finally { await releaseLock(lock); }
  */
 
-import { mkdirSync, existsSync, readFileSync, writeFileSync, rmSync, statSync } from 'fs';
-import { join } from 'path';
+import {
+  closeSync,
+  constants as fsConstants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'fs';
+import { join, resolve } from 'path';
 
 const LOCK_DIR_NAME = '.gbrain-lock';
 const LOCK_FILE = 'lock';
@@ -55,6 +68,189 @@ export interface LockHandle {
    * the NEW owner's live lock and re-open the concurrent-writer hole).
    */
   ownerToken?: string;
+  /** Filesystem identity of the lock directory we created. */
+  lockDirIdentity?: { dev: bigint; ino: bigint };
+}
+
+/**
+ * An open-descriptor capability for one already-existing persistent PGLite
+ * directory. Keeping the descriptor open binds the preflight decision to the
+ * same inode until PGlite.create() has completed; the lexical path is checked
+ * against it before and after every lock mutation.
+ */
+export interface ExistingPgliteDataDirAuthority {
+  readonly dataDir: string;
+  readonly dev: bigint;
+  readonly ino: bigint;
+  readonly uid: bigint;
+  readonly mode: bigint;
+  readonly fd: number;
+  closed: boolean;
+}
+
+export class PgliteDataDirAuthorityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PgliteDataDirAuthorityError';
+  }
+}
+
+function errnoCode(error: unknown): string | undefined {
+  return typeof error === 'object' && error !== null && 'code' in error
+    ? String((error as NodeJS.ErrnoException).code)
+    : undefined;
+}
+
+function authorityFailure(message: string): never {
+  throw new PgliteDataDirAuthorityError(message);
+}
+
+/** Capture a non-following, non-creating authority for an existing data dir. */
+export function captureExistingPgliteDataDirAuthority(
+  dataDir: string,
+): ExistingPgliteDataDirAuthority {
+  const absolutePath = resolve(dataDir);
+  const noFollow = fsConstants.O_NOFOLLOW;
+  const directory = fsConstants.O_DIRECTORY;
+  if (typeof noFollow !== 'number' || typeof directory !== 'number') {
+    return authorityFailure(
+      'This platform cannot safely open an existing persistent PGLite directory without following links.',
+    );
+  }
+
+  let fd: number;
+  try {
+    fd = openSync(absolutePath, fsConstants.O_RDONLY | noFollow | directory);
+  } catch (error) {
+    if (errnoCode(error) === 'ENOENT') {
+      return authorityFailure(
+        'Configured persistent PGLite database_path does not exist; ' +
+        'read-only open will not create an empty store.',
+      );
+    }
+    if (errnoCode(error) === 'ELOOP' || errnoCode(error) === 'ENOTDIR') {
+      return authorityFailure(
+        'Configured persistent PGLite database_path is not a direct existing directory; ' +
+        'refusing read-only open.',
+      );
+    }
+    throw error;
+  }
+
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    if (!opened.isDirectory()) {
+      return authorityFailure(
+        'Configured persistent PGLite database_path is not a direct existing directory; ' +
+        'refusing read-only open.',
+      );
+    }
+    if (typeof process.getuid === 'function' && opened.uid !== BigInt(process.getuid())) {
+      return authorityFailure(
+        'Configured persistent PGLite database_path is not owned by the current user; ' +
+        'refusing read-only open.',
+      );
+    }
+    if ((opened.mode & 0o022n) !== 0n) {
+      return authorityFailure(
+        'Configured persistent PGLite database_path is group/other-writable; ' +
+        'refusing read-only open.',
+      );
+    }
+
+    let canonicalPath: string;
+    try {
+      canonicalPath = realpathSync.native(absolutePath);
+    } catch (error) {
+      if (errnoCode(error) === 'ENOENT') {
+        return authorityFailure(
+          'Configured persistent PGLite database_path moved while it was being checked; ' +
+          'read-only open will not create an empty store.',
+        );
+      }
+      throw error;
+    }
+    if (canonicalPath !== absolutePath) {
+      return authorityFailure(
+        'Configured persistent PGLite database_path is not the exact direct real directory; ' +
+        'refusing symlinked read-only open.',
+      );
+    }
+
+    const authority: ExistingPgliteDataDirAuthority = {
+      dataDir: absolutePath,
+      dev: opened.dev,
+      ino: opened.ino,
+      uid: opened.uid,
+      mode: opened.mode,
+      fd,
+      closed: false,
+    };
+    assertExistingPgliteDataDirAuthority(authority);
+    return authority;
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+/** Revalidate both the held descriptor and the configured lexical name. */
+export function assertExistingPgliteDataDirAuthority(
+  authority: ExistingPgliteDataDirAuthority,
+): void {
+  if (authority.closed) {
+    authorityFailure('Persistent PGLite read-only directory authority is already closed.');
+  }
+
+  let opened: ReturnType<typeof fstatSync>;
+  let named: ReturnType<typeof lstatSync>;
+  try {
+    opened = fstatSync(authority.fd, { bigint: true });
+    named = lstatSync(authority.dataDir, { bigint: true });
+  } catch (error) {
+    if (errnoCode(error) === 'ENOENT' || errnoCode(error) === 'EBADF') {
+      authorityFailure(
+        'Configured persistent PGLite database_path moved before connection; ' +
+        'read-only open will not create an empty store.',
+      );
+    }
+    throw error;
+  }
+
+  if (
+    !opened.isDirectory()
+    || named.isSymbolicLink()
+    || !named.isDirectory()
+    || opened.dev !== authority.dev
+    || opened.ino !== authority.ino
+    || opened.uid !== authority.uid
+    || named.dev !== authority.dev
+    || named.ino !== authority.ino
+    || named.uid !== authority.uid
+    || (opened.mode & 0o022n) !== 0n
+    || (named.mode & 0o022n) !== 0n
+  ) {
+    authorityFailure(
+      'Configured persistent PGLite database_path changed before connection; ' +
+      'refusing read-only open.',
+    );
+  }
+}
+
+export function closeExistingPgliteDataDirAuthority(
+  authority: ExistingPgliteDataDirAuthority | null | undefined,
+): void {
+  if (!authority || authority.closed) return;
+  authority.closed = true;
+  closeSync(authority.fd);
+}
+
+export interface AcquireLockOptions {
+  timeoutMs?: number;
+  /** Existing-only reads must never recreate a missing PGLite data dir. */
+  createDataDir?: boolean;
+  /** Optional inode-bound authority captured by the read-only preflight. */
+  dataDirAuthority?: ExistingPgliteDataDirAuthority;
 }
 
 /** The on-disk lock identity, used to detect "we were reaped and replaced". */
@@ -113,7 +309,7 @@ function isProcessAlive(pid: number): boolean {
  * Returns { acquired: true } if the lock was obtained, { acquired: false } otherwise.
  * Stale locks (from dead processes) are automatically cleaned up.
  */
-export async function acquireLock(dataDir: string | undefined, opts?: { timeoutMs?: number }): Promise<LockHandle> {
+export async function acquireLock(dataDir: string | undefined, opts?: AcquireLockOptions): Promise<LockHandle> {
   const lockDir = getLockDir(dataDir);
 
   // In-memory PGLite — no lock needed (process-scoped, can't be shared)
@@ -123,12 +319,33 @@ export async function acquireLock(dataDir: string | undefined, opts?: { timeoutM
 
   // `lockDir` being set implies `dataDir` is set (see getLockDir), but TS
   // can't derive that across helper boundaries.
-  mkdirSync(dataDir as string, { recursive: true });
+  const persistentDataDir = resolve(dataDir as string);
+  if (opts?.dataDirAuthority) {
+    if (opts.dataDirAuthority.dataDir !== persistentDataDir) {
+      throw new PgliteDataDirAuthorityError(
+        'Persistent PGLite lock authority does not match the configured database_path.',
+      );
+    }
+    assertExistingPgliteDataDirAuthority(opts.dataDirAuthority);
+  }
+  if (opts?.createDataDir === false) {
+    if (!opts.dataDirAuthority) {
+      throw new PgliteDataDirAuthorityError(
+        'Existing-only PGLite lock acquisition requires a bound directory authority.',
+      );
+    }
+    // Deliberately no mkdir(dataDir): this is the key non-creating boundary.
+  } else {
+    mkdirSync(persistentDataDir, { recursive: true });
+  }
 
   const timeoutMs = opts?.timeoutMs ?? 30_000; // 30 second default timeout
   const startTime = Date.now();
 
   while (Date.now() - startTime < timeoutMs) {
+    if (opts?.dataDirAuthority) {
+      assertExistingPgliteDataDirAuthority(opts.dataDirAuthority);
+    }
     // Check for stale lock first
     if (existsSync(lockDir)) {
       const lockPath = join(lockDir, LOCK_FILE);
@@ -160,6 +377,13 @@ export async function acquireLock(dataDir: string | undefined, opts?: { timeoutM
     // Try to acquire lock (atomic mkdir)
     try {
       mkdirSync(lockDir, { recursive: false });
+      if (opts?.dataDirAuthority) {
+        assertExistingPgliteDataDirAuthority(opts.dataDirAuthority);
+      }
+      const lockDirStat = lstatSync(lockDir, { bigint: true });
+      if (!lockDirStat.isDirectory() || lockDirStat.isSymbolicLink()) {
+        throw new PgliteDataDirAuthorityError('PGLite lock path is not a direct directory.');
+      }
       // We got the lock — write our PID. #2058: seed `refreshed_at` and start
       // the heartbeat so this holder reads as alive-and-working to others.
       const lockPath = join(lockDir, LOCK_FILE);
@@ -172,8 +396,19 @@ export async function acquireLock(dataDir: string | undefined, opts?: { timeoutM
       }), { mode: 0o644 });
 
       const ownerToken = tokenOf({ pid: process.pid, acquired_at: now });
-      return { lockDir, acquired: true, lockPath, ownerToken, heartbeat: startHeartbeat(lockPath, ownerToken) };
+      if (opts?.dataDirAuthority) {
+        assertExistingPgliteDataDirAuthority(opts.dataDirAuthority);
+      }
+      return {
+        lockDir,
+        acquired: true,
+        lockPath,
+        ownerToken,
+        heartbeat: startHeartbeat(lockPath, ownerToken),
+        lockDirIdentity: { dev: lockDirStat.dev, ino: lockDirStat.ino },
+      };
     } catch (e: unknown) {
+      if (e instanceof PgliteDataDirAuthorityError) throw e;
       // mkdir failed — someone else grabbed it between our check and mkdir
       // This is fine, we'll retry
       if (Date.now() - startTime >= timeoutMs) {
@@ -212,6 +447,23 @@ export async function releaseLock(lock: LockHandle): Promise<void> {
     lock.heartbeat = undefined;
   }
   if (!lock.lockDir || !lock.acquired) return;
+
+  // A rename/symlink swap of the configured data directory can move our lock
+  // away from its lexical path. Never recursively remove whatever happens to
+  // occupy that name now.
+  if (lock.lockDirIdentity) {
+    try {
+      const current = lstatSync(lock.lockDir, { bigint: true });
+      if (
+        current.isSymbolicLink()
+        || !current.isDirectory()
+        || current.dev !== lock.lockDirIdentity.dev
+        || current.ino !== lock.lockDirIdentity.ino
+      ) return;
+    } catch {
+      return;
+    }
+  }
 
   // #2058 (codex): only remove the lock if it is STILL ours. If we were reaped
   // past the grace and another process re-acquired, removing its live lock

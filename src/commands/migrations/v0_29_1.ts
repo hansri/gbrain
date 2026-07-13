@@ -18,16 +18,15 @@
  *   D. Record  — handled by the runner.
  */
 
-import type { BrainEngine } from '../../core/engine.ts';
 import type { Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult } from './types.ts';
+import { runSnapshotMigrateOnly, withMigrationEngine } from './snapshot.ts';
 
 // ── Phase A — Schema ────────────────────────────────────────
 
 async function phaseASchema(opts: OrchestratorOpts): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) return { name: 'schema', status: 'skipped', detail: 'dry-run' };
   try {
-    const { runMigrateOnlyCore } = await import('./in-process.ts');
-    await runMigrateOnlyCore();
+    await runSnapshotMigrateOnly(opts);
     return { name: 'schema', status: 'complete' };
   } catch (e) {
     return { name: 'schema', status: 'failed', detail: e instanceof Error ? e.message : String(e) };
@@ -38,41 +37,27 @@ async function phaseASchema(opts: OrchestratorOpts): Promise<OrchestratorPhaseRe
 
 async function phaseBBackfill(opts: OrchestratorOpts): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) return { name: 'backfill_effective_date', status: 'skipped', detail: 'dry-run' };
-  let engine: BrainEngine | null = null;
   try {
-    const { createEngine } = await import('../../core/engine-factory.ts');
-    const { loadConfig, toEngineConfig } = await import('../../core/config.ts');
     const { backfillEffectiveDate } = await import('../../core/backfill-effective-date.ts');
-    const cfg = loadConfig();
-    if (!cfg) throw new Error('No gbrain config; run `gbrain init` first.');
-    const engineConfig = toEngineConfig(cfg);
-    engine = await createEngine(engineConfig);
-    await engine.connect(engineConfig);
+    return await withMigrationEngine(opts, async engine => {
+      let totalUpdated = 0;
+      const result = await backfillEffectiveDate(engine, {
+        onBatch: ({ batch, lastId, rowsTouched, cumulative }) => {
+          totalUpdated += rowsTouched;
+          if (batch % 10 === 0) {
+            process.stderr.write(`  [backfill] batch ${batch} | last_id=${lastId} | examined=${cumulative} | updated_so_far=${totalUpdated}\n`);
+          }
+        },
+      });
 
-    let totalExamined = 0;
-    let totalUpdated = 0;
-
-    const result = await backfillEffectiveDate(engine, {
-      onBatch: ({ batch, lastId, rowsTouched, cumulative }) => {
-        totalExamined = cumulative;
-        totalUpdated += rowsTouched;
-        if (batch % 10 === 0) {
-          process.stderr.write(`  [backfill] batch ${batch} | last_id=${lastId} | examined=${cumulative} | updated_so_far=${totalUpdated}\n`);
-        }
-      },
+      return {
+        name: 'backfill_effective_date',
+        status: 'complete',
+        detail: `examined=${result.examined} updated=${result.updated} fallback=${result.fallback} dur=${result.durationSec.toFixed(1)}s`,
+      };
     });
-
-    return {
-      name: 'backfill_effective_date',
-      status: 'complete',
-      detail: `examined=${result.examined} updated=${result.updated} fallback=${result.fallback} dur=${result.durationSec.toFixed(1)}s`,
-    };
   } catch (e) {
     return { name: 'backfill_effective_date', status: 'failed', detail: e instanceof Error ? e.message : String(e) };
-  } finally {
-    if (engine) {
-      try { await engine.disconnect(); } catch { /* ignore */ }
-    }
   }
 }
 
@@ -80,37 +65,27 @@ async function phaseBBackfill(opts: OrchestratorOpts): Promise<OrchestratorPhase
 
 async function phaseCVerify(opts: OrchestratorOpts): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) return { name: 'verify', status: 'skipped', detail: 'dry-run' };
-  let engine: BrainEngine | null = null;
   try {
-    const { createEngine } = await import('../../core/engine-factory.ts');
-    const { loadConfig, toEngineConfig } = await import('../../core/config.ts');
-    const cfg = loadConfig();
-    if (!cfg) throw new Error('No gbrain config; run `gbrain init` first.');
-    const engineConfig = toEngineConfig(cfg);
-    engine = await createEngine(engineConfig);
-    await engine.connect(engineConfig);
-    // Count rows where effective_date is still NULL but frontmatter HAS a
-    // parseable date — those are the rows the backfill should have touched
-    // but didn't. (Rows that fall through to 'fallback' have non-null
-    // effective_date already; this catches genuine misses.)
-    const rows = await engine.executeRaw<{ count: string }>(
-      `SELECT COUNT(*)::text AS count FROM pages WHERE effective_date IS NULL`,
-    );
-    const remaining = Number(rows[0]?.count ?? 0);
-    if (remaining > 0) {
-      return {
-        name: 'verify',
-        status: 'failed',
-        detail: `${remaining} pages still have NULL effective_date (backfill incomplete)`,
-      };
-    }
-    return { name: 'verify', status: 'complete', detail: '0 pages with NULL effective_date' };
+    return await withMigrationEngine(opts, async engine => {
+      // Count rows where effective_date is still NULL but frontmatter HAS a
+      // parseable date — those are the rows the backfill should have touched
+      // but didn't. (Rows that fall through to 'fallback' have non-null
+      // effective_date already; this catches genuine misses.)
+      const rows = await engine.executeRaw<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM pages WHERE effective_date IS NULL`,
+      );
+      const remaining = Number(rows[0]?.count ?? 0);
+      if (remaining > 0) {
+        return {
+          name: 'verify',
+          status: 'failed',
+          detail: `${remaining} pages still have NULL effective_date (backfill incomplete)`,
+        };
+      }
+      return { name: 'verify', status: 'complete', detail: '0 pages with NULL effective_date' };
+    });
   } catch (e) {
     return { name: 'verify', status: 'failed', detail: e instanceof Error ? e.message : String(e) };
-  } finally {
-    if (engine) {
-      try { await engine.disconnect(); } catch { /* ignore */ }
-    }
   }
 }
 

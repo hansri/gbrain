@@ -18,6 +18,7 @@ import { join } from 'node:path';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { v0_32_2, __setTestEngineOverride, __testing } from '../src/commands/migrations/v0_32_2.ts';
 import { parseFactsFence } from '../src/core/facts-fence.ts';
+import { migrationTestOpts } from './helpers/migration-opts.ts';
 
 let engine: PGLiteEngine;
 let brainDir: string;
@@ -45,7 +46,7 @@ beforeEach(async () => {
   );
 });
 
-const OPTS = { yes: true, dryRun: false, noAutopilotInstall: true };
+const OPTS = migrationTestOpts();
 const DRY_OPTS = { ...OPTS, dryRun: true };
 
 async function seedLegacyFact(input: {

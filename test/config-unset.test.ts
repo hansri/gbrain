@@ -4,6 +4,7 @@
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
+import { isProtectedMigrationAuthorityKey } from '../src/commands/config.ts';
 
 let engine: PGLiteEngine;
 
@@ -97,5 +98,14 @@ describe('round-trip: set → unset → get', () => {
       expect(n).toBe(1);
       expect(await engine.getConfig('test.loopkey')).toBeNull();
     }
+  });
+});
+
+describe('migration authority protection', () => {
+  test('database identity and every inflight version are reserved', () => {
+    expect(isProtectedMigrationAuthorityKey('database_instance_id')).toBe(true);
+    expect(isProtectedMigrationAuthorityKey('migration_inflight:0.42.59.0')).toBe(true);
+    expect(isProtectedMigrationAuthorityKey('migration_inflight:future')).toBe(true);
+    expect(isProtectedMigrationAuthorityKey('search.mode')).toBe(false);
   });
 });

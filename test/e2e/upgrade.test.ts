@@ -43,7 +43,7 @@ describeE2E('E2E: Check-Update', () => {
     expect(output.current_version).toBe(VERSION);
     expect(output.current_source).toBe('package-json');
     expect(typeof output.update_available).toBe('boolean');
-    expect(typeof output.upgrade_command).toBe('string');
+    expect(output.upgrade_command).toBe('gbrain upgrade');
   });
 
   test('check-update without --json prints human-readable output', async () => {

@@ -14,9 +14,8 @@
  *     apply-migrations.
  *
  * Uses the __setTestEngineOverride() injection point on v0_22_4.ts (mirrors
- * the repair-jsonb test pattern). Bun's os.homedir() doesn't observe
- * process.env.HOME mutations mid-process, so we redirect via the explicit
- * test override rather than relying on env-var redirection of loadConfig().
+ * the repair-jsonb test pattern). Migration artifacts are isolated through
+ * GBRAIN_HOME, the canonical state-root override used by gbrainPath().
  *
  * No DATABASE_URL needed; runs unconditionally in CI's Tier 1.
  *
@@ -29,6 +28,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { v0_22_4, __setTestEngineOverride } from '../../src/commands/migrations/v0_22_4.ts';
+import { migrationTestOpts } from '../helpers/migration-opts.ts';
 
 const fence = '---';
 
@@ -37,7 +37,7 @@ let tmpHome: string;
 let brainRootA: string;
 let brainRootB: string;
 let engine: PGLiteEngine;
-let originalHome: string | undefined;
+let originalGbrainHome: string | undefined;
 const originalContents = new Map<string, string>();
 
 beforeAll(async () => {
@@ -86,29 +86,28 @@ beforeAll(async () => {
   );
   __setTestEngineOverride(engine);
 
-  // Redirect ~/.gbrain/migrations/ output. The orchestrator's gbrainDir()
-  // helper reads process.env.HOME at call time, so the override takes
-  // effect even though Bun's os.homedir() does not observe mid-process
-  // mutations.
-  originalHome = process.env.HOME;
-  process.env.HOME = tmpHome;
+  // Redirect ~/.gbrain/migrations/ output through the canonical state-root
+  // override. Changing HOME is intentionally insufficient: configDir() owns
+  // the GBRAIN_HOME contract for tests and multi-tenant deployments.
+  originalGbrainHome = process.env.GBRAIN_HOME;
+  process.env.GBRAIN_HOME = tmpHome;
 });
 
 afterAll(async () => {
   __setTestEngineOverride(null);
   if (engine) await engine.disconnect();
-  if (originalHome === undefined) delete process.env.HOME;
-  else process.env.HOME = originalHome;
+  if (originalGbrainHome === undefined) delete process.env.GBRAIN_HOME;
+  else process.env.GBRAIN_HOME = originalGbrainHome;
   rmSync(workdir, { recursive: true, force: true });
 });
 
 describe('E2E: v0.22.4 frontmatter-guard migration', () => {
   test('orchestrator runs end-to-end and produces the expected artifacts', async () => {
-    const result = await v0_22_4.orchestrator({
+    const result = await v0_22_4.orchestrator(migrationTestOpts({
       yes: true,
       dryRun: false,
       noAutopilotInstall: true,
-    });
+    }));
 
     expect(result.version).toBe('0.22.4');
     expect(['complete', 'partial']).toContain(result.status);
@@ -179,11 +178,11 @@ describe('E2E: v0.22.4 frontmatter-guard migration', () => {
   });
 
   test('orchestrator is idempotent — re-running does not duplicate JSONL entries', async () => {
-    await v0_22_4.orchestrator({
+    await v0_22_4.orchestrator(migrationTestOpts({
       yes: true,
       dryRun: false,
       noAutopilotInstall: true,
-    });
+    }));
     const jsonlPath = join(tmpHome, '.gbrain', 'migrations', 'pending-host-work.jsonl');
     const lines = readFileSync(jsonlPath, 'utf8').split('\n').filter(Boolean);
     expect(lines.length).toBe(2);

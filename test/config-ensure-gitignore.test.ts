@@ -8,11 +8,19 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'fs';
+import {
+  chmodSync,
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  rmSync,
+  statSync,
+} from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import { withEnv } from './helpers/with-env.ts';
-import { ensureGitignore, configDir } from '../src/core/config.ts';
+import { ensureGitignore, configDir, configPath, saveConfig } from '../src/core/config.ts';
 
 let testHome: string;
 
@@ -32,6 +40,27 @@ describe('ensureGitignore', () => {
       const file = join(configDir(), '.gitignore');
       expect(existsSync(file)).toBe(true);
       expect(readFileSync(file, 'utf-8')).toBe('*\n');
+      expect(statSync(configDir()).mode & 0o777).toBe(0o700);
+      expect(statSync(file).mode & 0o777).toBe(0o600);
+    });
+  });
+
+  test('saveConfig repairs an owned loose directory and publishes config owner-only', async () => {
+    await withEnv({ GBRAIN_HOME: testHome }, async () => {
+      const dir = configDir();
+      mkdirSync(dir, { recursive: true, mode: 0o755 });
+      chmodSync(dir, 0o755);
+      writeFileSync(configPath(), '{"stale":true}\n', { mode: 0o644 });
+      chmodSync(configPath(), 0o644);
+
+      saveConfig({ engine: 'pglite', database_path: '/tmp/test-brain.pglite' });
+
+      expect(statSync(dir).mode & 0o777).toBe(0o700);
+      expect(statSync(configPath()).mode & 0o777).toBe(0o600);
+      expect(JSON.parse(readFileSync(configPath(), 'utf8'))).toMatchObject({
+        engine: 'pglite',
+        database_path: '/tmp/test-brain.pglite',
+      });
     });
   });
 

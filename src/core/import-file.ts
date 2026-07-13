@@ -10,7 +10,7 @@ import { findChunkForOffset } from './chunkers/edge-extractor.ts';
 import { extractCodeRefs, imageOfCandidates } from './link-extraction.ts';
 import { embedBatch, embedMultimodal, currentEmbeddingSignature } from './embedding.ts';
 import { slugifyPath, slugifyCodePath, isCodeFilePath } from './sync.ts';
-import type { ChunkInput, PageInput, PageType } from './types.ts';
+import type { ChunkInput, Page, PageInput, PageKind, PageType } from './types.ts';
 import { computeEffectiveDate } from './effective-date.ts';
 import { MARKDOWN_CHUNKER_VERSION } from './chunkers/recursive.ts';
 import { logSlugFallback } from './audit-slug-fallback.ts';
@@ -36,9 +36,19 @@ import {
 } from './embedding-context.ts';
 import { loadSearchModeConfig, resolveSearchMode } from './search/mode.ts';
 import { normalizeAliasList } from './search/alias-normalize.ts';
-import { isUndefinedTableError, warnOncePerProcess } from './utils.ts';
 import { computeCorpusGeneration } from './contextual-retrieval-service.ts';
 import { runGuardrails } from './guardrails.ts';
+import {
+  openGitCommitSnapshot,
+  type GitCommitSnapshot,
+  type GitCommitBlob,
+} from './sync-delta.ts';
+import {
+  assertSourceWriterLease,
+  assertSourceWriterLeaseAtCommit,
+  withSourceWriterLease,
+  type SourceWriterLease,
+} from './source-writer-lease.ts';
 
 /**
  * v0.20.0 Cathedral II Layer 8 D2 — markdown fence extraction helper.
@@ -203,7 +213,183 @@ export interface ImportResult {
   flag_reason?: 'markup_heavy' | 'oversized';
 }
 
-const MAX_FILE_SIZE = 5_000_000; // 5MB
+/**
+ * Prepare the stable page identity inside an importer's existing final
+ * transaction. A rename is collision-checked and versioned before the slug is
+ * moved. updateSlug must affect exactly one row; any later importer failure
+ * rolls the whole transaction back to the original canonical slug.
+ */
+interface PriorImportState {
+  page: Page;
+  pageKind: PageKind;
+  sourcePath: string | null;
+}
+
+async function readPriorImportState(
+  tx: BrainEngine,
+  page: Page,
+  lock = false,
+): Promise<PriorImportState> {
+  const rows = await tx.executeRaw<{ page_kind: PageKind; source_path: string | null }>(
+    `SELECT page_kind, source_path FROM pages
+      WHERE id = $1 AND source_id = $2 AND slug = $3${lock ? ' FOR UPDATE' : ''}`,
+    [page.id, page.source_id, page.slug],
+  );
+  if (rows.length !== 1) {
+    throw new Error(`Import identity metadata missing for page_id=${page.id}`);
+  }
+  return {
+    page,
+    pageKind: rows[0]!.page_kind,
+    sourcePath: rows[0]!.source_path,
+  };
+}
+
+async function stagePageIdentityForImport(
+  tx: BrainEngine,
+  targetSlug: string,
+  renameFromSlug: string | undefined,
+  renameFromSourcePath: string | undefined,
+  sourceId: string,
+): Promise<PriorImportState | null> {
+  const sourceOpts = { sourceId };
+  if (renameFromSlug && renameFromSlug !== targetSlug) {
+    const origin = await tx.getPage(renameFromSlug, sourceOpts);
+    if (!origin) {
+      throw new Error(
+        `Atomic rename origin missing: ${sourceId}:${renameFromSlug} -> ${targetSlug}`,
+      );
+    }
+    const collision = await tx.getPage(targetSlug, {
+      ...sourceOpts,
+      includeDeleted: true,
+    });
+    if (collision) {
+      throw new Error(
+        `Atomic rename destination collision: ${sourceId}:${targetSlug} already exists`,
+      );
+    }
+    // A slug redirect is semantic ownership even without a pages row. Check
+    // at the final write boundary (not only sync's earlier preflight) so a
+    // detected collision and the page move commit or roll back together. An
+    // alias that already points to the page being moved is safe: updateSlug
+    // retires the resulting self-alias atomically.
+    const destinationAliases = await tx.executeRaw<{ canonical_slug: string }>(
+      `SELECT canonical_slug FROM slug_aliases
+        WHERE source_id = $1 AND alias_slug = $2`,
+      [sourceId, targetSlug],
+    );
+    const conflictingAlias = destinationAliases.find(
+      row => row.canonical_slug !== renameFromSlug,
+    );
+    if (conflictingAlias) {
+      throw new Error(
+        `Atomic rename destination alias collision: ${sourceId}:${targetSlug} ` +
+        `already redirects to ${conflictingAlias.canonical_slug}`,
+      );
+    }
+    if (!renameFromSourcePath) {
+      throw new Error(
+        `Atomic rename requires the expected origin source_path: ${sourceId}:${renameFromSlug}`,
+      );
+    }
+    const prior = await readPriorImportState(tx, origin, true);
+    const expectedPath = renameFromSourcePath.replace(/[\\\/]/g, '/');
+    const actualPath = prior.sourcePath?.replace(/[\\\/]/g, '/') ?? null;
+    if (actualPath !== expectedPath) {
+      throw new Error(
+        `Atomic rename source_path changed for ${sourceId}:${renameFromSlug}: ` +
+        `expected ${expectedPath}, found ${actualPath ?? 'NULL'}`,
+      );
+    }
+    await tx.createVersion(renameFromSlug, sourceOpts);
+    await tx.updateSlug(renameFromSlug, targetSlug, sourceOpts);
+    const renamed = await tx.getPage(targetSlug, sourceOpts);
+    if (!renamed || renamed.id !== origin.id) {
+      throw new Error(
+        `Atomic rename verification failed: ${sourceId}:${renameFromSlug} -> ${targetSlug}`,
+      );
+    }
+    return prior;
+  }
+
+  const existing = await tx.getPage(targetSlug, sourceOpts);
+  if (existing) await tx.createVersion(targetSlug, sourceOpts);
+  return existing ? readPriorImportState(tx, existing) : null;
+}
+
+/**
+ * Retire only importer-generated state that cannot survive a kind change.
+ * User attachments and manual links are deliberately untouched: the image
+ * ledger delete is constrained to the prior source path + page id, and the
+ * image_of delete matches the exact provenance shape emitted below.
+ */
+async function cleanupPriorImportedState(
+  tx: BrainEngine,
+  prior: PriorImportState | null,
+  opts: {
+    sourceId: string;
+    targetSlug: string;
+    targetKind: PageKind;
+    targetSourcePath?: string | null;
+  },
+): Promise<void> {
+  if (!prior) return;
+
+  if (prior.pageKind === 'code') {
+    const oldChunks = await tx.executeRaw<{ id: number }>(
+      `SELECT id FROM content_chunks WHERE page_id = $1`,
+      [prior.page.id],
+    );
+    await tx.deleteCodeEdgesForChunks(oldChunks.map(row => row.id));
+  }
+
+  if (prior.pageKind === 'image') {
+    const normalizedOldPath = prior.sourcePath?.replace(/[\\\/]/g, '/') ?? null;
+    const normalizedTargetPath = opts.targetSourcePath?.replace(/[\\\/]/g, '/') ?? null;
+    if (
+      normalizedOldPath &&
+      (opts.targetKind !== 'image' || normalizedOldPath !== normalizedTargetPath)
+    ) {
+      await tx.executeRaw(
+        `DELETE FROM files
+          WHERE source_id = $1 AND page_id = $2 AND storage_path = $3`,
+        [opts.sourceId, prior.page.id, normalizedOldPath],
+      );
+    }
+    await tx.executeRaw(
+      `DELETE FROM links
+        WHERE from_page_id = $1
+          AND origin_page_id = $1
+          AND link_type = 'image_of'
+          AND link_source = 'manual'
+          AND origin_field = 'frontmatter'`,
+      [prior.page.id],
+    );
+  }
+
+  if (prior.pageKind === 'markdown') {
+    // Markdown importer/reconcile-links owns only this provenance tuple.
+    // Retire it on every changed re-import (including markdown -> code/image
+    // conversion) so removed citations cannot leave stale doc<->code pairs.
+    // Body extractor rows have NULL origin; manual rows have another source.
+    await tx.executeRaw(
+      `DELETE FROM links
+        WHERE origin_page_id = $1
+          AND link_source = 'markdown'
+          AND origin_field = 'compiled_truth'
+          AND link_type IN ('documents', 'documented_by')`,
+      [prior.page.id],
+    );
+  }
+
+  if (opts.targetKind !== 'markdown') {
+    await tx.setPageAliases(opts.targetSlug, opts.sourceId, []);
+  }
+}
+
+/** Maximum bytes accepted by markdown and code import paths. */
+export const MAX_IMPORT_TEXT_BYTES = 5_000_000; // 5MB
 
 /**
  * Import content from a string. Core pipeline:
@@ -211,7 +397,8 @@ const MAX_FILE_SIZE = 5_000_000; // 5MB
  *
  * Used by put_page operation and importFromFile.
  *
- * Size guard: content is rejected if its UTF-8 byte length exceeds MAX_FILE_SIZE.
+ * Size guard: content is rejected if its UTF-8 byte length exceeds
+ * MAX_IMPORT_TEXT_BYTES.
  * importFromFile already enforces this against disk size before calling here, but
  * the remote MCP put_page operation passes caller-supplied content straight in,
  * so the guard has to live on this function — otherwise an authenticated caller
@@ -247,6 +434,10 @@ export async function importFromContent(
      * the version bump.
      */
     forceRechunk?: boolean;
+    /** Existing canonical slug moved inside the final write transaction. */
+    renameFromSlug?: string;
+    /** Previous source path (used by image imports; accepted for shared opts). */
+    renameFromSourcePath?: string;
     /**
      * v0.39.0.0 T1.5: active schema pack for type inference. When set, parseMarkdown
      * uses the pack's path_prefixes instead of the hardcoded gbrain-base table.
@@ -282,6 +473,8 @@ export async function importFromContent(
      * leave it unset → markers preserved (the gate + CLI own them).
      */
     remote?: boolean;
+    /** Internal fencing proof shared by bulk import/sync worker engines. */
+    writerLease?: SourceWriterLease;
   } = {},
 ): Promise<ImportResult> {
   // v0.18.0+ multi-source: when caller is syncing under a non-default source,
@@ -294,14 +487,21 @@ export async function importFromContent(
   // Uses Buffer.byteLength to count UTF-8 bytes the same way disk size would,
   // so the network path behaves identically to the file path.
   const byteLength = Buffer.byteLength(content, 'utf-8');
-  if (byteLength > MAX_FILE_SIZE) {
+  if (byteLength > MAX_IMPORT_TEXT_BYTES) {
     return {
       slug,
       status: 'skipped',
       chunks: 0,
-      error: `Content too large (${byteLength} bytes, max ${MAX_FILE_SIZE}). Split the content into smaller files or remove large embedded assets.`,
+      error: `Content too large (${byteLength} bytes, max ${MAX_IMPORT_TEXT_BYTES}). Split the content into smaller files or remove large embedded assets.`,
     };
   }
+
+  const effectiveSourceId = sourceId ?? 'default';
+  if (!opts.writerLease) {
+    return withSourceWriterLease(engine, effectiveSourceId, writerLease =>
+      importFromContent(engine, slug, content, { ...opts, writerLease }));
+  }
+  assertSourceWriterLease(opts.writerLease, engine, effectiveSourceId);
 
   const parsed = parseMarkdown(content, slug + '.md', { activePack: opts.activePack });
 
@@ -558,8 +758,9 @@ export async function importFromContent(
     tags: parsed.tags,
   };
 
-  const existing = await engine.getPage(slug, sourceId ? { sourceId } : undefined);
-  if (existing?.content_hash === hash && !opts.forceRechunk) {
+  const existingSlug = opts.renameFromSlug ?? slug;
+  const existing = await engine.getPage(existingSlug, { sourceId: effectiveSourceId });
+  if (!opts.renameFromSlug && existing?.content_hash === hash && !opts.forceRechunk) {
     return { slug, status: 'skipped', chunks: 0, parsedPage };
   }
 
@@ -600,9 +801,9 @@ export async function importFromContent(
         `${(err as Error).message}. Re-run import after DB recovery.`
       );
     }
-    if (dup && dup.slug !== slug) {
+    if (dup && dup.slug !== slug && dup.slug !== opts.renameFromSlug) {
       // Look up the duplicate page so we can compare frontmatter.id.
-      const dupPage = await engine.getPage(dup.slug, sourceId ? { sourceId } : undefined);
+      const dupPage = await engine.getPage(dup.slug, { sourceId: effectiveSourceId });
       const dupFmId = (dupPage?.frontmatter as Record<string, unknown> | undefined)?.id;
       const dupFmIdStr = typeof dupFmId === 'string' && dupFmId.length > 0 ? dupFmId : null;
       const sameExternalId = fmIdStr !== null && dupFmIdStr === fmIdStr;
@@ -728,9 +929,28 @@ export async function importFromContent(
   // caller's sourceId so writes target (sourceId, slug) rather than the
   // schema DEFAULT — required for multi-source brains; harmless ('default')
   // for single-source callers.
-  const txOpts = sourceId ? { sourceId } : undefined;
+  const txOpts = { sourceId: effectiveSourceId };
+  const aliasNorms = normalizeAliasList(
+    (parsed.frontmatter as Record<string, unknown>).aliases,
+  );
+  // Embedding/guardrail work can be long. Re-check the fencing token at the
+  // final DB boundary so a failed heartbeat or TTL takeover cannot let stale
+  // work commit after a successor acquired the source.
+  assertSourceWriterLease(opts.writerLease, engine, effectiveSourceId);
   await engine.transaction(async (tx) => {
-    if (existing) await tx.createVersion(slug, txOpts);
+    const prior = await stagePageIdentityForImport(
+      tx,
+      slug,
+      opts.renameFromSlug,
+      opts.renameFromSourcePath,
+      effectiveSourceId,
+    );
+    await cleanupPriorImportedState(tx, prior, {
+      sourceId: effectiveSourceId,
+      targetSlug: slug,
+      targetKind: 'markdown',
+      targetSourcePath: opts.sourcePath,
+    });
 
     // v0.29.1 — compute effective_date from frontmatter precedence chain.
     // Filename comes from importFromFile path (basename) or the slug tail
@@ -819,7 +1039,10 @@ export async function importFromContent(
       // as stale via embed --stale. The deferred/backfill + per-slug embed
       // paths stamp too; this covers the inline import/sync path.
       if (!opts.noEmbed) {
-        await tx.setPageEmbeddingSignature(slug, { sourceId, signature: currentEmbeddingSignature() });
+        await tx.setPageEmbeddingSignature(slug, {
+          sourceId: effectiveSourceId,
+          signature: currentEmbeddingSignature(),
+        });
       }
     } else {
       // Content is empty — delete stale chunks so they don't ghost in search results
@@ -862,26 +1085,16 @@ export async function importFromContent(
         );
       } catch { /* same reason — silent skip */ }
     }
-  });
 
-  // T3 — project frontmatter `aliases:` into page_aliases (free-text alias
-  // resolution for search). Runs AFTER the page write commits so the slug
-  // exists. Fail-soft: a pre-v110 brain has no page_aliases table yet (the
-  // migration may not have run); an alias-write failure must NOT fail the
-  // import. Always called (even with []) so REMOVING an alias from frontmatter
-  // clears its row — the content_hash includes non-timestamp frontmatter, so
-  // an alias edit changes the hash and reaches this path (not the skip branch).
-  try {
-    const aliasNorms = normalizeAliasList((parsed.frontmatter as Record<string, unknown>).aliases);
-    await engine.setPageAliases(slug, sourceId ?? 'default', aliasNorms);
-  } catch (e) {
-    if (!isUndefinedTableError(e)) {
-      warnOncePerProcess(
-        'setPageAliases:failed',
-        `[import] page_aliases projection failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`,
-      );
-    }
-  }
+    // Slug-keyed aliases are part of the same commit as the page identity.
+    // setPageAliases joins this active transaction (no savepoint).
+    await tx.setPageAliases(slug, effectiveSourceId, aliasNorms);
+
+    // Reassert at the real commit boundary. A lease can be lost while the
+    // preceding writes run; throwing here rolls the whole page transaction
+    // back instead of letting a fenced writer commit stale work.
+    await assertSourceWriterLeaseAtCommit(opts.writerLease!, tx, effectiveSourceId);
+  });
 
   return {
     slug,
@@ -903,108 +1116,141 @@ export async function importFromContent(
  * `people/elon` page on the next `gbrain sync` or `gbrain import`. In shared
  * brains where PRs are mergeable, this is a silent page-hijack primitive.
  */
-export async function importFromFile(
-  engine: BrainEngine,
-  filePath: string,
+export interface ImportFileOptions {
+  noEmbed?: boolean;
+  inferFrontmatter?: boolean;
+  sourceId?: string;
+  forceRechunk?: boolean;
+  /** Existing canonical slug to move inside the importer's final DB tx. */
+  renameFromSlug?: string;
+  /** Previous source path (needed to retire an image's old file ledger row). */
+  renameFromSourcePath?: string;
+  /**
+   * v0.39 T1.5: active schema pack threaded through to importFromContent so
+   * `parseMarkdown` uses pack-driven type inference. Load ONCE per command;
+   * never per file (codex perf finding #7).
+   */
+  activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }> };
+  /** Internal source-writer fencing proof. */
+  writerLease?: SourceWriterLease;
+}
+
+export type ImportFilePreflightResult =
+  | {
+      ok: true;
+      slug: string;
+      content: string;
+      kind: 'code' | 'markdown';
+      usedFrontmatterFallback: boolean;
+    }
+  | { ok: false; result: ImportResult };
+
+/**
+ * Parse and validate a text import without touching the database or embedding
+ * provider. Sync rename uses this to identify the committed destination before
+ * it considers retiring the old canonical page.
+ */
+export async function preflightImportFileContent(
+  content: string,
   relativePath: string,
-  opts: {
-    noEmbed?: boolean;
-    inferFrontmatter?: boolean;
-    sourceId?: string;
-    forceRechunk?: boolean;
-    /**
-     * v0.39 T1.5: active schema pack threaded through to importFromContent so
-     * `parseMarkdown` uses pack-driven type inference. Load ONCE per command;
-     * never per file (codex perf finding #7).
-     */
-    activePack?: { page_types: ReadonlyArray<{ name: string; path_prefixes: ReadonlyArray<string> }> };
-  } = {},
-): Promise<ImportResult> {
-  // Defense-in-depth: reject symlinks before reading content.
-  const lstat = lstatSync(filePath);
-  if (lstat.isSymbolicLink()) {
-    return { slug: relativePath, status: 'skipped', chunks: 0, error: `Skipping symlink: ${filePath}` };
-  }
-
-  const stat = statSync(filePath);
-  if (stat.size > MAX_FILE_SIZE) {
-    return { slug: relativePath, status: 'skipped', chunks: 0, error: `File too large (${stat.size} bytes)` };
-  }
-
-  let content = readFileSync(filePath, 'utf-8');
-
-  // Route code files through the code import path
+  opts: ImportFileOptions = {},
+): Promise<ImportFilePreflightResult> {
   if (isCodeFilePath(relativePath)) {
-    return importCodeFile(engine, relativePath, content, {
-      noEmbed: opts.noEmbed,
-      sourceId: opts.sourceId,
-    });
+    return {
+      ok: true,
+      slug: slugifyCodePath(relativePath),
+      content,
+      kind: 'code',
+      usedFrontmatterFallback: false,
+    };
   }
 
-  // v0.22.8 — Frontmatter inference: if the file has no frontmatter and
-  // inference is enabled, synthesize it from the filesystem path + content.
-  // This turns bare markdown files into fully-typed, dated, tagged pages
-  // without requiring the user to manually add YAML headers.
-  // The inference is applied to the in-memory content only; the file on disk
-  // is not modified. Use `gbrain frontmatter generate --fix` to write back.
   if (opts.inferFrontmatter !== false) {
     const { applyInference } = await import('./frontmatter-inference.ts');
     const { content: inferred, inferred: meta } = applyInference(relativePath, content);
-    if (!meta.skipped) {
-      content = inferred;
-    }
+    if (!meta.skipped) content = inferred;
   }
 
   const parsed = parseMarkdown(content, relativePath, { activePack: opts.activePack });
-
-  // Enforce path-authoritative slug. parseMarkdown prefers frontmatter.slug over
-  // the path-derived slug, so a mismatch here means the frontmatter is trying
-  // to rewrite a page whose filesystem location says something different.
-  //
-  // parsed.slug is `frontmatter.slug || inferSlug(filePath)` where inferSlug
-  // falls back to slugifyPath(). So parsed.slug.length > 0 with empty
-  // expectedSlug = frontmatter provided one; both empty = no usable slug.
   const expectedSlug = slugifyPath(relativePath);
   let resolvedSlug = expectedSlug;
   let usedFrontmatterFallback = false;
 
   if (expectedSlug === '') {
     if (parsed.slug && parsed.slug.length > 0) {
-      // v0.32.7 CJK wave (PR #598 + codex C1/C6): path-derived slug is empty
-      // (emoji / Thai / Arabic / exotic-script filename). Frontmatter slug
-      // takes over. logSlugFallback fires below once we know the import
-      // isn't going to short-circuit.
       resolvedSlug = parsed.slug;
       usedFrontmatterFallback = true;
     } else {
-      // No path slug, no frontmatter slug — friendlier error (D6=B).
       return {
-        slug: '',
-        status: 'skipped',
-        chunks: 0,
-        error:
-          `Filename "${relativePath}" produces no usable slug. ` +
-          `Add a "slug:" to the frontmatter, or rename the file to use ` +
-          `ASCII / Chinese / Japanese / Korean characters.`,
+        ok: false,
+        result: {
+          slug: '',
+          status: 'skipped',
+          chunks: 0,
+          error:
+            `Filename "${relativePath}" produces no usable slug. ` +
+            `Add a "slug:" to the frontmatter, or rename the file to use ` +
+            `ASCII / Chinese / Japanese / Korean characters.`,
+        },
       };
     }
   } else if (parsed.slug !== expectedSlug) {
-    // Anti-spoof preserved: path DOES derive a slug, but the frontmatter slug
-    // claims a different one. Reject.
     return {
-      slug: expectedSlug,
-      status: 'skipped',
-      chunks: 0,
-      error:
-        `Frontmatter slug "${parsed.slug}" does not match path-derived slug "${expectedSlug}" ` +
-        `(from ${relativePath}). Remove the frontmatter "slug:" line or move the file.`,
+      ok: false,
+      result: {
+        slug: expectedSlug,
+        status: 'skipped',
+        chunks: 0,
+        error:
+          `Frontmatter slug "${parsed.slug}" does not match path-derived slug "${expectedSlug}" ` +
+          `(from ${relativePath}). Remove the frontmatter "slug:" line or move the file.`,
+      },
     };
+  }
+
+  return {
+    ok: true,
+    slug: resolvedSlug,
+    content,
+    kind: 'markdown',
+    usedFrontmatterFallback,
+  };
+}
+
+/**
+ * Import already-captured text bytes under a repo-relative path.
+ *
+ * The content is an explicit argument so Git-backed sync can pass an immutable
+ * commit blob without round-tripping through a mutable checkout. Filesystem
+ * callers retain their lstat/stat checks in `importFromFile` before entering
+ * this shared parser.
+ */
+export async function importFileContent(
+  engine: BrainEngine,
+  content: string,
+  relativePath: string,
+  opts: ImportFileOptions = {},
+): Promise<ImportResult> {
+  const preflight = await preflightImportFileContent(content, relativePath, opts);
+  if (!preflight.ok) return preflight.result;
+  content = preflight.content;
+
+  // Route code files through the code import path.
+  if (preflight.kind === 'code') {
+    return importCodeFile(engine, relativePath, content, {
+      noEmbed: opts.noEmbed,
+      sourceId: opts.sourceId,
+      force: opts.forceRechunk,
+      renameFromSlug: opts.renameFromSlug,
+      renameFromSourcePath: opts.renameFromSourcePath,
+      writerLease: opts.writerLease,
+    });
   }
 
   // Emit the dual-channel audit entry AFTER we know we're not going to
   // short-circuit, so we don't log noise for failed imports.
-  if (usedFrontmatterFallback) {
-    logSlugFallback(resolvedSlug, relativePath);
+  if (preflight.usedFrontmatterFallback) {
+    logSlugFallback(preflight.slug, relativePath);
   }
 
   // Pass the resolved slug explicitly so that any future change to
@@ -1013,11 +1259,134 @@ export async function importFromFile(
   // precedence in computeEffectiveDate. e.g. `daily/2024-03-15.md` →
   // filename `2024-03-15`.
   const fileBasename = basename(relativePath, '.md');
-  return importFromContent(engine, resolvedSlug, content, {
+  return importFromContent(engine, preflight.slug, content, {
     ...opts,
     filename: fileBasename,
     sourcePath: relativePath,
   });
+}
+
+export async function importFromFile(
+  engine: BrainEngine,
+  filePath: string,
+  relativePath: string,
+  opts: ImportFileOptions = {},
+): Promise<ImportResult> {
+  // Defense-in-depth: reject symlinks before reading content.
+  const lstat = lstatSync(filePath);
+  if (lstat.isSymbolicLink()) {
+    return { slug: relativePath, status: 'skipped', chunks: 0, error: `Skipping symlink: ${filePath}` };
+  }
+
+  const stat = statSync(filePath);
+  if (stat.size > MAX_IMPORT_TEXT_BYTES) {
+    return { slug: relativePath, status: 'skipped', chunks: 0, error: `File too large (${stat.size} bytes)` };
+  }
+
+  return importFileContent(engine, readFileSync(filePath, 'utf-8'), relativePath, opts);
+}
+
+export type ImportGitBlobOptions = ImportFileOptions & ImportImageOptions;
+
+export type ImportGitBlobPreflightResult =
+  | { ok: true; slug: string }
+  | { ok: false; result: ImportResult };
+
+/**
+ * Resolve and validate an immutable Git target without side effects. The blob
+ * is read here so a missing/corrupt object cannot be discovered only after a
+ * rename transaction has begun. The later import reads the same immutable
+ * object again and performs the full quality/embedding checks.
+ */
+export async function preflightImportGitBlob(
+  snapshot: GitCommitSnapshot,
+  blob: GitCommitBlob,
+  opts: ImportGitBlobOptions = {},
+): Promise<ImportGitBlobPreflightResult> {
+  if (isImageFilePath(blob.path)) {
+    if (blob.size > MAX_IMPORT_IMAGE_BYTES) {
+      return {
+        ok: false,
+        result: {
+          slug: slugifyPath(blob.path),
+          status: 'skipped',
+          chunks: 0,
+          error: `Image too large (${blob.size} bytes, max ${MAX_IMPORT_IMAGE_BYTES}). Voyage multimodal caps at 20MB per input.`,
+        },
+      };
+    }
+    await snapshot.read(blob.path, MAX_IMPORT_IMAGE_BYTES);
+    return { ok: true, slug: blob.path.replace(/[\\\/]/g, '/').toLowerCase() };
+  }
+
+  if (blob.size > MAX_IMPORT_TEXT_BYTES) {
+    return {
+      ok: false,
+      result: {
+        slug: blob.path,
+        status: 'skipped',
+        chunks: 0,
+        error: `File too large (${blob.size} bytes)`,
+      },
+    };
+  }
+  const bytes = await snapshot.read(blob.path, MAX_IMPORT_TEXT_BYTES);
+  const text = await preflightImportFileContent(bytes.toString('utf8'), blob.path, opts);
+  if (!text.ok) return text;
+  return { ok: true, slug: text.slug };
+}
+
+/** Import a blob reference that was already resolved from one commit tree. */
+export async function importGitBlob(
+  engine: BrainEngine,
+  snapshot: GitCommitSnapshot,
+  blob: GitCommitBlob,
+  opts: ImportGitBlobOptions = {},
+): Promise<ImportResult> {
+  if (isImageFilePath(blob.path)) {
+    if (blob.size > MAX_IMPORT_IMAGE_BYTES) {
+      return {
+        slug: slugifyPath(blob.path),
+        status: 'skipped',
+        chunks: 0,
+        error: `Image too large (${blob.size} bytes, max ${MAX_IMPORT_IMAGE_BYTES}). Voyage multimodal caps at 20MB per input.`,
+      };
+    }
+    const bytes = await snapshot.read(blob.path, MAX_IMPORT_IMAGE_BYTES);
+    return importImageBuffer(engine, bytes, blob.path, opts);
+  }
+  if (blob.size > MAX_IMPORT_TEXT_BYTES) {
+    return {
+      slug: blob.path,
+      status: 'skipped',
+      chunks: 0,
+      error: `File too large (${blob.size} bytes)`,
+    };
+  }
+  const bytes = await snapshot.read(blob.path, MAX_IMPORT_TEXT_BYTES);
+  return importFileContent(engine, bytes.toString('utf8'), blob.path, opts);
+}
+
+/** Resolve and import one path from the exact bytes at `commit`. */
+export async function importGitCommitFile(
+  engine: BrainEngine,
+  repoPath: string,
+  commit: string,
+  relativePath: string,
+  opts: ImportGitBlobOptions = {},
+): Promise<ImportResult> {
+  const snapshot = openGitCommitSnapshot(repoPath, commit);
+  try {
+    const blob = snapshot.getBlob(relativePath);
+    if (!blob) {
+      throw new Error(
+        `Path is not a regular file in Git snapshot ${commit.slice(0, 12)}: ${relativePath}`,
+      );
+    }
+    return await importGitBlob(engine, snapshot, blob, opts);
+  } finally {
+    await snapshot.close();
+  }
 }
 
 /**
@@ -1046,18 +1415,32 @@ export async function importCodeFile(
   engine: BrainEngine,
   relativePath: string,
   content: string,
-  opts: { noEmbed?: boolean; force?: boolean; sourceId?: string } = {},
+  opts: {
+    noEmbed?: boolean;
+    force?: boolean;
+    sourceId?: string;
+    renameFromSlug?: string;
+    renameFromSourcePath?: string;
+    writerLease?: SourceWriterLease;
+  } = {},
 ): Promise<ImportResult> {
   const slug = slugifyCodePath(relativePath);
   const lang = detectCodeLanguage(relativePath) || 'unknown';
   const title = `${relativePath} (${lang})`;
   const sourceId = opts.sourceId;
-  const txOpts = sourceId ? { sourceId } : undefined;
+  const effectiveSourceId = sourceId ?? 'default';
+  const txOpts = { sourceId: effectiveSourceId };
 
   const byteLength = Buffer.byteLength(content, 'utf-8');
-  if (byteLength > MAX_FILE_SIZE) {
+  if (byteLength > MAX_IMPORT_TEXT_BYTES) {
     return { slug, status: 'skipped', chunks: 0, error: `Code file too large (${byteLength} bytes)` };
   }
+
+  if (!opts.writerLease) {
+    return withSourceWriterLease(engine, effectiveSourceId, writerLease =>
+      importCodeFile(engine, relativePath, content, { ...opts, writerLease }));
+  }
+  assertSourceWriterLease(opts.writerLease, engine, effectiveSourceId);
 
   // Vendor-neutral guardrail seam (observe-only, fail-open). Runs AFTER the
   // code size guard, BEFORE hash compute, code-chunking, embedding, and DB
@@ -1081,8 +1464,9 @@ export async function importCodeFile(
     .update(JSON.stringify({ title, type: 'code', content, lang, chunker_version: CHUNKER_VERSION }))
     .digest('hex');
 
-  const existing = await engine.getPage(slug, sourceId ? { sourceId } : undefined);
-  if (!opts.force && existing?.content_hash === hash) {
+  const existingSlug = opts.renameFromSlug ?? slug;
+  const existing = await engine.getPage(existingSlug, { sourceId: effectiveSourceId });
+  if (!opts.renameFromSlug && !opts.force && existing?.content_hash === hash) {
     return { slug, status: 'skipped', chunks: 0 };
   }
 
@@ -1119,7 +1503,9 @@ export async function importCodeFile(
   // OpenAI API. Order matters: our chunk_index is semantic (tree-sitter
   // order), so a matching (chunk_index, text_hash) means a verbatim
   // preserved symbol.
-  const existingChunks = existing ? await engine.getChunks(slug, sourceId ? { sourceId } : undefined) : [];
+  const existingChunks = existing
+    ? await engine.getChunks(existingSlug, { sourceId: effectiveSourceId })
+    : [];
   const existingByKey = new Map<string, typeof existingChunks[number]>();
   for (const ec of existingChunks) {
     existingByKey.set(`${ec.chunk_index}:${ec.chunk_text}`, ec);
@@ -1155,8 +1541,21 @@ export async function importCodeFile(
   // Store. Every per-page tx call carries `txOpts.sourceId` so multi-source
   // brains write to the correct (source_id, slug) row instead of duplicating
   // under the schema DEFAULT.
+  assertSourceWriterLease(opts.writerLease, engine, effectiveSourceId);
   await engine.transaction(async (tx) => {
-    if (existing) await tx.createVersion(slug, txOpts);
+    const prior = await stagePageIdentityForImport(
+      tx,
+      slug,
+      opts.renameFromSlug,
+      opts.renameFromSourcePath,
+      effectiveSourceId,
+    );
+    await cleanupPriorImportedState(tx, prior, {
+      sourceId: effectiveSourceId,
+      targetSlug: slug,
+      targetKind: 'code',
+      targetSourcePath: relativePath,
+    });
 
     await tx.putPage(slug, {
       type: 'code' as string,
@@ -1166,6 +1565,7 @@ export async function importCodeFile(
       timeline: '',
       frontmatter: { language: lang, file: relativePath },
       content_hash: hash,
+      source_path: relativePath,
     }, txOpts);
 
     await tx.addTag(slug, 'code', txOpts);
@@ -1179,41 +1579,25 @@ export async function importCodeFile(
       // falsely marked current; `reindex --code --force` / `embed --stale`
       // handle the swap for those.
       if (!opts.noEmbed && needsEmbedIndexes.length === chunks.length) {
-        await tx.setPageEmbeddingSignature(slug, { sourceId, signature: currentEmbeddingSignature() });
+        await tx.setPageEmbeddingSignature(slug, {
+          sourceId: effectiveSourceId,
+          signature: currentEmbeddingSignature(),
+        });
       }
     } else {
       await tx.deleteChunks(slug, txOpts);
     }
-  });
 
-  // v0.20.0 Cathedral II Layer 5 (A1): extracted call-site edges persist
-  // in code_edges_symbol (unresolved — we don't attempt within-file target
-  // resolution here; getCallersOf / getCalleesOf match on to_symbol_qualified
-  // which is the callee's short name). Edges land AFTER chunks upsert so
-  // chunk IDs are stable.
-  if (extractedEdges.length > 0 && chunks.length > 0) {
-    try {
-      // Normalize ONCE: '' and undefined both mean the schema-default source
-      // (pages.source_id DEFAULT 'default'). Using the normalized value for
-      // BOTH the chunk lookup and the edge stamp keeps them in lockstep —
-      // an unscoped getChunks here could fan out to same-slug chunks from
-      // another source, and a '' stamp would FK-violate against sources(id)
-      // and silently drop the file's whole call graph in the best-effort
-      // catch below (adversarial review findings).
-      const edgeSourceId = sourceId || 'default';
-      const persistedChunks = await engine.getChunks(slug, { sourceId: edgeSourceId });
+    // Code edges are part of the same final commit as page/chunk identity.
+    // cleanupPriorImportedState removed every edge touching the prior code
+    // chunks before upsert. Any get/add failure below therefore rolls back the
+    // page rename and the edge replacement together; replay can safely honor
+    // content_hash without inheriting a half-built call graph.
+    if (extractedEdges.length > 0 && chunks.length > 0) {
+      const persistedChunks = await tx.getChunks(slug, { sourceId: effectiveSourceId });
       const byIndex = new Map<number, { id?: number; symbol_name_qualified?: string | null; start_line?: number | null; end_line?: number | null }>();
       for (const pc of persistedChunks) {
         byIndex.set(pc.chunk_index, pc);
-      }
-      // Per-chunk invalidation (codex SP-2): wipe old edges involving
-      // chunks whose IDs we know, so re-import doesn't leave stale
-      // edges pointing at old symbol names.
-      const chunkIds = persistedChunks
-        .map(c => c.id)
-        .filter((id): id is number => typeof id === 'number');
-      if (chunkIds.length > 0) {
-        await engine.deleteCodeEdgesForChunks(chunkIds);
       }
 
       // Build the chunk-range table for offset → chunk-id resolution.
@@ -1239,30 +1623,19 @@ export async function importCodeFile(
           from_symbol_qualified: from.symbol_name_qualified,
           to_symbol_qualified: e.toSymbol,
           edge_type: e.edgeType,
-          // Stamp the source: getCallersOf/getCalleesOf add
-          // `AND source_id = <scoped>` whenever a worktree pin / --source is
-          // in play, and a NULL here never matches that filter — so every
-          // scoped call-graph query silently returned 0 rows on
-          // multi-source brains even though the edges existed. The fallback
-          // is 'default', NOT null: an unscoped import lands its pages under
-          // the schema default (pages.source_id DEFAULT 'default'), so a
-          // NULL-stamped edge would be invisible to the matching scoped
-          // query getCallersOf(sym, { sourceId: 'default' }) — the same bug
-          // through the other door.
-          source_id: edgeSourceId,
+          source_id: effectiveSourceId,
         });
       }
 
       if (edgeInputs.length > 0) {
-        await engine.addCodeEdges(edgeInputs);
+        await tx.addCodeEdges(edgeInputs);
       }
-    } catch (edgeErr) {
-      // Edge persistence is best-effort. A failed addCodeEdges must not
-      // fail the overall import — the chunks + embeddings already
-      // landed, which is the primary value.
-      console.warn(`[gbrain] edge extraction failed for ${slug}: ${edgeErr instanceof Error ? edgeErr.message : String(edgeErr)}`);
     }
-  }
+
+    // Page, chunks and code edges share one fencing point immediately before
+    // the transaction callback returns to the engine for commit.
+    await assertSourceWriterLeaseAtCommit(opts.writerLease!, tx, effectiveSourceId);
+  });
 
   return { slug, status: 'imported', chunks: chunks.length };
 }
@@ -1287,7 +1660,7 @@ export type ImportFileResult = ImportResult;
 export const SUPPORTED_IMAGE_EXTS = ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.heic', '.heif', '.avif'] as const;
 
 /** Voyage caps each multimodal input at 20MB. We honor that as the size limit. */
-const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+export const MAX_IMPORT_IMAGE_BYTES = 20 * 1024 * 1024;
 
 /** Extensions that need WASM decode before Voyage embedding. */
 const NEEDS_DECODE = new Set(['.heic', '.heif', '.avif']);
@@ -1303,7 +1676,15 @@ const NEEDS_DECODE = new Set(['.heic', '.heif', '.avif']);
  */
 export interface ImportTransactionSpec {
   slug: string;
-  hadExisting: boolean;
+  /**
+   * Source that owns every row touched by this transaction. Omit for the
+   * legacy/default-source path. Multi-source callers must pass it so page
+   * versioning, page/chunk replacement, and file metadata stay on the same
+   * `(source_id, slug)` identity.
+   */
+  sourceId?: string;
+  renameFromSlug?: string;
+  renameFromSourcePath?: string;
   page: PageInput;
   /** When undefined, no chunk write happens. When [], deletes any prior chunks. */
   chunks?: ChunkInput[];
@@ -1311,6 +1692,8 @@ export interface ImportTransactionSpec {
   file?: FileSpec;
   /** Inside-transaction hook for type-specific work (tags, links). */
   after?: (tx: BrainEngine) => Promise<void>;
+  /** Runtime fencing proof for importer-owned transactions. */
+  writerLease?: SourceWriterLease;
 }
 
 export async function withImportTransaction(
@@ -1318,25 +1701,43 @@ export async function withImportTransaction(
   spec: ImportTransactionSpec,
 ): Promise<void> {
   await engine.transaction(async (tx) => {
-    if (spec.hadExisting) await tx.createVersion(spec.slug);
-    await tx.putPage(spec.slug, spec.page);
+    const sourceId = spec.sourceId ?? 'default';
+    if (spec.writerLease) assertSourceWriterLease(spec.writerLease, tx, sourceId);
+    const sourceOpts = { sourceId };
+    const prior = await stagePageIdentityForImport(
+      tx,
+      spec.slug,
+      spec.renameFromSlug,
+      spec.renameFromSourcePath,
+      sourceId,
+    );
+    const targetKind = spec.page.page_kind ?? 'markdown';
+    await cleanupPriorImportedState(tx, prior, {
+      sourceId,
+      targetSlug: spec.slug,
+      targetKind,
+      targetSourcePath: spec.page.source_path,
+    });
+    await tx.putPage(spec.slug, spec.page, sourceOpts);
     if (spec.file) {
       // page_id resolution after putPage so the new row's id is available.
-      const stored = await tx.getPage(spec.slug);
+      const stored = await tx.getPage(spec.slug, sourceOpts);
       await tx.upsertFile({
         ...spec.file,
+        source_id: sourceId,
         page_slug: spec.slug,
         page_id: stored?.id ?? null,
       });
     }
     if (spec.chunks !== undefined) {
       if (spec.chunks.length > 0) {
-        await tx.upsertChunks(spec.slug, spec.chunks);
+        await tx.upsertChunks(spec.slug, spec.chunks, sourceOpts);
       } else {
-        await tx.deleteChunks(spec.slug);
+        await tx.deleteChunks(spec.slug, sourceOpts);
       }
     }
     if (spec.after) await spec.after(tx);
+    if (spec.writerLease) await assertSourceWriterLeaseAtCommit(spec.writerLease, tx, sourceId);
   });
 }
 
@@ -1525,6 +1926,12 @@ export interface ImportImageOptions {
    * with sourceId would TS-error on the importImageFile branch.
    */
   sourceId?: string;
+  /** Existing canonical slug to move inside the final image-write tx. */
+  renameFromSlug?: string;
+  /** Previous image storage path to remove in that same tx. */
+  renameFromSourcePath?: string;
+  /** Internal source-writer fencing proof. */
+  writerLease?: SourceWriterLease;
 }
 
 /** Module-level limiter so concurrent imports across files share the budget. */
@@ -1536,26 +1943,27 @@ const _ocrLimiter = pLimit(8);
  * (extended in import.ts to recognize image extensions when
  * embedding_multimodal is on).
  */
-export async function importImageFile(
+export async function importImageBuffer(
   engine: BrainEngine,
-  filePath: string,
+  buf: Buffer,
   relativePath: string,
   opts: ImportImageOptions = {},
 ): Promise<ImportResult> {
-  // Defense-in-depth: reject symlinks before reading bytes.
-  const lstat = lstatSync(filePath);
-  if (lstat.isSymbolicLink()) {
-    return { slug: slugifyPath(relativePath), status: 'skipped', chunks: 0, error: `Skipping symlink: ${filePath}` };
-  }
-  const stat = statSync(filePath);
-  if (stat.size > MAX_IMAGE_BYTES) {
+  if (buf.byteLength > MAX_IMPORT_IMAGE_BYTES) {
     return {
       slug: slugifyPath(relativePath),
       status: 'skipped',
       chunks: 0,
-      error: `Image too large (${stat.size} bytes, max ${MAX_IMAGE_BYTES}). Voyage multimodal caps at 20MB per input.`,
+      error: `Image too large (${buf.byteLength} bytes, max ${MAX_IMPORT_IMAGE_BYTES}). Voyage multimodal caps at 20MB per input.`,
     };
   }
+
+  const sourceId = opts.sourceId ?? 'default';
+  if (!opts.writerLease) {
+    return withSourceWriterLease(engine, sourceId, writerLease =>
+      importImageBuffer(engine, buf, relativePath, { ...opts, writerLease }));
+  }
+  assertSourceWriterLease(opts.writerLease, engine, sourceId);
 
   const ext = extname(relativePath).toLowerCase();
   const slug = slugifyPath(relativePath); // strips .md/.mdx; for images ext stays in path
@@ -1563,11 +1971,12 @@ export async function importImageFile(
   // and slugifyPath would already preserve it). Recompute with the file
   // extension preserved so the page slug is stable + collision-free.
   const imageSlug = relativePath.replace(/[\\\/]/g, '/').toLowerCase();
-  const buf = readFileSync(filePath);
   const hash = createHash('sha256').update(buf).digest('hex');
 
-  const existing = await engine.getPage(imageSlug);
-  if (existing?.content_hash === hash) {
+  const sourceOpts = { sourceId };
+  const existingSlug = opts.renameFromSlug ?? imageSlug;
+  const existing = await engine.getPage(existingSlug, sourceOpts);
+  if (!opts.renameFromSlug && existing?.content_hash === hash) {
     return { slug: imageSlug, status: 'skipped', chunks: 0 };
   }
 
@@ -1616,7 +2025,7 @@ export async function importImageFile(
     type: 'image',
     title: filename,
     mime_type: decoded.mime,
-    bytes: stat.size,
+    bytes: buf.byteLength,
     ...exif,
   };
 
@@ -1632,16 +2041,20 @@ export async function importImageFile(
   };
 
   const fileSpec: FileSpec = {
+    source_id: sourceId,
     filename,
     storage_path: relativePath.replace(/[\\\/]/g, '/'),
     mime_type: decoded.mime,
-    size_bytes: stat.size,
+    size_bytes: buf.byteLength,
     content_hash: hash,
   };
 
+  assertSourceWriterLease(opts.writerLease, engine, sourceId);
   await withImportTransaction(engine, {
     slug: imageSlug,
-    hadExisting: !!existing,
+    sourceId: opts.sourceId,
+    renameFromSlug: opts.renameFromSlug,
+    renameFromSourcePath: opts.renameFromSourcePath,
     page: {
       type: 'image',
       page_kind: 'image',
@@ -1650,22 +2063,29 @@ export async function importImageFile(
       timeline: '',
       frontmatter,
       content_hash: hash,
+      source_path: relativePath,
     },
     chunks: [chunk],
     file: fileSpec,
+    writerLease: opts.writerLease,
     after: async (tx) => {
       // Cherry-3: path-proximity auto-link to a sibling text page. The first
       // matching candidate gets an image_of edge. Best-effort — addLink
       // throws when the target doesn't exist; we silently skip for now and
       // let `gbrain reconcile-links` pick up later additions.
       for (const candidate of imageOfCandidates(imageSlug)) {
-        const sibling = await tx.getPage(candidate);
+        const sibling = await tx.getPage(candidate, sourceOpts);
         if (sibling) {
           try {
             await tx.addLink(
               imageSlug, candidate,
               filename,
               'image_of', 'manual', imageSlug, 'frontmatter',
+              {
+                fromSourceId: sourceId,
+                toSourceId: sourceId,
+                originSourceId: sourceId,
+              },
             );
           } catch { /* sibling vanished mid-tx; skip */ }
           break; // one canonical link per image
@@ -1675,6 +2095,29 @@ export async function importImageFile(
   });
 
   return { slug: imageSlug, status: 'imported', chunks: 1 };
+}
+
+export async function importImageFile(
+  engine: BrainEngine,
+  filePath: string,
+  relativePath: string,
+  opts: ImportImageOptions = {},
+): Promise<ImportResult> {
+  // Defense-in-depth: reject symlinks before reading bytes.
+  const lstat = lstatSync(filePath);
+  if (lstat.isSymbolicLink()) {
+    return { slug: slugifyPath(relativePath), status: 'skipped', chunks: 0, error: `Skipping symlink: ${filePath}` };
+  }
+  const stat = statSync(filePath);
+  if (stat.size > MAX_IMPORT_IMAGE_BYTES) {
+    return {
+      slug: slugifyPath(relativePath),
+      status: 'skipped',
+      chunks: 0,
+      error: `Image too large (${stat.size} bytes, max ${MAX_IMPORT_IMAGE_BYTES}). Voyage multimodal caps at 20MB per input.`,
+    };
+  }
+  return importImageBuffer(engine, readFileSync(filePath), relativePath, opts);
 }
 
 /** Used by sync.isSyncable + import.ts walker. */

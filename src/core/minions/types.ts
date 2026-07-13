@@ -130,6 +130,20 @@ export interface MinionJobInput {
   idempotency_key?: string;
   /** Submission backpressure: cap waiting jobs with this name before inserting a new row. */
   maxWaiting?: number;
+  /**
+   * Optional exact backpressure partition. The value must be a non-empty
+   * prefix of `idempotency_key`; only waiting rows with the same prefix count
+   * toward `maxWaiting`. This keeps independently authenticated producers
+   * from consuming or coalescing one another's queue slots without adding a
+   * second persisted grouping column.
+   */
+  maxWaitingKey?: string;
+  /**
+   * Behavior when the `maxWaiting` partition is full. `coalesce` preserves
+   * the historical single-flight behavior. Network ingestion uses `reject`
+   * so an accepted event is never silently replaced by an unrelated job.
+   */
+  maxWaitingBehavior?: 'coalesce' | 'reject';
 
   // v12: scheduler polish
   /**

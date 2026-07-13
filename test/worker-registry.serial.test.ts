@@ -13,6 +13,7 @@ import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { execFileSync } from 'node:child_process';
 
 let home: string;
 const origHome = process.env.GBRAIN_HOME;
@@ -35,11 +36,15 @@ async function reg() {
 
 describe('classifyLiveness (Codex #9)', () => {
   test('no error = alive, ESRCH = dead, EPERM = alive, other = unknown', async () => {
-    const { classifyLiveness } = await reg();
+    const { classifyLiveness, parseElapsedProcessTimeMs } = await reg();
     expect(classifyLiveness(undefined)).toBe('alive');
     expect(classifyLiveness('ESRCH')).toBe('dead');
     expect(classifyLiveness('EPERM')).toBe('alive'); // not pruned just because unsignalable
     expect(classifyLiveness('EINVAL')).toBe('unknown');
+    expect(parseElapsedProcessTimeMs('01:02')).toBe(62_000);
+    expect(parseElapsedProcessTimeMs('03:04:05')).toBe(11_045_000);
+    expect(parseElapsedProcessTimeMs('2-03:04:05')).toBe(183_845_000);
+    expect(parseElapsedProcessTimeMs('not-a-duration')).toBeNull();
   });
 });
 
@@ -96,6 +101,13 @@ describe('pruning + guards', () => {
   });
 
   test('PID-reuse guard: live pid that started long after registration is skipped (Codex #8)', async () => {
+    // Minimal CI images may omit `ps`; without a start-time observation there
+    // is deliberately no safe reuse claim to assert.
+    try {
+      execFileSync('ps', ['-p', String(process.pid)], { stdio: 'ignore' });
+    } catch {
+      return;
+    }
     const { readWorkers, workerRegistryDir, currentBrainId } = await reg();
     const dir = workerRegistryDir();
     require('fs').mkdirSync(dir, { recursive: true });

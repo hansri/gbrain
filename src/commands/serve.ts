@@ -1,6 +1,12 @@
 import { spawnSync } from 'node:child_process';
 import type { BrainEngine } from '../core/engine.ts';
 import { startMcpServer } from '../mcp/server.ts';
+import {
+  resolveStdioMcpPolicy,
+  stdioMcpPolicyFromEnv,
+  type ResolvedStdioMcpPolicy,
+  type StdioMcpPolicyInput,
+} from '../mcp/stdio-policy.ts';
 
 // Maximum time the stdio path will wait for engine.disconnect() (PGLite
 // close + advisory lock release) before forcing exit. Keeps a wedged
@@ -33,7 +39,13 @@ export interface ServeOptions {
   // (which unconditionally attaches a 'data' listener to real
   // process.stdin and would pollute the test runner's stdin handle).
   // Defaults to the real implementation when omitted.
-  startMcpServer?: (engine: BrainEngine) => Promise<void>;
+  startMcpServer?: (engine: BrainEngine, policy: ResolvedStdioMcpPolicy) => Promise<void>;
+  /**
+   * Explicit stdio MCP capability policy supplied by an embedding launcher.
+   * When omitted, GBRAIN_MCP_STDIO_* env vars are parsed; absent env vars use
+   * the curated retrieval-readonly default.
+   */
+  mcpPolicy?: StdioMcpPolicyInput;
   // Test seam for the parent-process watchdog. The default
   // (`readLiveParentPid`) reads the live kernel PPID via `ps` because
   // `process.ppid` is captured at process creation and does not refresh
@@ -85,12 +97,16 @@ export async function runServe(
     const ttlIdx = args.indexOf('--token-ttl');
     const tokenTtl = ttlIdx >= 0 ? parseInt(args[ttlIdx + 1]) || 3600 : 3600;
 
-    // #1353: --enable-dcr-insecure opts into the consent-bypassing
-    // client_credentials grant on the DCR path. It implies --enable-dcr (you
-    // can't allow insecure DCR clients without DCR). Plain --enable-dcr keeps
-    // the secure default: DCR clients are authorization_code (consent-bearing).
-    const enableDcrInsecure = args.includes('--enable-dcr-insecure');
-    const enableDcr = args.includes('--enable-dcr') || enableDcrInsecure;
+    // Dynamic Client Registration and unattended authorization are disabled
+    // until serve-http has a real operator-consent flow. Fail loud if an old
+    // deployment still passes either flag; trusted client registration stays
+    // available through `gbrain auth register-client` and the admin API.
+    if (args.includes('--enable-dcr') || args.includes('--enable-dcr-insecure')) {
+      throw new Error(
+        'Network Dynamic Client Registration is disabled until interactive operator consent is implemented. ' +
+        'Register clients locally with `gbrain auth register-client` instead.',
+      );
+    }
 
     const publicUrlIdx = args.indexOf('--public-url');
     const publicUrl = publicUrlIdx >= 0 ? args[publicUrlIdx + 1] : undefined;
@@ -119,7 +135,7 @@ export async function runServe(
     const suppressBootstrapToken = args.includes('--suppress-bootstrap-token');
 
     const { runServeHttp } = await import('./serve-http.ts');
-    await runServeHttp(engine, { port, tokenTtl, enableDcr, enableDcrInsecure, publicUrl, logFullParams, bind, suppressBootstrapToken });
+    await runServeHttp(engine, { port, tokenTtl, publicUrl, logFullParams, bind, suppressBootstrapToken });
     return;
   }
 
@@ -133,7 +149,14 @@ export async function runServe(
   installStdioLifecycle(engine, args, opts);
 
   const start = opts.startMcpServer ?? startMcpServer;
-  await start(engine);
+  const mcpPolicy = resolveStdioMcpPolicy(opts.mcpPolicy ?? stdioMcpPolicyFromEnv());
+  const log = opts.log ?? console.error;
+  log(
+    `[gbrain] stdio MCP policy profile=${mcpPolicy.profile} `
+    + `tools=${mcpPolicy.allowedOperations.length} fingerprint=${mcpPolicy.fingerprint} `
+    + `hot_memory=${mcpPolicy.includeHotMemory ? 'on' : 'off'} source_bound=yes`,
+  );
+  await start(engine, mcpPolicy);
   // startMcpServer's `await server.connect(transport)` resolves once the
   // SDK has wired up its stdin 'data' listener; that listener keeps the
   // event loop alive. We deliberately do NOT add `await new Promise(() =>

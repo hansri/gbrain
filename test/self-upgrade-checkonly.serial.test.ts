@@ -5,12 +5,15 @@
  * extraction are real.
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { VERSION } from '../src/version.ts';
 import { parseSemver } from '../src/core/semver.ts';
-import { runSelfUpgrade } from '../src/commands/self-upgrade.ts';
+import {
+  assertInlineSelfUpgradeReleaseAllowed,
+  runSelfUpgrade,
+} from '../src/commands/self-upgrade.ts';
 
 const realFetch = globalThis.fetch;
 const realLog = console.log;
@@ -89,5 +92,30 @@ describe('self-upgrade --check-only surfaces what you get', () => {
     const out = JSON.parse(captured.join('\n'));
     expect(out.update_available).toBe(false);
     expect(out.changelog_diff).toBe('');
+  });
+});
+
+describe('self-upgrade apply release policy', () => {
+  test('supervised or unknown targets are denied by the canonical guard', () => {
+    expect(() => assertInlineSelfUpgradeReleaseAllowed('0.43.0.0'))
+      .toThrow(/inline upgrade .* denied/i);
+    expect(() => assertInlineSelfUpgradeReleaseAllowed('0.42.59.0'))
+      .toThrow(/exact forward release|inline upgrade .* denied/i);
+    expect(() => assertInlineSelfUpgradeReleaseAllowed(null))
+      .toThrow(/exact valid release target/);
+    expect(() => assertInlineSelfUpgradeReleaseAllowed('not-a-version'))
+      .toThrow(/exact valid release target/);
+  });
+
+  test('the policy guard runs immediately before runUpgrade and --force has no bypass branch', () => {
+    const source = readFileSync(
+      new URL('../src/commands/self-upgrade.ts', import.meta.url),
+      'utf8',
+    );
+    const guardCall = source.lastIndexOf('assertInlineSelfUpgradeReleaseAllowed(latest)');
+    const upgradeCall = source.lastIndexOf("await runUpgrade(['--target', latest])");
+    expect(guardCall).toBeGreaterThan(0);
+    expect(upgradeCall).toBeGreaterThan(guardCall);
+    expect(source.slice(guardCall, upgradeCall)).not.toContain('if (force)');
   });
 });

@@ -30,10 +30,10 @@
  * fix manually.
  */
 
-import { execSync } from 'child_process';
 import { runGbrainSubprocess } from './in-process.ts';
 import type { Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult } from './types.ts';
-import { childGlobalFlags } from '../../core/cli-options.ts';
+import { childGlobalArgs } from '../../core/cli-options.ts';
+import { runSnapshotMigrateOnly } from './snapshot.ts';
 // Bug 3 — ledger writes moved to the runner (apply-migrations.ts).
 
 // ── Phase A — Schema ────────────────────────────────────────
@@ -44,8 +44,7 @@ async function phaseASchema(opts: OrchestratorOpts): Promise<OrchestratorPhaseRe
     // 10-minute budget. Migrations v8/v9 dedup with helper-index should be sub-second
     // even on 80K-duplicate brains, but the outer wall-clock cap shouldn't be the
     // failure mode (the prior 60s ceiling tripped Garry's production upgrade).
-    const { runMigrateOnlyCore } = await import('./in-process.ts');
-    await runMigrateOnlyCore();
+    await runSnapshotMigrateOnly(opts);
     return { name: 'schema', status: 'complete' };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -61,7 +60,7 @@ interface ConfigCheckResult {
   raw?: string;
 }
 
-function phaseBConfigCheck(opts: OrchestratorOpts): OrchestratorPhaseResult & { autoLink: ConfigCheckResult } {
+async function phaseBConfigCheck(opts: OrchestratorOpts): Promise<OrchestratorPhaseResult & { autoLink: ConfigCheckResult }> {
   if (opts.dryRun) {
     return { name: 'config', status: 'skipped', detail: 'dry-run', autoLink: { status: 'unknown' } };
   }
@@ -69,7 +68,9 @@ function phaseBConfigCheck(opts: OrchestratorOpts): OrchestratorPhaseResult & { 
   // Default behavior when unset = enabled (per isAutoLinkEnabled).
   let raw = '';
   try {
-    raw = execSync('gbrain config get auto_link', { encoding: 'utf-8', timeout: 10_000, env: process.env }).trim();
+    raw = (await runGbrainSubprocess(['config', 'get', 'auto_link'], {
+      timeoutMs: 10_000, snapshot: opts, effect: 'read_only',
+    })).trim();
   } catch {
     // get exits non-zero when the key isn't set — that's fine, defaults to enabled.
     raw = '';
@@ -89,13 +90,15 @@ function phaseBConfigCheck(opts: OrchestratorOpts): OrchestratorPhaseResult & { 
 
 // ── Phases C/D — Backfill (links + timeline) ────────────────
 
-function phaseCBackfillLinks(opts: OrchestratorOpts): OrchestratorPhaseResult {
+async function phaseCBackfillLinks(opts: OrchestratorOpts): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) return { name: 'backfill_links', status: 'skipped', detail: 'dry-run' };
   try {
     // --source db is idempotent: the UNIQUE constraint on
     // (from_page_id, to_page_id, link_type) and ON CONFLICT DO NOTHING
     // make re-runs cheap. Empty brains return 0/0 quickly.
-    runGbrainSubprocess('gbrain extract links --source db' + childGlobalFlags(), { timeoutMs: 600_000 });
+    await runGbrainSubprocess(['extract', 'links', '--source', 'db', ...childGlobalArgs()], {
+      timeoutMs: 600_000, snapshot: opts, effect: 'mutating',
+    });
     return { name: 'backfill_links', status: 'complete' };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -103,10 +106,12 @@ function phaseCBackfillLinks(opts: OrchestratorOpts): OrchestratorPhaseResult {
   }
 }
 
-function phaseDBackfillTimeline(opts: OrchestratorOpts): OrchestratorPhaseResult {
+async function phaseDBackfillTimeline(opts: OrchestratorOpts): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) return { name: 'backfill_timeline', status: 'skipped', detail: 'dry-run' };
   try {
-    runGbrainSubprocess('gbrain extract timeline --source db' + childGlobalFlags(), { timeoutMs: 600_000 });
+    await runGbrainSubprocess(['extract', 'timeline', '--source', 'db', ...childGlobalArgs()], {
+      timeoutMs: 600_000, snapshot: opts, effect: 'mutating',
+    });
     return { name: 'backfill_timeline', status: 'complete' };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -122,24 +127,37 @@ interface StatsSnapshot {
   timeline_entry_count: number;
 }
 
-function readStats(): StatsSnapshot | null {
+async function readStats(opts: OrchestratorOpts): Promise<StatsSnapshot | null> {
+  let out: string;
   try {
-    const out = execSync('gbrain get_stats --json 2>/dev/null || gbrain stats', {
-      encoding: 'utf-8', timeout: 30_000, env: process.env,
-    });
-    // The fallback `gbrain stats` prints human-readable output; parse loosely.
-    const pages = parseInt((out.match(/Pages:\s+(\d+)/) || ['', '0'])[1], 10);
-    const links = parseInt((out.match(/Links:\s+(\d+)/) || ['', '0'])[1], 10);
-    const timeline = parseInt((out.match(/Timeline:\s+(\d+)/) || ['', '0'])[1], 10);
-    return { page_count: pages, link_count: links, timeline_entry_count: timeline };
+    try {
+      out = await runGbrainSubprocess(['get_stats', '--json'], {
+        timeoutMs: 30_000, snapshot: opts, effect: 'read_only',
+      });
+    } catch {
+      out = await runGbrainSubprocess(['stats'], {
+        timeoutMs: 30_000, snapshot: opts, effect: 'read_only',
+      });
+    }
   } catch {
     return null;
   }
+  try {
+    const parsed = JSON.parse(out) as Partial<StatsSnapshot>;
+    if ([parsed.page_count, parsed.link_count, parsed.timeline_entry_count]
+      .every(value => typeof value === 'number')) {
+      return parsed as StatsSnapshot;
+    }
+  } catch { /* human-readable fallback below */ }
+  const pages = parseInt((out.match(/Pages:\s+(\d+)/) || ['', '0'])[1], 10);
+  const links = parseInt((out.match(/Links:\s+(\d+)/) || ['', '0'])[1], 10);
+  const timeline = parseInt((out.match(/Timeline:\s+(\d+)/) || ['', '0'])[1], 10);
+  return { page_count: pages, link_count: links, timeline_entry_count: timeline };
 }
 
-function phaseEVerify(opts: OrchestratorOpts, autoLinkDisabled: boolean): OrchestratorPhaseResult {
+async function phaseEVerify(opts: OrchestratorOpts, autoLinkDisabled: boolean): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) return { name: 'verify', status: 'skipped', detail: 'dry-run' };
-  const stats = readStats();
+  const stats = await readStats(opts);
   if (!stats) {
     return { name: 'verify', status: 'failed', detail: 'could not read gbrain stats' };
   }
@@ -197,7 +215,7 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
   }
 
   // B. Config check
-  const b = phaseBConfigCheck(opts);
+  const b = await phaseBConfigCheck(opts);
   phases.push({ name: b.name, status: b.status, detail: b.detail });
   const autoLinkDisabled = b.autoLink.status === 'disabled';
 
@@ -206,16 +224,16 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
     phases.push({ name: 'backfill_links', status: 'skipped', detail: 'auto_link disabled' });
     phases.push({ name: 'backfill_timeline', status: 'skipped', detail: 'auto_link disabled' });
   } else {
-    const c = phaseCBackfillLinks(opts);
+    const c = await phaseCBackfillLinks(opts);
     phases.push(c);
-    const d = phaseDBackfillTimeline(opts);
+    const d = await phaseDBackfillTimeline(opts);
     phases.push(d);
     // Backfill failure is non-fatal — extraction missing some pages is recoverable
     // via re-run. The schema is what matters; data backfill we tolerate.
   }
 
   // E. Verify
-  const e = phaseEVerify(opts, autoLinkDisabled);
+  const e = await phaseEVerify(opts, autoLinkDisabled);
   phases.push(e);
 
   // F. Record

@@ -5,6 +5,7 @@ import {
   MigrationRetryExhausted,
   MIGRATIONS,
   LATEST_VERSION,
+  verifyMigrationPostcondition,
 } from '../src/core/migrate.ts';
 
 describe('isMigrationIdempotent — D6 default', () => {
@@ -51,6 +52,36 @@ describe('MigrationDriftError', () => {
     expect(err.hint).toBe('column missing');
     expect(err.message).toContain('v42');
     expect(err.message).toContain('pages_emotional_weight');
+  });
+});
+
+describe('verifyMigrationPostcondition', () => {
+  test('re-verifies after the one idempotent retry', async () => {
+    let verifies = 0;
+    let reruns = 0;
+    await verifyMigrationPostcondition({} as any, {
+      version: 999,
+      name: 'test_verify_retry',
+      sql: '',
+      idempotent: true,
+      verify: async () => ++verifies === 2,
+    }, async () => { reruns++; });
+
+    expect(verifies).toBe(2);
+    expect(reruns).toBe(1);
+  });
+
+  test('persistent verify failure throws instead of advancing optimistically', async () => {
+    let reruns = 0;
+    await expect(verifyMigrationPostcondition({} as any, {
+      version: 999,
+      name: 'test_verify_failure',
+      sql: '',
+      idempotent: true,
+      verify: async () => false,
+    }, async () => { reruns++; })).rejects.toBeInstanceOf(MigrationDriftError);
+
+    expect(reruns).toBe(1);
   });
 });
 

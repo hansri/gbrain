@@ -1023,6 +1023,34 @@ describe('makeResolver — fallback chain', () => {
     expect(await r.resolve('Nonexistent Person', 'people')).toBeNull();
   });
 
+  test('source-scoped resolver threads scope through exact, fuzzy, and search tiers', async () => {
+    const seen: Array<{ method: string; sourceId?: string }> = [];
+    const engine = {
+      async getPage(_slug: string, opts?: { sourceId?: string }) {
+        seen.push({ method: 'exact', sourceId: opts?.sourceId });
+        return null;
+      },
+      async findByTitleFuzzy(
+        _name: string,
+        _dir?: string,
+        _threshold?: number,
+        opts?: { sourceId?: string },
+      ) {
+        seen.push({ method: 'fuzzy', sourceId: opts?.sourceId });
+        return null;
+      },
+      async searchKeyword(_query: string, opts?: { sourceId?: string }) {
+        seen.push({ method: 'search', sourceId: opts?.sourceId });
+        return [];
+      },
+    } as unknown as BrainEngine;
+
+    const resolver = makeResolver(engine, { mode: 'live', sourceId: 'alpha' });
+    expect(await resolver.resolve('Only Beta', 'companies')).toBeNull();
+    expect(seen.length).toBeGreaterThanOrEqual(3);
+    expect(seen.every(call => call.sourceId === 'alpha')).toBe(true);
+  });
+
   // ─── issue #972: resolveBasenameMatches ───────────────────────────────
 
   // Extended fake engine that also implements `getAllSlugs` so
@@ -1110,7 +1138,7 @@ describe('makeResolver — fallback chain', () => {
     expect(out).not.toContain('archive/struktura');        // no cross-source
   });
 
-  test('resolveBasenameMatches: no sourceId stays brain-wide (back-compat)', async () => {
+  test('resolveBasenameMatches: omitted sourceId is scoped to default', async () => {
     let sawOpts: any = 'unset';
     const engine = {
       async getPage() { return null; },
@@ -1118,13 +1146,15 @@ describe('makeResolver — fallback chain', () => {
       async searchKeyword() { return []; },
       async getAllSlugs(opts?: { sourceId?: string }) {
         sawOpts = opts;
-        return new Set(['projects/struktura', 'archive/struktura']);
+        return new Set(opts?.sourceId === 'default'
+          ? ['projects/struktura']
+          : ['projects/struktura', 'archive/struktura']);
       },
     } as unknown as BrainEngine;
     const r = makeResolver(engine, { mode: 'batch' });
     const out = await r.resolveBasenameMatches!('struktura');
-    expect(sawOpts).toBeUndefined();                        // unscoped call
-    expect(out.sort()).toEqual(['archive/struktura', 'projects/struktura']);
+    expect(sawOpts).toEqual({ sourceId: 'default' });
+    expect(out).toEqual(['projects/struktura']);
   });
 
   test('resolveBasenameMatches: empty input returns []', async () => {
@@ -1264,4 +1294,3 @@ describe("v0.18.0 migration v22 — links_resolution_type", () => {
     expect(v22!.sql).toContain("unqualified");
   });
 });
-

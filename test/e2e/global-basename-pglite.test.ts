@@ -55,6 +55,10 @@ async function truncateAll() {
 beforeEach(async () => {
   await truncateAll();
   brainDir = mkdtempSync(join(tmpdir(), 'gbrain-issue-972-'));
+  // Filesystem extraction now treats source identity and checkout path as a
+  // single authority tuple. Register the temporary checkout explicitly so
+  // `--dir` proves ownership instead of relying on ambient user config.
+  await engine.setConfig('sync.repo_path', brainDir);
 }, 15_000);
 
 function writeFile(rel: string, content: string) {

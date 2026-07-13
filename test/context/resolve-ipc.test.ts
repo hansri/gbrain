@@ -30,8 +30,9 @@ describe('resolve IPC', () => {
       pointers: [{ display: 'Alice', slug: 'people/alice', source_id: 'default', synopsis: 'x', arm: 'alias', confidence: 0.9 }],
       text: 'BLOCK',
     };
-    const server = await startResolveIpcServer(sock, async (req) => {
+    const server = await startResolveIpcServer(sock, { sourceId: 'default' }, async (req) => {
       expect(req.candidates[0].query).toBe('Alice');
+      expect(req.sourceId).toBe('default');
       return block;
     });
     expect(server).not.toBeNull();
@@ -53,7 +54,7 @@ describe('resolve IPC', () => {
   test('server returning null relays as null (resolved, nothing found)', async () => {
     const dir = tmpDir();
     const sock = resolveSocketPath(dir);
-    const server = await startResolveIpcServer(sock, async () => null);
+    const server = await startResolveIpcServer(sock, { sourceId: 'default' }, async () => null);
     servers.push(server!);
     const got = await resolveViaIpc(sock, { candidates: [{ display: 'A', query: 'A' }] });
     expect(got).toBeNull();
@@ -63,14 +64,56 @@ describe('resolve IPC', () => {
   test('stale socket file is cleaned up so a fresh server can bind', async () => {
     const dir = tmpDir();
     const sock = resolveSocketPath(dir);
-    const s1 = await startResolveIpcServer(sock, async () => null);
+    const s1 = await startResolveIpcServer(sock, { sourceId: 'default' }, async () => null);
     servers.push(s1!);
     s1!.close();
     // bind again at the same path — startResolveIpcServer must unlink the stale file
-    const s2 = await startResolveIpcServer(sock, async () => null);
+    const s2 = await startResolveIpcServer(sock, { sourceId: 'default' }, async () => null);
     expect(s2).not.toBeNull();
     servers.push(s2!);
     expect(existsSync(sock)).toBe(true);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('server rejects a caller-selected foreign source before the handler runs', async () => {
+    const dir = tmpDir();
+    const sock = resolveSocketPath(dir);
+    let calls = 0;
+    const server = await startResolveIpcServer(sock, { sourceId: 'source-a' }, async () => {
+      calls += 1;
+      return null;
+    });
+    expect(server).not.toBeNull();
+    servers.push(server!);
+
+    const got = await resolveViaIpc(sock, {
+      candidates: [{ display: 'Private', query: 'Private' }],
+      sourceId: 'source-b',
+    });
+    expect(got).toBe(IPC_UNAVAILABLE);
+    expect(calls).toBe(0);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('server accepts the bound source and stamps it when omitted', async () => {
+    const dir = tmpDir();
+    const sock = resolveSocketPath(dir);
+    const seen: string[] = [];
+    const server = await startResolveIpcServer(sock, { sourceId: 'source-a' }, async (req) => {
+      seen.push(req.sourceId!);
+      return null;
+    });
+    expect(server).not.toBeNull();
+    servers.push(server!);
+
+    expect(await resolveViaIpc(sock, {
+      candidates: [{ display: 'A', query: 'A' }],
+      sourceId: 'source-a',
+    })).toBeNull();
+    expect(await resolveViaIpc(sock, {
+      candidates: [{ display: 'A', query: 'A' }],
+    })).toBeNull();
+    expect(seen).toEqual(['source-a', 'source-a']);
     rmSync(dir, { recursive: true, force: true });
   });
 });

@@ -374,55 +374,47 @@ describe('doctor command', () => {
 // hint when the partial count is < 3.
 // ─────────────────────────────────────────────────────────────────────────
 describe('v0.31.8 — wedge migration force-retry hint (D19)', () => {
-  test('local doctor source contains wedge detection alongside the existing stuck path', async () => {
+  test('local doctor routes wedge and forward-progress semantics through the shared resolver', async () => {
     const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
-    // The existing forward-progress override stays intact. Both branches
-    // must be present and live next to each other; replacing the override
-    // with statusForVersion() would re-open stale wedge alerts (codex OV11).
     expect(source).toContain('Forward-progress override');
-    expect(source).toContain('partialCount >= 3');
-    // Both branches must coexist. Wedged path builds the command list with
-    // --force-retry; partial path falls back to plain --yes. Order varies
-    // between the local + remote doctor blocks, so just assert presence.
+    expect(source).toContain('listUnresolvedMigrationStates');
+    expect(source).toContain('buildMigrationLedgerCheck');
     expect(source).toContain('WEDGED MIGRATION(s)');
     expect(source).toContain('MINIONS HALF-INSTALLED');
     expect(source).toContain('--force-retry');
-    expect(source).toMatch(/MINIONS HALF-INSTALLED[\s\S]{0,400}--yes/);
+    expect(source).not.toContain('partialCount >= 3');
   });
 
-  test('wedge detection is local to doctor — no statusForVersion import (D19 anti-regression)', async () => {
+  test('doctor does not import apply-migrations state logic (shared core owns it)', async () => {
     const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
-    // D19 explicitly chose to extend the existing block in place rather than
-    // import statusForVersion, because statusForVersion is per-version only
-    // and doesn't encode the cross-version forward-progress override. If a
-    // future refactor re-introduces the import this regression guard
-    // catches it.
     expect(source).not.toMatch(/import\s*\{\s*statusForVersion\s*\}/);
     expect(source).not.toMatch(/from\s*['"]\.\/apply-migrations\.ts['"]/);
+    expect(source).toMatch(/from\s*['"]\.\.\/core\/migration-state\.ts['"]/);
   });
 
   test('multiple wedged versions chain force-retry calls with &&', async () => {
-    const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
-    // The local doctor block uses `.join(' && ')` so multiple wedged
-    // versions render as a single copy-pasteable command line. Match BOTH
-    // engine.ts blocks (local doctor + remote doctor) — the regex finds
-    // either occurrence.
-    expect(source).toMatch(/wedged\.map\(v\s*=>\s*`gbrain apply-migrations --force-retry [^`]+`\)\.join\(' && '\)/);
+    const { buildMigrationLedgerCheck } = await import('../src/commands/doctor.ts');
+    const entries = ['0.20.0', '0.21.0'].flatMap(version => [
+      { version, brain_id: 'brain-a', status: 'partial' as const },
+      { version, brain_id: 'brain-a', status: 'partial' as const },
+      { version, brain_id: 'brain-a', status: 'partial' as const },
+    ]);
+    const check = buildMigrationLedgerCheck(entries, 'brain-a');
+    expect(check?.message).toContain(
+      'gbrain apply-migrations --force-retry 0.20.0 && gbrain apply-migrations --force-retry 0.21.0',
+    );
   });
 
-  test('remote doctor (doctorReportRemote) also emits the force-retry hint (D14)', async () => {
+  test('remote doctor uses the same shared renderer (D14)', async () => {
     const source = await Bun.file(new URL('../src/commands/doctor.ts', import.meta.url)).text();
-    // Check that the wedge detection is duplicated in the remote doctor
-    // path so thin-client operators see it. Find the doctorReportRemote
-    // function span and verify the wedge-hint code lives inside it.
     const remoteStart = source.indexOf('export async function doctorReportRemote(');
     expect(remoteStart).toBeGreaterThan(0);
     const remoteEnd = source.indexOf('\nexport async function runDoctor(', remoteStart);
     expect(remoteEnd).toBeGreaterThan(remoteStart);
     const remoteBlock = source.slice(remoteStart, remoteEnd);
-    expect(remoteBlock).toContain('--force-retry');
-    expect(remoteBlock).toContain('partialCount >= 3');
-    expect(remoteBlock).toMatch(/WEDGED MIGRATION\(s\) on brain host/);
+    expect(remoteBlock).toContain('buildMigrationLedgerCheck(');
+    expect(remoteBlock).toContain("'on brain host'");
+    expect(remoteBlock).not.toContain('partialCount >= 3');
   });
 });
 

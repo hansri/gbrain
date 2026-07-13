@@ -22,12 +22,29 @@
  * direct sync paths). The cycle path was already protected.
  */
 import { hostname } from 'os';
+import { randomUUID } from 'crypto';
 import type { BrainEngine } from './engine.ts';
 
 export interface DbLockHandle {
   id: string;
+  /** Exact acquisition identity used by every refresh/release/fencing check. */
+  owner: DbLockOwner;
   release: () => Promise<void>;
-  refresh: () => Promise<void>;
+  refresh: (signal?: AbortSignal) => Promise<void>;
+}
+
+export interface DbLockOwner {
+  readonly id: string;
+  readonly pid: number;
+  readonly host: string;
+  readonly holderToken: string;
+}
+
+export class LockOwnershipLostError extends Error {
+  constructor(public readonly lockId: string, detail = 'lock row no longer belongs to this acquisition') {
+    super(`Lost ownership of lock '${lockId}': ${detail}`);
+    this.name = 'LockOwnershipLostError';
+  }
 }
 
 /** Default TTL: 30 minutes, same as cycle lock. */
@@ -176,6 +193,17 @@ export async function tryAcquireDbLock(
 ): Promise<DbLockHandle | null> {
   const pid = process.pid;
   const host = hostname();
+  // PID and hostname are diagnostic attributes, not a unique owner identity.
+  // A process can reacquire after TTL takeover with the same PID (or a restored
+  // container can reuse both). Every acquire therefore carries a fresh opaque
+  // token and all refresh/release statements match the full tuple.
+  const ownerToken = randomUUID();
+  const owner: DbLockOwner = Object.freeze({
+    id: lockId,
+    pid,
+    host,
+    holderToken: ownerToken,
+  });
   // v0.42.x (#1794): a holder that refreshed within this window is protected
   // from the ON CONFLICT steal even if its TTL lapsed (starved-but-alive).
   const stealGraceSeconds = resolveStealGraceSeconds(ttlMinutes);
@@ -206,11 +234,12 @@ export async function tryAcquireDbLock(
     // acquired_at) to identify wedged-but-alive holders without stealing
     // healthy long-running holders that are actively refreshing.
     const rows: Array<{ id: string }> = await sql`
-      INSERT INTO gbrain_cycle_locks (id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at)
-      VALUES (${lockId}, ${pid}, ${host}, NOW(), NOW() + ${ttl}::interval, NOW())
+      INSERT INTO gbrain_cycle_locks (id, holder_pid, holder_host, holder_token, acquired_at, ttl_expires_at, last_refreshed_at)
+      VALUES (${lockId}, ${pid}, ${host}, ${ownerToken}, NOW(), NOW() + ${ttl}::interval, NOW())
       ON CONFLICT (id) DO UPDATE
         SET holder_pid = ${pid},
             holder_host = ${host},
+            holder_token = ${ownerToken},
             acquired_at = NOW(),
             ttl_expires_at = NOW() + ${ttl}::interval,
             last_refreshed_at = NOW()
@@ -220,33 +249,55 @@ export async function tryAcquireDbLock(
       RETURNING id
     `;
     if (rows.length === 0) return null;
-    const deregister = registerCleanup(`db-lock:${lockId}`, async () => {
+    if (rows.length !== 1) throw new Error(`Lock acquire for '${lockId}' returned ${rows.length} rows`);
+    const deregister = registerCleanup(`db-lock:${lockId}:${ownerToken}`, async () => {
       await sql`
         DELETE FROM gbrain_cycle_locks
-        WHERE id = ${lockId} AND holder_pid = ${pid}
+        WHERE id = ${lockId}
+          AND holder_pid = ${pid}
+          AND holder_host = ${host}
+          AND holder_token = ${ownerToken}
       `;
     });
     return {
       id: lockId,
-      refresh: async () => {
+      owner,
+      refresh: async (signal?: AbortSignal) => {
         // v0.41.13.0: bump BOTH ttl_expires_at AND last_refreshed_at.
         // v0.42.x (#1794): route through the DIRECT session pool, not the
         // transaction pool, so a Supavisor pooler exhaustion (EMAXCONNSESSION)
         // can't kill the heartbeat and let the live lock get stolen.
-        await engine.executeRawDirect(
+        const refreshed = await engine.executeRawDirect<{ id: string }>(
           `UPDATE gbrain_cycle_locks
               SET ttl_expires_at = NOW() + ($1)::interval,
                   last_refreshed_at = NOW()
-            WHERE id = $2 AND holder_pid = $3`,
-          [ttl, lockId, pid],
+            WHERE id = $2
+              AND holder_pid = $3
+              AND holder_host = $4
+              AND holder_token = $5
+          RETURNING id`,
+          [ttl, lockId, pid, host, ownerToken],
+          { signal },
         );
+        if (refreshed.length !== 1) {
+          deregister();
+          throw new LockOwnershipLostError(lockId, 'refresh matched zero rows');
+        }
       },
       release: async () => {
-        deregister();
-        await sql`
+        const rows: Array<{ id: string }> = await sql`
           DELETE FROM gbrain_cycle_locks
-          WHERE id = ${lockId} AND holder_pid = ${pid}
+          WHERE id = ${lockId}
+            AND holder_pid = ${pid}
+            AND holder_host = ${host}
+            AND holder_token = ${ownerToken}
+          RETURNING id
         `;
+        if (rows.length !== 1) {
+          deregister();
+          throw new LockOwnershipLostError(lockId, 'release matched zero rows');
+        }
+        deregister();
       },
     };
   }
@@ -255,44 +306,80 @@ export async function tryAcquireDbLock(
     const db = maybePGLite.db;
     const ttl = `${ttlMinutes} minutes`;
     const { rows } = await db.query(
-      `INSERT INTO gbrain_cycle_locks (id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at)
-       VALUES ($1, $2, $3, NOW(), NOW() + $4::interval, NOW())
+      `INSERT INTO gbrain_cycle_locks (id, holder_pid, holder_host, holder_token, acquired_at, ttl_expires_at, last_refreshed_at)
+       VALUES ($1, $2, $3, $4, NOW(), NOW() + $5::interval, NOW())
        ON CONFLICT (id) DO UPDATE
          SET holder_pid = $2,
              holder_host = $3,
+             holder_token = $4,
              acquired_at = NOW(),
-             ttl_expires_at = NOW() + $4::interval,
+             ttl_expires_at = NOW() + $5::interval,
              last_refreshed_at = NOW()
          WHERE gbrain_cycle_locks.ttl_expires_at < NOW()
            AND (gbrain_cycle_locks.last_refreshed_at IS NULL
-                OR gbrain_cycle_locks.last_refreshed_at < NOW() - $5 * INTERVAL '1 second')
+                OR gbrain_cycle_locks.last_refreshed_at < NOW() - $6 * INTERVAL '1 second')
        RETURNING id`,
-      [lockId, pid, host, ttl, stealGraceSeconds],
+      [lockId, pid, host, ownerToken, ttl, stealGraceSeconds],
     );
     if (rows.length === 0) return null;
-    const deregister = registerCleanup(`db-lock:${lockId}`, async () => {
+    if (rows.length !== 1) throw new Error(`Lock acquire for '${lockId}' returned ${rows.length} rows`);
+    const deregister = registerCleanup(`db-lock:${lockId}:${ownerToken}`, async () => {
       await db.query(
-        `DELETE FROM gbrain_cycle_locks WHERE id = $1 AND holder_pid = $2`,
-        [lockId, pid],
+        `DELETE FROM gbrain_cycle_locks
+          WHERE id = $1 AND holder_pid = $2 AND holder_host = $3 AND holder_token = $4`,
+        [lockId, pid, host, ownerToken],
       );
     });
     return {
       id: lockId,
-      refresh: async () => {
-        await db.query(
+      owner,
+      refresh: async (signal?: AbortSignal) => {
+        const query = db.query(
           `UPDATE gbrain_cycle_locks
               SET ttl_expires_at = NOW() + $1::interval,
                   last_refreshed_at = NOW()
-            WHERE id = $2 AND holder_pid = $3`,
-          [ttl, lockId, pid],
+            WHERE id = $2
+              AND holder_pid = $3
+              AND holder_host = $4
+              AND holder_token = $5
+          RETURNING id`,
+          [ttl, lockId, pid, host, ownerToken],
         );
+        let refreshedResult: { rows: unknown[] };
+        if (signal) {
+          let rejectAbort!: (reason?: unknown) => void;
+          const abortPromise = new Promise<never>((_, reject) => {
+            rejectAbort = reject;
+          });
+          const listener = (): void => rejectAbort(signal.reason ?? new Error('lock refresh aborted'));
+          if (signal.aborted) listener();
+          else signal.addEventListener('abort', listener, { once: true });
+          try {
+            refreshedResult = await Promise.race([query, abortPromise]);
+          } finally {
+            signal.removeEventListener('abort', listener);
+          }
+        } else {
+          refreshedResult = await query;
+        }
+        const refreshed = refreshedResult.rows;
+        if (refreshed.length !== 1) {
+          deregister();
+          throw new LockOwnershipLostError(lockId, 'refresh matched zero rows');
+        }
       },
       release: async () => {
-        deregister();
-        await db.query(
-          `DELETE FROM gbrain_cycle_locks WHERE id = $1 AND holder_pid = $2`,
-          [lockId, pid],
+        const { rows: released } = await db.query(
+          `DELETE FROM gbrain_cycle_locks
+            WHERE id = $1 AND holder_pid = $2 AND holder_host = $3 AND holder_token = $4
+          RETURNING id`,
+          [lockId, pid, host, ownerToken],
         );
+        if (released.length !== 1) {
+          deregister();
+          throw new LockOwnershipLostError(lockId, 'release matched zero rows');
+        }
+        deregister();
       },
     };
   }
@@ -314,7 +401,7 @@ export async function tryAcquireDbLock(
   try {
     const snap = await inspectLock(engine, lockId);
     if (snap && !snap.ttl_expired && isHolderDeadLocally(snap.holder_pid, snap.holder_host, snap.age_ms)) {
-      const { deleted } = await deleteLockRow(engine, lockId, snap.holder_pid);
+      const { deleted } = await deleteLockRow(engine, lockId, snap.holder_pid, snap.holder_token);
       if (deleted) {
         const second = await acquireOnce();
         if (second) return second;
@@ -343,6 +430,8 @@ export interface LockSnapshot {
   id: string;
   holder_pid: number;
   holder_host: string;
+  /** Opaque acquisition identity; PID/host alone can be reused. */
+  holder_token: string;
   acquired_at: Date;
   ttl_expires_at: Date;
   age_ms: number;
@@ -370,13 +459,14 @@ interface RawLockRow {
   id?: string;
   holder_pid?: number;
   holder_host?: string;
+  holder_token?: string;
   acquired_at?: Date | string;
   ttl_expires_at?: Date | string;
   last_refreshed_at?: Date | string | null;
 }
 
 /** Canonical column list for every lock SELECT — keep in lockstep with `RawLockRow`. */
-const LOCK_SELECT_COLS = 'id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at';
+const LOCK_SELECT_COLS = 'id, holder_pid, holder_host, holder_token, acquired_at, ttl_expires_at, last_refreshed_at';
 
 /**
  * Row → `LockSnapshot` mapper. Coerces postgres.js Date|string columns to Date
@@ -385,7 +475,7 @@ const LOCK_SELECT_COLS = 'id, holder_pid, holder_host, acquired_at, ttl_expires_
  * ttl). v0.41.13.0: last_refreshed_at may be NULL on pre-v98 brains.
  */
 function rowToLockSnapshot(row: RawLockRow, now: number): LockSnapshot | null {
-  if (row.holder_pid === undefined || !row.acquired_at || !row.ttl_expires_at) return null;
+  if (row.holder_pid === undefined || !row.holder_token || !row.acquired_at || !row.ttl_expires_at) return null;
   const acquired = row.acquired_at instanceof Date ? row.acquired_at : new Date(row.acquired_at);
   const ttlExpires = row.ttl_expires_at instanceof Date ? row.ttl_expires_at : new Date(row.ttl_expires_at);
   const lastRefreshed = row.last_refreshed_at == null
@@ -395,6 +485,7 @@ function rowToLockSnapshot(row: RawLockRow, now: number): LockSnapshot | null {
     id: String(row.id ?? ''),
     holder_pid: Number(row.holder_pid),
     holder_host: String(row.holder_host ?? ''),
+    holder_token: String(row.holder_token),
     acquired_at: acquired,
     ttl_expires_at: ttlExpires,
     age_ms: now - acquired.getTime(),
@@ -428,11 +519,11 @@ async function selectLockRows(engine: BrainEngine, opts: SelectLockRowsOpts = {}
   if (engine.kind === 'postgres' && maybePG.sql) {
     const sql = maybePG.sql as any;
     if (opts.lockId !== undefined) {
-      rows = await sql`SELECT id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at FROM gbrain_cycle_locks WHERE id = ${opts.lockId}`;
+      rows = await sql`SELECT id, holder_pid, holder_host, holder_token, acquired_at, ttl_expires_at, last_refreshed_at FROM gbrain_cycle_locks WHERE id = ${opts.lockId}`;
     } else if (opts.staleOnly) {
-      rows = await sql`SELECT id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at FROM gbrain_cycle_locks WHERE ttl_expires_at < NOW() ORDER BY acquired_at`;
+      rows = await sql`SELECT id, holder_pid, holder_host, holder_token, acquired_at, ttl_expires_at, last_refreshed_at FROM gbrain_cycle_locks WHERE ttl_expires_at < NOW() ORDER BY acquired_at`;
     } else {
-      rows = await sql`SELECT id, holder_pid, holder_host, acquired_at, ttl_expires_at, last_refreshed_at FROM gbrain_cycle_locks ORDER BY acquired_at`;
+      rows = await sql`SELECT id, holder_pid, holder_host, holder_token, acquired_at, ttl_expires_at, last_refreshed_at FROM gbrain_cycle_locks ORDER BY acquired_at`;
     }
   } else if (engine.kind === 'pglite' && maybePGLite.db) {
     if (opts.lockId !== undefined) {
@@ -470,7 +561,7 @@ export async function listStaleLocks(engine: BrainEngine): Promise<LockSnapshot[
 /**
  * v0.41.6.0 D3: atomic verify-and-delete for `gbrain sync --break-lock`.
  *
- * Runs `DELETE ... WHERE id = $1 AND holder_pid = $2 RETURNING id`.
+ * Runs `DELETE ... WHERE id = $1 AND holder_pid = $2 AND holder_token = $3 RETURNING id`.
  * RETURNING shape:
  *   - row returned  → we cleared the lock atomically.
  *   - empty array   → row was already cleared by another process (idempotent;
@@ -484,6 +575,7 @@ export async function deleteLockRow(
   engine: BrainEngine,
   lockId: string,
   holderPid: number,
+  holderToken: string,
 ): Promise<{ deleted: boolean }> {
   const maybePG = engine as unknown as { sql?: (...args: unknown[]) => Promise<unknown> };
   const maybePGLite = engine as unknown as {
@@ -494,7 +586,9 @@ export async function deleteLockRow(
     const sql = maybePG.sql as any;
     const rows: Array<{ id: string }> = await sql`
       DELETE FROM gbrain_cycle_locks
-       WHERE id = ${lockId} AND holder_pid = ${holderPid}
+       WHERE id = ${lockId}
+         AND holder_pid = ${holderPid}
+         AND holder_token = ${holderToken}
       RETURNING id
     `;
     return { deleted: rows.length > 0 };
@@ -502,9 +596,9 @@ export async function deleteLockRow(
   if (engine.kind === 'pglite' && maybePGLite.db) {
     const { rows } = await maybePGLite.db.query(
       `DELETE FROM gbrain_cycle_locks
-        WHERE id = $1 AND holder_pid = $2
+        WHERE id = $1 AND holder_pid = $2 AND holder_token = $3
        RETURNING id`,
-      [lockId, holderPid],
+      [lockId, holderPid, holderToken],
     );
     return { deleted: rows.length > 0 };
   }
@@ -519,12 +613,13 @@ export async function deleteLockRow(
  *   DELETE FROM gbrain_cycle_locks
  *    WHERE id = $1
  *      AND holder_pid = $2
- *      AND last_refreshed_at < NOW() - $3 * INTERVAL '1 second'
+ *      AND holder_token = $3
+ *      AND last_refreshed_at < NOW() - $4 * INTERVAL '1 second'
  *   RETURNING id, last_refreshed_at
  *
- * Three matching conditions in one SQL statement (no TOCTOU window):
+ * Four matching conditions in one SQL statement (no TOCTOU window):
  *   - id matches the per-source lock key
- *   - holder_pid matches the inspected snapshot (defeats PID-reuse races)
+ *   - holder_pid and holder_token match the exact inspected acquisition
  *   - last_refreshed_at is older than maxAgeSeconds ago — the "wedged but
  *     alive" signal. A healthy holder using withRefreshingLock refreshes
  *     every (ttl/6) ms (~5 min for default 30-min TTL), so
@@ -532,7 +627,7 @@ export async function deleteLockRow(
  *     stopped firing (Postgres query timeout, event-loop wedge, etc.)
  *     show a stale value.
  *
- * Why $3 * INTERVAL '1 second' instead of $3::interval: Postgres does NOT
+ * Why $4 * INTERVAL '1 second' instead of $4::interval: Postgres does NOT
  * cast a bare integer to interval via ::interval (that's a string-only
  * cast). The multiplicative form is the canonical idiom and works on both
  * Postgres + PGLite.
@@ -553,6 +648,7 @@ export async function deleteLockRowIfStale(
   engine: BrainEngine,
   lockId: string,
   holderPid: number,
+  holderToken: string,
   maxAgeSeconds: number,
 ): Promise<{ deleted: boolean; lastRefreshedAt: Date | null }> {
   const maybePG = engine as unknown as { sql?: (...args: unknown[]) => Promise<unknown> };
@@ -566,6 +662,7 @@ export async function deleteLockRowIfStale(
       DELETE FROM gbrain_cycle_locks
        WHERE id = ${lockId}
          AND holder_pid = ${holderPid}
+         AND holder_token = ${holderToken}
          AND last_refreshed_at IS NOT NULL
          AND last_refreshed_at < NOW() - ${maxAgeSeconds} * INTERVAL '1 second'
       RETURNING id, last_refreshed_at
@@ -580,10 +677,11 @@ export async function deleteLockRowIfStale(
       `DELETE FROM gbrain_cycle_locks
         WHERE id = $1
           AND holder_pid = $2
+          AND holder_token = $3
           AND last_refreshed_at IS NOT NULL
-          AND last_refreshed_at < NOW() - $3 * INTERVAL '1 second'
+          AND last_refreshed_at < NOW() - $4 * INTERVAL '1 second'
        RETURNING id, last_refreshed_at`,
-      [lockId, holderPid, maxAgeSeconds],
+      [lockId, holderPid, holderToken, maxAgeSeconds],
     );
     if (rows.length === 0) return { deleted: false, lastRefreshedAt: null };
     const r = rows[0] as { id: string; last_refreshed_at: Date | string | null };
@@ -597,8 +695,8 @@ export async function deleteLockRowIfStale(
 /**
  * #1972 — snapshot-matched verify-and-delete for the background reaper.
  *
- * Unlike `deleteLockRow` (id + holder_pid only), this ALSO pins the observed
- * `acquired_at`, closing the TOCTOU window the reaper opens by reading rows
+ * Pins the observed holder token and `acquired_at`, closing the TOCTOU window
+ * the reaper opens by reading rows
  * before deleting them: between the SELECT and the DELETE, the dead holder's
  * row could be replaced by a NEW holder that reused the same numeric PID
  * (PID-space wraps). That new row carries a newer `acquired_at`, so the match
@@ -617,6 +715,7 @@ export async function deleteLockRowExact(
   engine: BrainEngine,
   lockId: string,
   holderPid: number,
+  holderToken: string,
   acquiredAt: Date,
 ): Promise<{ deleted: boolean }> {
   const maybePG = engine as unknown as { sql?: (...args: unknown[]) => Promise<unknown> };
@@ -630,6 +729,7 @@ export async function deleteLockRowExact(
       DELETE FROM gbrain_cycle_locks
        WHERE id = ${lockId}
          AND holder_pid = ${holderPid}
+         AND holder_token = ${holderToken}
          AND date_trunc('milliseconds', acquired_at) = ${acquiredAt}
       RETURNING id
     `;
@@ -640,9 +740,10 @@ export async function deleteLockRowExact(
       `DELETE FROM gbrain_cycle_locks
         WHERE id = $1
           AND holder_pid = $2
-          AND date_trunc('milliseconds', acquired_at) = $3
+          AND holder_token = $3
+          AND date_trunc('milliseconds', acquired_at) = $4
        RETURNING id`,
-      [lockId, holderPid, acquiredAt],
+      [lockId, holderPid, holderToken, acquiredAt],
     );
     return { deleted: rows.length > 0 };
   }
@@ -669,7 +770,7 @@ export async function deleteLockRowExact(
  *     ├─ holder_host != thisHost ──────────────→ KEEP (cross_host; can't probe)
  *     ├─ kill(pid,0) == alive / EPERM ─────────→ KEEP (live or not-ours)
  *     ├─ ESRCH && age < 60s grace ─────────────→ KEEP (PID-reuse defense)
- *     └─ ESRCH && age ≥ 60s grace ─────────────→ deleteLockRowExact(id, pid, acquired_at)
+ *     └─ ESRCH && age ≥ 60s grace ─────────────→ deleteLockRowExact(id, pid, token, acquired_at)
  *                                                  (snapshot-matched: reused-PID
  *                                                   fresh row has newer acquired_at → no-op)
  */
@@ -692,7 +793,9 @@ export async function reapDeadHolderLocks(
     // isHolderDeadLocally combines same-host + ESRCH + the 60s reuse grace,
     // so pure-PID-liveness (which PID-space wrap defeats) is never used alone.
     if (!isHolderDeadLocally(s.holder_pid, s.holder_host, s.age_ms, opts)) continue;
-    const { deleted } = await deleteLockRowExact(engine, s.id, s.holder_pid, s.acquired_at);
+    const { deleted } = await deleteLockRowExact(
+      engine, s.id, s.holder_pid, s.holder_token, s.acquired_at,
+    );
     if (deleted) reapedIds.push(s.id);
   }
   return { reaped: reapedIds.length, reapedIds };
@@ -781,8 +884,8 @@ export async function liveSyncStatus(
  * Failure paths:
  *  - lock unavailable → throws LockUnavailableError (caller decides retry)
  *  - work() throws → release lock cleanly + re-throw original
- *  - heartbeat fails → log + clear interval; lock TTL will auto-expire,
- *    work() continues but next refresh would see the lock invalidated
+ *  - heartbeat/renewal fails → invalidate the runtime lease, abort the work
+ *    signal, and throw `LockOwnershipLostError` after cooperative unwind
  */
 export class LockUnavailableError extends Error {
   constructor(public readonly lockId: string) {
@@ -796,6 +899,10 @@ export interface WithRefreshingLockOpts {
   ttlMinutes?: number;
   /** Heartbeat-fail threshold in ms — abort if SELECT 1 takes longer. Default 30000. */
   heartbeatTimeoutMs?: number;
+  /** Called exactly once when renewal can no longer prove ownership. */
+  onLockLost?: (error: LockOwnershipLostError) => void;
+  /** Test seam; production derives ttl/6 with a 15s floor. */
+  _refreshIntervalMs?: number;
 }
 
 /**
@@ -807,21 +914,45 @@ export interface WithRefreshingLockOpts {
 export async function withRefreshingLock<T>(
   engine: BrainEngine,
   lockId: string,
-  work: () => Promise<T>,
+  work: (signal: AbortSignal, handle: DbLockHandle) => Promise<T>,
   opts: WithRefreshingLockOpts = {},
 ): Promise<T> {
   const ttlMinutes = opts.ttlMinutes ?? DEFAULT_TTL_MINUTES;
   const heartbeatTimeoutMs = opts.heartbeatTimeoutMs ?? 30000;
   // Refresh 6x per TTL window so a missed tick doesn't expire the lock.
-  const refreshIntervalMs = Math.max(15000, (ttlMinutes * 60 * 1000) / 6);
+  const refreshIntervalMs = opts._refreshIntervalMs ?? Math.max(15000, (ttlMinutes * 60 * 1000) / 6);
 
   const handle = await tryAcquireDbLock(engine, lockId, ttlMinutes);
   if (!handle) throw new LockUnavailableError(lockId);
 
-  let healthOk = true;
+  const state: { healthOk: boolean; ownershipLost: LockOwnershipLostError | null } = {
+    healthOk: true,
+    ownershipLost: null,
+  };
+  const lockAbort = new AbortController();
+  let refreshTask: Promise<void> | null = null;
+
+  const markOwnershipLost = (error: unknown): void => {
+    if (state.ownershipLost) return;
+    const msg = error instanceof Error ? error.message : String(error);
+    const loss = error instanceof LockOwnershipLostError
+      ? error
+      : new LockOwnershipLostError(lockId, `refresh failed: ${msg}`);
+    state.ownershipLost = loss;
+    state.healthOk = false;
+    lockAbort.abort(loss);
+    try { opts.onLockLost?.(loss); } catch { /* invalidation hook is best-effort */ }
+    process.stderr.write(`[lock-refresh] ${lockId}: ${loss.message}; aborting holder\n`);
+  };
 
   const interval = setInterval(() => {
-    void (async () => {
+    if (refreshTask || state.ownershipLost) return;
+    refreshTask = (async () => {
+      const refreshAbort = new AbortController();
+      const timeoutId = setTimeout(
+        () => refreshAbort.abort(new Error('refresh_timeout')),
+        heartbeatTimeoutMs,
+      );
       try {
         // v0.42.x (#1794, V1): the refresh IS the heartbeat. handle.refresh()
         // routes through the DIRECT session pool (postgres), so it survives a
@@ -830,37 +961,55 @@ export async function withRefreshingLock<T>(
         // probed `SELECT 1` on the READ pool and clearInterval'd on probe
         // failure — that's exactly how an exhausted read pool stopped renewal
         // even though the lock was alive. We no longer gate renewal on read-pool
-        // health, and we do NOT clearInterval on a transient failure: a blip
-        // self-heals on the next tick; the TTL is the backstop if the pool stays
-        // genuinely dead (at which point a steal is correct).
-        const timeout = new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('refresh_timeout')), heartbeatTimeoutMs)
-        );
-        await Promise.race([handle.refresh(), timeout]);
-        healthOk = true;
+        // health. A failed/zero-row refresh cannot prove continued ownership,
+        // so it aborts the holder rather than letting writes continue behind a
+        // stolen fencing token.
+        await handle.refresh(refreshAbort.signal);
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        process.stderr.write(`[lock-refresh] ${lockId}: ${msg}; will retry next tick\n`);
-        healthOk = false;
+        clearInterval(interval);
+        markOwnershipLost(err);
+      } finally {
+        clearTimeout(timeoutId);
       }
-    })();
+    })().finally(() => {
+      refreshTask = null;
+    });
   }, refreshIntervalMs);
   // #1633: don't let the refresh timer keep the process alive on its own. The
   // finally clearInterval is the primary cleanup; unref is belt-and-suspenders
   // so a missed clear can't pin the event loop open past real work completion.
   (interval as unknown as { unref?: () => void }).unref?.();
 
+  let result!: T;
+  let workError: unknown;
+  let workFailed = false;
+  let releaseError: unknown;
   try {
-    return await work();
+    result = await work(lockAbort.signal, handle);
+  } catch (error) {
+    workFailed = true;
+    workError = error;
   } finally {
     clearInterval(interval);
-    try { await handle.release(); } catch { /* idempotent */ }
-    if (!healthOk) {
+    // A refresh that started before work completed must settle before release;
+    // otherwise release can delete the row and a late refresh misclassifies the
+    // successful handoff as ownership loss (or, worse, refreshes a takeover).
+    if (refreshTask) await refreshTask;
+    try { await handle.release(); } catch (error) { releaseError = error; }
+    if (!state.healthOk) {
       // Surface that the heartbeat detected backend trouble — caller can
       // log to the connection-events audit if desired.
       process.stderr.write(`[lock-refresh] ${lockId}: completed with degraded heartbeat\n`);
     }
   }
+  if (state.ownershipLost) throw state.ownershipLost;
+  if (releaseError) {
+    throw releaseError instanceof LockOwnershipLostError
+      ? releaseError
+      : new LockOwnershipLostError(lockId, `release failed: ${releaseError instanceof Error ? releaseError.message : String(releaseError)}`);
+  }
+  if (workFailed) throw workError;
+  return result;
 }
 
 /**

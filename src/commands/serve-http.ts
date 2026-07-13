@@ -36,13 +36,14 @@ import { buildError, serializeError } from '../core/errors.ts';
 import { VERSION } from '../version.ts';
 import * as db from '../core/db.ts';
 import { sqlQueryForEngine, executeRawJsonb } from '../core/sql-query.ts';
-import { MinionQueue } from '../core/minions/queue.ts';
+import { MinionQueue, MinionQueueBackpressureError } from '../core/minions/queue.ts';
 import {
   computeContentHash,
   validateIngestionEvent,
   type IngestionContentType,
   type IngestionEvent,
 } from '../core/ingestion/types.ts';
+import { isValidSourceId } from '../core/source-id.ts';
 
 /**
  * /health endpoint timeout. 3s rather than 5s: Fly.io's default
@@ -243,9 +244,9 @@ export function parseCorsAllowlistOAuth(): Set<string> | null {
  * hardcoded string, and so the same options object covers all listed
  * origins without enumeration in the response.
  *
- * Same-origin requests (no Origin header) get `cb(null, true)` which the
- * cors package translates to "no CORS headers needed" — they're not
- * cross-origin so they don't trigger the gate.
+ * Requests without an Origin header get `cb(null, true)` which the cors
+ * package translates to "no CORS headers needed". The hard request gate
+ * below separately recognizes an explicit same-origin Origin value.
  */
 export function resolveCorsOrigin(allowlist: Set<string> | null): cors.CorsOptions['origin'] {
   if (allowlist === null) return false;
@@ -255,15 +256,208 @@ export function resolveCorsOrigin(allowlist: Set<string> | null): cors.CorsOptio
   };
 }
 
+/** Explicit parser ceilings for every general-purpose HTTP body surface. */
+export const HTTP_BODY_LIMITS = Object.freeze({
+  oauth: '32kb',
+  admin: '32kb',
+  mcp: '1mb',
+});
+
+/**
+ * Security headers shared by JSON, OAuth, webhook, and admin responses.
+ * The CSP intentionally preserves the existing self-hosted admin SPA plus
+ * its two Google Fonts origins; everything else is denied by default.
+ * HSTS is deliberately not set here: pinning is an operator/edge decision
+ * with a long-lived lockout blast radius if TLS or host routing changes.
+ */
+export function buildHttpSecurityHeaders(): Record<string, string> {
+  return {
+    'Content-Security-Policy': [
+      "default-src 'none'",
+      "base-uri 'none'",
+      "object-src 'none'",
+      "frame-ancestors 'none'",
+      "form-action 'self'",
+      "script-src 'self'",
+      "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+      "font-src 'self' https://fonts.gstatic.com",
+      "img-src 'self' data:",
+      "connect-src 'self' https://fonts.googleapis.com https://fonts.gstatic.com",
+    ].join('; '),
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=(), payment=(), usb=()',
+    'Referrer-Policy': 'no-referrer',
+    'X-Content-Type-Options': 'nosniff',
+    'X-DNS-Prefetch-Control': 'off',
+    'X-Frame-Options': 'DENY',
+  };
+}
+
+/**
+ * Hard request gate in front of the SDK OAuth router.
+ *
+ * The SDK installs its own permissive `cors()` middleware on some nested
+ * routes. Merely omitting ACAO in our outer middleware is therefore not a
+ * complete deny: a downstream handler can add `Access-Control-Allow-Origin:
+ * *` again. This predicate lets the outer app stop an untrusted browser
+ * Origin before any nested router runs. Same-origin browser calls remain
+ * allowed without requiring an env allow-list.
+ */
+export function isHttpOriginAllowed(
+  origin: string | undefined,
+  requestOrigin: string | undefined,
+  canonicalOrigin: string | undefined,
+  allowlist: Set<string> | null,
+): boolean {
+  if (!origin) return true;
+  if (origin === requestOrigin || origin === canonicalOrigin) return true;
+  return allowlist?.has(origin) === true;
+}
+
+export interface AdminMutationOriginInput {
+  method: string;
+  origin?: string;
+  referer?: string;
+  fetchSite?: string;
+  requestOrigin?: string;
+  canonicalOrigin?: string;
+}
+
+/**
+ * CSRF boundary for cookie-authenticated admin mutations. SameSite=Strict is
+ * retained as the first layer; this adds Origin/Referer + Fetch Metadata so a
+ * compromised sibling origin cannot submit privileged admin writes.
+ * Requests without browser metadata remain compatible with supervised local
+ * scripts that explicitly carry the admin cookie.
+ */
+export function isAdminMutationOriginAllowed(input: AdminMutationOriginInput): boolean {
+  const method = input.method.toUpperCase();
+  if (method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return true;
+  if (input.fetchSite === 'cross-site') return false;
+
+  const trusted = new Set(
+    [input.requestOrigin, input.canonicalOrigin].filter((v): v is string => Boolean(v)),
+  );
+  if (input.origin) return trusted.has(input.origin);
+  if (input.referer) {
+    try {
+      return trusted.has(new URL(input.referer).origin);
+    } catch {
+      return false;
+    }
+  }
+
+  // Modern browsers send Fetch Metadata. Fail closed for a same-site sibling
+  // with stripped Origin/Referer; allow same-origin/top-level and non-browser
+  // clients (which send none of these headers).
+  if (input.fetchSite && input.fetchSite !== 'same-origin' && input.fetchSite !== 'none') return false;
+  return true;
+}
+
+export interface HttpErrorEnvelope {
+  status: number;
+  body: { error: 'payload_too_large' | 'invalid_request_body' | 'invalid_request' | 'internal_error' };
+}
+
+/** Production-safe mapping for parser failures and unexpected Express errors. */
+export function classifyHttpError(error: unknown): HttpErrorEnvelope {
+  const candidate = error as { status?: unknown; type?: unknown } | null;
+  const status = typeof candidate?.status === 'number' ? candidate.status : undefined;
+  const type = typeof candidate?.type === 'string' ? candidate.type : undefined;
+  if (status === 413 || type === 'entity.too.large') {
+    return { status: 413, body: { error: 'payload_too_large' } };
+  }
+  if (status === 400 || type === 'entity.parse.failed') {
+    return { status: 400, body: { error: 'invalid_request_body' } };
+  }
+  if (status !== undefined && status >= 400 && status < 500) {
+    return { status, body: { error: 'invalid_request' } };
+  }
+  return { status: 500, body: { error: 'internal_error' } };
+}
+
+export type OAuthTokenErrorEnvelope = {
+  status: 400 | 401;
+  body: {
+    error: 'invalid_client' | 'invalid_grant';
+    error_description: string;
+  };
+};
+
+/**
+ * OAuth failures cross a public trust boundary. Provider and database error
+ * messages can reveal whether a client exists, whether it was revoked, SQL
+ * details, or connection configuration. Map them to stable RFC-shaped
+ * envelopes and keep the underlying exception out of both the response and
+ * request-driven logs.
+ */
+export function oauthTokenErrorEnvelope(
+  phase: 'client_authentication' | 'grant_exchange',
+): OAuthTokenErrorEnvelope {
+  if (phase === 'client_authentication') {
+    return {
+      status: 401,
+      body: {
+        error: 'invalid_client',
+        error_description: 'Client authentication failed.',
+      },
+    };
+  }
+  return {
+    status: 400,
+    body: {
+      error: 'invalid_grant',
+      error_description: 'Authorization grant is invalid or expired.',
+    },
+  };
+}
+
+/** Stable post-auth rate-limit identity; never accepts a caller header. */
+export function authenticatedClientRateLimitKey(req: Request): string {
+  const auth = (req as Request & { auth?: AuthInfo }).auth;
+  return `oauth-client:${auth?.clientId ?? 'missing-auth'}`;
+}
+
+/**
+ * Collision-free, non-identifying queue partition for one authenticated
+ * ingestion principal/source tuple. A delimiter-based key is unsafe because
+ * legacy access-token names may contain `:` and one tuple can become a prefix
+ * of another. JSON tuple encoding preserves field boundaries; SHA-256 gives
+ * every persisted idempotency prefix the same opaque length. Bump `v2` before
+ * changing the tuple or encoding contract.
+ */
+export function buildIngestBackpressureKey(clientId: string, sourceId: string): string {
+  const tupleHash = createHash('sha256')
+    .update(JSON.stringify([clientId, sourceId]), 'utf8')
+    .digest('hex');
+  return `ingest:webhook:v2:${tupleHash}:`;
+}
+
+export interface GeneratedBootstrapPrintPolicyInput {
+  fromEnv: boolean;
+  suppressRequested: boolean;
+  bind: string;
+  publicUrl?: string;
+  stderrIsTty: boolean;
+}
+
+/**
+ * A generated admin credential may be shown only to a local interactive
+ * operator. Public and non-interactive starts frequently feed stderr into a
+ * supervisor/log collector, where printing a credential would persist it.
+ * Environment-provided credentials are never echoed regardless of posture.
+ */
+export function shouldPrintGeneratedBootstrapToken(
+  input: GeneratedBootstrapPrintPolicyInput,
+): boolean {
+  if (input.fromEnv || input.suppressRequested || !input.stderrIsTty || input.publicUrl) {
+    return false;
+  }
+  return input.bind === '127.0.0.1' || input.bind === '::1' || input.bind === 'localhost';
+}
+
 interface ServeHttpOptions {
   port: number;
   tokenTtl: number;
-  enableDcr: boolean;
-  /**
-   * #1353: allow the consent-bypassing client_credentials grant on the DCR path.
-   * Off by default; DCR clients default to authorization_code. Implies enableDcr.
-   */
-  enableDcrInsecure?: boolean;
   /**
    * Public URL the server is reachable at (e.g., https://brain.example.com).
    * Used as the OAuth issuer in discovery metadata. Defaults to
@@ -430,7 +624,7 @@ export function skillPublishStatus(publishSkills: boolean): { bannerValue: strin
 }
 
 export async function runServeHttp(engine: BrainEngine, options: ServeHttpOptions) {
-  const { port, tokenTtl, enableDcr, enableDcrInsecure, publicUrl, logFullParams } = options;
+  const { port, tokenTtl, publicUrl, logFullParams } = options;
   // v0.34.1 (#864, D11): default bind flipped from 0.0.0.0 to 127.0.0.1.
   // gbrain's primary use case is a personal-knowledge brain on a laptop;
   // the pre-v0.34 default exposed brains on every interface. Server
@@ -440,6 +634,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // than silently binding loopback only.
   const bind = options.bind ?? '127.0.0.1';
   const config = loadConfig() || { engine: 'pglite' as const };
+  // The issuer URL goes into discovery metadata + token issuer claims and is
+  // also the canonical browser origin for CORS/CSRF checks below.
+  const issuerUrl = new URL(publicUrl || `http://localhost:${port}`);
 
   if (logFullParams) {
     console.error(
@@ -505,42 +702,21 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // writes use executeRawJsonb (see mcp_request_log INSERT sites below).
   const sql = sqlQueryForEngine(engine);
 
-  // Initialize OAuth provider. F12 cleanup: DCR-disable now flips a
-  // constructor option instead of monkey-patching `_clientsStore` after
-  // construction. Same outcome (no /register endpoint when --enable-dcr
-  // is not passed); cleaner shape for tests and future maintainers.
+  // Dynamic Client Registration is deliberately unavailable on the network
+  // until a real operator-consent UI exists. Trusted local CLI and
+  // authenticated admin registration still call registerClientManual.
   const oauthProvider = new GBrainOAuthProvider({
     sql,
     tokenTtl,
-    dcrDisabled: !enableDcr,
-    allowClientCredentialsDcr: enableDcrInsecure === true,
+    dcrDisabled: true,
   });
-
-  // #1353: loud stderr security WARN when DCR is enabled. DCR is an
-  // unauthenticated network registration endpoint; surface the posture change
-  // (and the extra blast radius of --enable-dcr-insecure) so it's visible in
-  // logs, not buried in the neutral "DCR: enabled" banner line.
-  if (enableDcr) {
-    console.error(
-      'SECURITY WARNING: Dynamic Client Registration (--enable-dcr) is ON. ' +
-      'Any network caller can self-register an OAuth client. DCR clients default ' +
-      'to the authorization_code (consent-bearing) grant. See SECURITY.md.',
-    );
-    if (enableDcrInsecure) {
-      console.error(
-        'SECURITY WARNING: --enable-dcr-insecure is ON — self-registered DCR ' +
-        'clients may request the client_credentials grant, which BYPASSES the ' +
-        '/authorize consent screen. Only use this on a trusted network.',
-      );
-    }
-  }
 
   // Sweep expired tokens on startup (non-blocking)
   try {
     const swept = await oauthProvider.sweepExpiredTokens();
     if (swept > 0) console.error(`Swept ${swept} expired tokens`);
   } catch (e) {
-    console.error('Token sweep failed (non-blocking):', e instanceof Error ? e.message : e);
+    console.error('Token sweep failed (non-blocking).');
   }
 
   // v0.36.x #1024: bootstrap token sourcing.
@@ -556,10 +732,17 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     console.error(resolved.message);
     process.exit(1);
   }
-  let bootstrapToken: string = resolved.token;
-  let bootstrapFromEnv: boolean = resolved.fromEnv;
+  const bootstrapToken: string = resolved.token;
+  const bootstrapFromEnv: boolean = resolved.fromEnv;
   const bootstrapHash = createHash('sha256').update(bootstrapToken).digest('hex');
   const suppressBootstrapPrint = options.suppressBootstrapToken === true;
+  const printGeneratedBootstrapToken = shouldPrintGeneratedBootstrapToken({
+    fromEnv: bootstrapFromEnv,
+    suppressRequested: suppressBootstrapPrint,
+    bind,
+    publicUrl,
+    stderrIsTty: process.stderr.isTTY === true,
+  });
   const adminSessions = new Map<string, number>(); // sessionId → expiresAt
 
   // SSE clients for live activity feed
@@ -575,6 +758,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
   // Express 5 app
   const app = express();
+  // Do not advertise the framework/version in every response.
+  app.disable('x-powered-by');
   // v0.41.3 (T8): configurable trust-proxy via GBRAIN_HTTP_TRUST_PROXY env.
   // Default 'loopback' (trust Caddy/Tailscale on the same host) preserves
   // pre-v0.41.3 behavior. Operators behind Fly.io / Render / Vercel / nginx
@@ -583,6 +768,14 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // transport already reads this env var (src/mcp/http-transport.ts:111)
   // for the same purpose; T8 makes the Express path agree.
   app.set('trust proxy', resolveTrustProxy(process.env.GBRAIN_HTTP_TRUST_PROXY));
+
+  // No dependency required for the small, stable header set we need here.
+  // HSTS stays an explicit edge/operator decision (see SECURITY.md).
+  app.use((_req: Request, res: Response, next: NextFunction) => {
+    const headers = buildHttpSecurityHeaders();
+    for (const [name, value] of Object.entries(headers)) res.setHeader(name, value);
+    next();
+  });
 
   // ---------------------------------------------------------------------------
   // Cookie parsing — required for /admin auth (express 5 has no built-in)
@@ -599,7 +792,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // (src/mcp/http-transport.ts:parseCorsAllowlist) and gates every OAuth
   // surface behind the allowlist. When the env var is unset the OAuth
   // endpoints reject all cross-origin requests (default deny). Same-origin
-  // requests are unaffected because browsers send no Origin header for them.
+  // requests are admitted by the hard gate via request/canonical-origin match.
   //
   // The /admin SPA is the one cross-origin caller we expect on a personal
   // laptop install; it ships co-located with the brain and uses
@@ -616,23 +809,60 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     methods: ['GET', 'POST', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
   };
-  app.use('/mcp', cors(corsOAuthOptions));
-  app.use('/token', cors(corsOAuthOptions));
-  app.use('/authorize', cors(corsOAuthOptions));
-  app.use('/register', cors(corsOAuthOptions));
-  app.use('/revoke', cors(corsOAuthOptions));
+  const oauthAndMcpPaths = ['/mcp', '/token', '/authorize', '/register', '/revoke'];
+  app.use(oauthAndMcpPaths, (req: Request, res: Response, next: NextFunction) => {
+    const host = req.get('host');
+    let requestOrigin: string | undefined;
+    if (host) {
+      try { requestOrigin = new URL(`${req.protocol}://${host}`).origin; } catch { /* fail closed below */ }
+    }
+    const origin = req.get('origin');
+    if (!isHttpOriginAllowed(origin, requestOrigin, issuerUrl.origin, corsAllowlistOAuth)) {
+      res.status(403).json({ error: 'cors_origin_denied' });
+      return;
+    }
+    next();
+  });
+  for (const route of oauthAndMcpPaths) app.use(route, cors(corsOAuthOptions));
 
-  // ---------------------------------------------------------------------------
-  // Custom client_credentials handler (before mcpAuthRouter)
-  // SDK's token handler only supports authorization_code and refresh_token
-  // ---------------------------------------------------------------------------
-  const ccRateLimiter = rateLimit({
+  // Pre-auth IP limiter runs before body parsing, client lookup, hashing, or
+  // database work. It is intentionally independent from the post-auth client
+  // limits on /mcp and /ingest below.
+  const oauthIpRateLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 50,
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: 'too_many_requests', error_description: 'Rate limit exceeded. Try again in 15 minutes.' },
   });
+
+  // Network DCR and unattended authorization are fail-closed until an
+  // operator-consent flow exists. These explicit blockers precede both body
+  // parsers and the SDK router; provider configuration is a second layer.
+  app.all('/register', oauthIpRateLimiter, (_req: Request, res: Response) => {
+    res.status(404).json({ error: 'not_found' });
+  });
+  app.all('/authorize', oauthIpRateLimiter, (_req: Request, res: Response) => {
+    res.status(403).json({
+      error: 'access_denied',
+      error_description: 'Interactive operator consent is not available.',
+    });
+  });
+
+  // Parse OAuth bodies only after the pre-auth limiter. Explicit ceilings
+  // keep the contract stable across SDK/Express upgrades.
+  const oauthFormParser = express.urlencoded({
+    extended: false,
+    limit: HTTP_BODY_LIMITS.oauth,
+    parameterLimit: 100,
+  });
+  app.use('/token', oauthIpRateLimiter, oauthFormParser);
+  app.use('/revoke', oauthIpRateLimiter, oauthFormParser);
+
+  // ---------------------------------------------------------------------------
+  // Custom client_credentials handler (before mcpAuthRouter)
+  // SDK's token handler only supports authorization_code and refresh_token
+  // ---------------------------------------------------------------------------
 
   // Magic-link rate limiter: 10 requests/min/IP. The bootstrap token is
   // 64-char hex (unguessable) so brute-forcing is computationally
@@ -647,7 +877,15 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     message: 'Too many magic-link attempts. Wait a minute before trying again.',
   });
 
-  app.post('/token', ccRateLimiter, express.urlencoded({ extended: false }), async (req, res, next) => {
+  const adminLoginRateLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'too_many_login_attempts' },
+  });
+
+  app.post('/token', async (req, res, next) => {
     if (req.body?.grant_type !== 'client_credentials') {
       return next(); // Fall through to confidential-client handler or SDK
     }
@@ -661,9 +899,9 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
       const tokens = await oauthProvider.exchangeClientCredentials(client_id, client_secret, scope);
       res.json(tokens);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Unknown error';
-      res.status(400).json({ error: 'invalid_grant', error_description: msg });
+    } catch {
+      const envelope = oauthTokenErrorEnvelope('client_authentication');
+      res.status(envelope.status).json(envelope.body);
     }
   });
 
@@ -675,10 +913,12 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // clients. This middleware verifies the secret hash ourselves before
   // calling the provider's exchange methods directly.
   //
-  // Public clients (token_endpoint_auth_method='none') fall through to
-  // the SDK's handler — the v0.34.1.0 PKCE path stays canonical.
+  // Public refresh-token clients are handled here too so the SDK cannot turn
+  // "known client missing secret" vs "unknown client" into a registration
+  // oracle. New public authorization-code exchange is unavailable while
+  // /authorize is fail-closed; existing refresh grants can still rotate.
   // ---------------------------------------------------------------------------
-  app.post('/token', ccRateLimiter, async (req, res, next) => {
+  app.post('/token', async (req, res, next) => {
     const grantType = req.body?.grant_type;
     if (grantType !== 'authorization_code' && grantType !== 'refresh_token') {
       return next();
@@ -703,12 +943,32 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         // Malformed Basic header → falls through; SDK will reject
       }
     }
-    if (!clientId || !presentedSecret) {
-      return next(); // Public client path; SDK handles.
+    if (!clientId) {
+      const envelope = oauthTokenErrorEnvelope('client_authentication');
+      res.status(envelope.status).json(envelope.body);
+      return;
+    }
+
+    let client;
+    try {
+      if (presentedSecret) {
+        client = await oauthProvider.verifyConfidentialClientSecret(clientId, presentedSecret);
+      } else {
+        // No new public authorization codes can be minted while /authorize is
+        // disabled. Deny this shape without looking up the client so known and
+        // unknown IDs remain indistinguishable.
+        if (grantType === 'authorization_code') {
+          throw new Error('Invalid client');
+        }
+        client = await oauthProvider.verifyPublicClient(clientId);
+      }
+    } catch {
+      const envelope = oauthTokenErrorEnvelope('client_authentication');
+      res.status(envelope.status).json(envelope.body);
+      return;
     }
 
     try {
-      const client = await oauthProvider.verifyConfidentialClientSecret(clientId, presentedSecret);
       let tokens;
       if (grantType === 'authorization_code') {
         const code = req.body.code;
@@ -729,26 +989,18 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         tokens = await oauthProvider.exchangeRefreshToken(client, refreshToken, scopeParam);
       }
       res.json(tokens);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Unknown error';
-      // RFC 6749: invalid_client for auth failures, invalid_grant for
-      // code/token problems. "Invalid client" → 401; everything else 400.
-      if (msg === 'Invalid client' || msg === 'Client has been revoked') {
-        res.status(401).json({ error: 'invalid_client', error_description: msg });
-      } else {
-        res.status(400).json({ error: 'invalid_grant', error_description: msg });
-      }
+    } catch {
+      const envelope = oauthTokenErrorEnvelope('grant_exchange');
+      res.status(envelope.status).json(envelope.body);
     }
   });
 
   // ---------------------------------------------------------------------------
   // MCP SDK Auth Router (OAuth endpoints)
   // ---------------------------------------------------------------------------
-  // The issuer URL goes into discovery metadata + token iss claims. It MUST
-  // match the URL clients actually hit, or strict OAuth clients reject tokens
-  // (RFC 8414 §3.3). Honor --public-url for production deployments behind
-  // reverse proxies / tunnels; default to localhost for dev.
-  const issuerUrl = new URL(publicUrl || `http://localhost:${port}`);
+  // The issuer URL created at startup goes into discovery metadata + token
+  // issuer claims. It MUST match the URL clients actually hit, or strict
+  // OAuth clients reject tokens (RFC 8414 §3.3).
 
   // F9: cookie `secure` flag honors both the request's TLS state (req.secure
   // is set when express trust-proxy lands an X-Forwarded-Proto: https) AND
@@ -782,15 +1034,17 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
   const authRouter = mcpAuthRouter(authRouterOptions);
 
-  // Patch the SDK's OAuth metadata to include client_credentials grant type.
-  // The SDK hardcodes ['authorization_code', 'refresh_token'] — we intercept
-  // the response and add client_credentials before it reaches the client.
+  // Patch SDK metadata to describe the actually reachable grant surface.
+  // Existing refresh tokens remain renewable, but new authorization codes
+  // cannot be minted without operator consent and registration is local/admin
+  // only. Do not advertise network DCR or an unattended auth-code flow.
   app.use((req, res, next) => {
     if (req.path === '/.well-known/oauth-authorization-server' && req.method === 'GET') {
       const origJson = res.json.bind(res);
       (res as any).json = (body: any) => {
-        if (body?.grant_types_supported && !body.grant_types_supported.includes('client_credentials')) {
-          body.grant_types_supported.push('client_credentials');
+        if (body && typeof body === 'object') {
+          body.grant_types_supported = ['client_credentials', 'refresh_token'];
+          delete body.registration_endpoint;
         }
         return origJson(body);
       };
@@ -815,26 +1069,31 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // v0.40 D15.5: safeHexEqual extracted to src/core/timing-safe.ts so the new
   // /webhooks/github HMAC verifier reuses the same constant-time compare.
   // POST /admin/login — JSON body with token (for programmatic/UI login)
-  app.post('/admin/login', express.json(), (req, res) => {
-    const token = req.body?.token;
-    if (!token || typeof token !== 'string') {
-      res.status(400).json({ error: 'Token required' });
-      return;
-    }
+  app.post(
+    '/admin/login',
+    adminLoginRateLimiter,
+    express.json({ limit: HTTP_BODY_LIMITS.admin }),
+    (req, res) => {
+      const token = req.body?.token;
+      if (!token || typeof token !== 'string') {
+        res.status(400).json({ error: 'Token required' });
+        return;
+      }
 
-    const tokenHash = createHash('sha256').update(token).digest('hex');
-    if (!safeHexEqual(tokenHash, bootstrapHash)) {
-      res.status(401).json({ error: 'Invalid token. Check your terminal output.' });
-      return;
-    }
+      const tokenHash = createHash('sha256').update(token).digest('hex');
+      if (!safeHexEqual(tokenHash, bootstrapHash)) {
+        res.status(401).json({ error: 'Invalid token. Check your terminal output.' });
+        return;
+      }
 
-    const sessionId = randomBytes(32).toString('hex');
-    const expiresAt = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
-    adminSessions.set(sessionId, expiresAt);
+      const sessionId = randomBytes(32).toString('hex');
+      const expiresAt = Date.now() + 24 * 60 * 60 * 1000; // 24 hours
+      adminSessions.set(sessionId, expiresAt);
 
-    res.cookie('gbrain_admin', sessionId, adminCookie(req, 24 * 60 * 60 * 1000));
-    res.json({ status: 'authenticated' });
-  });
+      res.cookie('gbrain_admin', sessionId, adminCookie(req, 24 * 60 * 60 * 1000));
+      res.json({ status: 'authenticated' });
+    },
+  );
 
   // ---------------------------------------------------------------------------
   // Magic-link nonce store (single-use) — D11 + D12
@@ -885,7 +1144,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 
   // POST /admin/api/issue-magic-link — agent-callable mint endpoint.
   // Auth: Authorization: Bearer <bootstrapToken>. Returns one-time nonce.
-  app.post('/admin/api/issue-magic-link', express.json(), (req: Request, res: Response) => {
+  app.post('/admin/api/issue-magic-link', express.json({ limit: HTTP_BODY_LIMITS.admin }), (req: Request, res: Response) => {
     const auth = (req.headers.authorization || '') as string;
     const m = auth.match(/^Bearer\s+(\S+)$/i);
     if (!m) {
@@ -958,6 +1217,22 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     if (Date.now() > expiresAt) {
       adminSessions.delete(sessionId);
       res.status(401).json({ error: 'Session expired' });
+      return;
+    }
+    const host = req.get('host');
+    let requestOrigin: string | undefined;
+    if (host) {
+      try { requestOrigin = new URL(`${req.protocol}://${host}`).origin; } catch { /* rejected when browser metadata is present */ }
+    }
+    if (!isAdminMutationOriginAllowed({
+      method: req.method,
+      origin: req.get('origin'),
+      referer: req.get('referer'),
+      fetchSite: req.get('sec-fetch-site'),
+      requestOrigin,
+      canonicalOrigin: issuerUrl.origin,
+    })) {
+      res.status(403).json({ error: 'csrf_origin_denied' });
       return;
     }
     next();
@@ -1072,7 +1347,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       res.json(snap);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      res.status(500).json({ error: msg });
+      console.error('admin jobs snapshot error:', msg);
+      res.status(500).json({ error: 'internal_error' });
     }
   });
 
@@ -1127,7 +1403,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
         takes,
       });
     } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : 'unknown' });
+      console.error('admin calibration pattern error:', err instanceof Error ? err.message : String(err));
+      res.status(500).json({ error: 'internal_error' });
     }
   });
 
@@ -1138,7 +1415,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const profile = await getLatestProfile(engine, { holder });
       res.json(profile);
     } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : 'unknown' });
+      console.error('admin calibration profile error:', err instanceof Error ? err.message : String(err));
+      res.status(500).json({ error: 'internal_error' });
     }
   });
 
@@ -1215,7 +1493,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       res.status(400).json({ error: 'unknown_chart_type', supported: ['brier-trend', 'domain-bars', 'pattern-statements', 'abandoned-threads'] });
       return;
     } catch (err) {
-      res.status(500).json({ error: err instanceof Error ? err.message : 'unknown' });
+      console.error('admin calibration chart error:', err instanceof Error ? err.message : String(err));
+      res.status(500).json({ error: 'internal_error' });
       return;
     }
   });
@@ -1286,7 +1565,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     }
   });
 
-  app.post('/admin/api/api-keys', requireAdmin, express.json(), async (req: Request, res: Response) => {
+  app.post('/admin/api/api-keys', requireAdmin, express.json({ limit: HTTP_BODY_LIMITS.admin }), async (req: Request, res: Response) => {
     try {
       const { name } = req.body;
       if (!name) { res.status(400).json({ error: 'Name required' }); return; }
@@ -1297,23 +1576,25 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       await sql`INSERT INTO access_tokens (id, name, token_hash) VALUES (${id}, ${name}, ${hash})`;
       res.json({ name, token, id });
     } catch (e) {
-      res.status(500).json({ error: e instanceof Error ? e.message : 'Failed to create API key' });
+      console.error('admin API-key creation error:', e instanceof Error ? e.message : String(e));
+      res.status(500).json({ error: 'internal_error' });
     }
   });
 
-  app.post('/admin/api/api-keys/revoke', requireAdmin, express.json(), async (req: Request, res: Response) => {
+  app.post('/admin/api/api-keys/revoke', requireAdmin, express.json({ limit: HTTP_BODY_LIMITS.admin }), async (req: Request, res: Response) => {
     try {
       const { name } = req.body;
       if (!name) { res.status(400).json({ error: 'Name required' }); return; }
       await sql`UPDATE access_tokens SET revoked_at = now() WHERE name = ${name} AND revoked_at IS NULL`;
       res.json({ revoked: true });
     } catch (e) {
-      res.status(500).json({ error: e instanceof Error ? e.message : 'Revoke failed' });
+      console.error('admin API-key revoke error:', e instanceof Error ? e.message : String(e));
+      res.status(500).json({ error: 'internal_error' });
     }
   });
 
   // Register client from admin dashboard
-  app.post('/admin/api/register-client', requireAdmin, express.json(), async (req: Request, res: Response) => {
+  app.post('/admin/api/register-client', requireAdmin, express.json({ limit: HTTP_BODY_LIMITS.admin }), async (req: Request, res: Response) => {
     try {
       // v0.39.3.0 WARN-9 + CV12: accept BOTH `scopes` (admin SPA convention)
       // AND `scope` (OAuth wire-format convention, singular). The pre-fix
@@ -1366,12 +1647,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       }
       res.json({ ...result, tokenTtl: tokenTtl ? Number(tokenTtl) : null });
     } catch (e) {
-      res.status(500).json({ error: e instanceof Error ? e.message : 'Registration failed' });
+      console.error('admin OAuth-client registration error:', e instanceof Error ? e.message : String(e));
+      res.status(500).json({ error: 'internal_error' });
     }
   });
 
   // Update client TTL
-  app.post('/admin/api/update-client-ttl', requireAdmin, express.json(), async (req: Request, res: Response) => {
+  app.post('/admin/api/update-client-ttl', requireAdmin, express.json({ limit: HTTP_BODY_LIMITS.admin }), async (req: Request, res: Response) => {
     try {
       const { clientId, tokenTtl } = req.body;
       if (!clientId) { res.status(400).json({ error: 'clientId required' }); return; }
@@ -1379,12 +1661,13 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       await sql`UPDATE oauth_clients SET token_ttl = ${ttl} WHERE client_id = ${clientId}`;
       res.json({ updated: true, tokenTtl: ttl });
     } catch (e) {
-      res.status(500).json({ error: e instanceof Error ? e.message : 'Update failed' });
+      console.error('admin OAuth-client TTL update error:', e instanceof Error ? e.message : String(e));
+      res.status(500).json({ error: 'internal_error' });
     }
   });
 
   // Revoke OAuth client
-  app.post('/admin/api/revoke-client', requireAdmin, express.json(), async (req: Request, res: Response) => {
+  app.post('/admin/api/revoke-client', requireAdmin, express.json({ limit: HTTP_BODY_LIMITS.admin }), async (req: Request, res: Response) => {
     try {
       const { clientId } = req.body;
       if (!clientId) { res.status(400).json({ error: 'clientId required' }); return; }
@@ -1394,7 +1677,8 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       await sql`DELETE FROM oauth_tokens WHERE client_id = ${clientId}`;
       res.json({ revoked: true });
     } catch (e) {
-      res.status(500).json({ error: e instanceof Error ? e.message : 'Revoke failed' });
+      console.error('admin OAuth-client revoke error:', e instanceof Error ? e.message : String(e));
+      res.status(500).json({ error: 'internal_error' });
     }
   });
 
@@ -1436,7 +1720,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       if (req.path.startsWith('/admin/api/') || req.path === '/admin/events' || req.path === '/admin/login') {
         return next();
       }
-      res.sendFile(path.join(adminDistPath, 'index.html'));
+      // Keep the filename relative to an explicit root. An absolute sendFile
+      // path can include a legitimate dot-directory (for example Git's
+      // `.worktrees` checkout root), which `send` treats as a forbidden
+      // dotfile segment and turns into a false 404.
+      res.sendFile('index.html', { root: adminDistPath });
     });
   } else {
     // Embedded path. Read assets from the generated manifest. Cache the
@@ -1488,7 +1776,29 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     res.status(405).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed' }, id: null });
   });
 
-  app.post('/mcp', requireBearerAuth({ verifier: oauthProvider }), async (req: Request, res: Response) => {
+  const mcpIpRateLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 1_200,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { error: 'rate_limit_exceeded' },
+  });
+  const mcpClientRateLimiter = rateLimit({
+    windowMs: 60_000,
+    limit: 600,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    keyGenerator: authenticatedClientRateLimitKey,
+    message: { error: 'rate_limit_exceeded' },
+  });
+
+  app.post(
+    '/mcp',
+    mcpIpRateLimiter,
+    requireBearerAuth({ verifier: oauthProvider }),
+    mcpClientRateLimiter,
+    express.json({ limit: HTTP_BODY_LIMITS.mcp }),
+    async (req: Request, res: Response) => {
     const startTime = Date.now();
     const authInfo = (req as any).auth as AuthInfo;
     const authorizedMcpOperations = filterMcpOperationsForAuth(mcpOperations, authInfo);
@@ -1770,11 +2080,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       if (!res.headersSent) {
         res.status(500).json({
           error: 'internal_error',
-          message: e instanceof Error ? e.message : 'Unknown error',
         });
       }
     }
-  });
+    },
+  );
 
   // ---------------------------------------------------------------------------
   // v0.38 ingestion substrate — POST /ingest (webhook source)
@@ -1785,25 +2095,32 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // (file-watcher, inbox-folder, cron-scheduler) while serve --http hosts
   // the network surface and submits Minion jobs directly.
   //
-  // Auth: existing OAuth `write` scope. Rate limit: 100 events / 10s per
-  // IP (reuses the IP-keyed pattern from ccRateLimiter; a future tweak
-  // could key on authInfo.clientId for fairer per-agent fairness).
+  // Auth: existing OAuth `write` scope. A pre-auth IP limit stops anonymous
+  // abuse before token verification; a post-auth client limit prevents one
+  // valid integration from monopolizing parsing/queue capacity.
   // Payload cap: 1 MB default. Content-type allowlist: markdown, plain,
   // HTML, JSON. Binary content is REJECTED with HTTP 415 in v1 — the
   // binary-upload flow ships as a separate route in a later wave when
   // content-type processors land.
   //
-  // Events always carry untrusted_payload: true because the input came
+  // Events always carry untrusted_payload + remote because the input came
   // over the network from an OAuth-authenticated but otherwise untrusted
-  // source (Zapier / IFTTT / Apple Shortcuts). The downstream
-  // ingest_capture handler logs the flag; a future v2 wave wires it
-  // through the put_page op to skip auto-link.
+  // source (Zapier / IFTTT / Apple Shortcuts). The worker threads both into
+  // importFromContent so trust-owned markers cannot be forged.
   // ---------------------------------------------------------------------------
   const ingestRateLimiter = rateLimit({
     windowMs: 10_000, // 10 seconds
     limit: 100, // 100 events per IP per window
     standardHeaders: 'draft-7',
     legacyHeaders: false,
+    message: { error: 'rate_limit_exceeded', message: 'too many /ingest events; backoff and retry' },
+  });
+  const ingestClientRateLimiter = rateLimit({
+    windowMs: 10_000,
+    limit: 50,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    keyGenerator: authenticatedClientRateLimitKey,
     message: { error: 'rate_limit_exceeded', message: 'too many /ingest events; backoff and retry' },
   });
 
@@ -1834,6 +2151,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
     '/ingest',
     ingestRateLimiter,
     requireBearerAuth({ verifier: oauthProvider, requiredScopes: ['write'] }),
+    ingestClientRateLimiter,
     express.raw({ type: '*/*', limit: ingestMaxBytes }),
     async (req: Request, res: Response) => {
       const startTime = Date.now();
@@ -1921,7 +2239,20 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       const content = body.toString('utf8');
       const contentHash = computeContentHash(content);
       const sourceUri = (req.header('x-gbrain-source-uri') || `mcp-webhook:${authInfo.clientId}:${Date.now()}`).slice(0, 1024);
-      const sourceId = (req.header('x-gbrain-source-id') || `webhook-${authInfo.clientId}`).slice(0, 256);
+      // The authenticated principal is the sole write-source authority. A
+      // caller header may repeat it for observability, but can never select a
+      // different source. Missing/invalid source grants fail closed instead
+      // of falling back to the server process's default source.
+      const sourceId = authInfo.sourceId;
+      if (!isValidSourceId(sourceId)) {
+        res.status(403).json({ error: 'source_scope_required' });
+        return;
+      }
+      const requestedSourceId = req.header('x-gbrain-source-id');
+      if (requestedSourceId !== undefined && requestedSourceId !== sourceId) {
+        res.status(403).json({ error: 'source_scope_denied' });
+        return;
+      }
       const callerSlug = req.header('x-gbrain-slug');
 
       const event: IngestionEvent = {
@@ -1952,21 +2283,29 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       }
 
       try {
+        const backpressureKey = buildIngestBackpressureKey(authInfo.clientId, sourceId);
         const job = await ingestQueue.add(
           'ingest_capture',
           {
             event,
+            sourceId,
             ...(callerSlug ? { slug: callerSlug } : {}),
+            remote: true,
           },
           {
             // Idempotency: same content from the same client within the
             // queue's lifetime is a single job. Different content gets
             // different jobs. Daemon-side dedup catches the 24h window;
             // the queue-level idempotency catches simultaneous retries.
-            idempotency_key: `ingest:webhook:${authInfo.clientId}:${contentHash}`,
-            // Cap waiting jobs from a single client so a runaway integration
-            // can't fill the queue.
+            idempotency_key: `${backpressureKey}${contentHash}`,
+            // Partition the cap by authenticated principal AND source. The
+            // exact prefix is persisted in idempotency_key, so another source
+            // can neither consume this producer's slots nor receive one of its
+            // job IDs. Reject instead of coalescing distinct network events:
+            // 202 must always mean this exact event is durably queued.
             maxWaiting: 50,
+            maxWaitingKey: backpressureKey,
+            maxWaitingBehavior: 'reject',
           },
         );
 
@@ -1995,12 +2334,18 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
           source_id: sourceId,
           message: 'Accepted. Event queued for ingestion.',
         });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error('POST /ingest queue submission error:', msg);
+      } catch (error) {
+        if (error instanceof MinionQueueBackpressureError) {
+          res.setHeader('Retry-After', '10');
+          res.status(429).json({
+            error: 'queue_backpressure',
+            message: 'Ingestion queue is full for this client and source; retry later.',
+          });
+          return;
+        }
+        console.error('POST /ingest queue submission failed.');
         res.status(500).json({
           error: 'queue_submission_failed',
-          message: msg,
         });
       }
 
@@ -2009,13 +2354,11 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       // (codex F#16) skips the second-response attempt if the inner block
       // already wrote a response and then threw on a downstream line (e.g.
       // a logging side-effect after `res.status(202).json(...)`).
-      } catch (outerErr) {
-        const msg = outerErr instanceof Error ? outerErr.message : String(outerErr);
-        console.error('POST /ingest unexpected handler error:', msg);
+      } catch {
+        console.error('POST /ingest unexpected handler failure.');
         if (!res.headersSent) {
           res.status(500).json({
             error: 'internal_error',
-            message: msg,
           });
         }
       }
@@ -2169,10 +2512,29 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error('webhook: queue submission error:', msg);
-        res.status(500).json({ error: 'queue_submission_failed', message: msg });
+        res.status(500).json({ error: 'queue_submission_failed' });
       }
     },
   );
+
+  // Unknown paths and middleware/parser failures must never fall through to
+  // Express's HTML error page (which can expose stack details in development
+  // mode and breaks JSON/MCP clients in every mode).
+  app.use((_req: Request, res: Response) => {
+    res.status(404).json({ error: 'not_found' });
+  });
+  app.use((error: unknown, _req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) {
+      next(error);
+      return;
+    }
+    const envelope = classifyHttpError(error);
+    // Never persist parser/request text: malformed bodies can contain secrets,
+    // control characters, or attacker-chosen fragments. Log only the stable
+    // public classification needed for operations.
+    console.error(`HTTP request error: status=${envelope.status} code=${envelope.body.error}`);
+    res.status(envelope.status).json(envelope.body);
+  });
 
   // ---------------------------------------------------------------------------
   // Start server
@@ -2189,7 +2551,7 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
 ║  Engine:    ${(config.engine || 'pglite').padEnd(40)}║
 ║  Issuer:    ${issuerUrl.origin.padEnd(40)}║
 ║  Clients:   ${String((clientCount[0] as any).count).padEnd(40)}║
-║  DCR:       ${(enableDcr ? (enableDcrInsecure ? 'enabled (INSECURE: client_credentials)' : 'enabled') : 'disabled').padEnd(40)}║
+║  DCR:       ${'disabled (operator consent required)'.padEnd(40)}║
 ║  Skills:    ${skillStatus.bannerValue.padEnd(40)}║
 ║  Token TTL: ${(tokenTtl + 's').padEnd(40)}║
 ╠══════════════════════════════════════════════════════╣
@@ -2201,7 +2563,9 @@ ${suppressBootstrapPrint
   ? '║  Admin Token: suppressed (--suppress-bootstrap-token) ║\n╚══════════════════════════════════════════════════════╝'
   : bootstrapFromEnv
     ? '║  Admin Token: from $GBRAIN_ADMIN_BOOTSTRAP_TOKEN     ║\n╚══════════════════════════════════════════════════════╝'
-    : `║  Admin Token (paste into /admin login):              ║\n║  ${bootstrapToken.substring(0, 50)}  ║\n║  ${bootstrapToken.substring(50).padEnd(50)}  ║\n╚══════════════════════════════════════════════════════╝`}
+    : printGeneratedBootstrapToken
+      ? `║  Admin Token (paste into /admin login):              ║\n║  ${bootstrapToken.substring(0, 50)}  ║\n║  ${bootstrapToken.substring(50).padEnd(50)}  ║\n╚══════════════════════════════════════════════════════╝`
+      : '║  Admin Token: generated but not printed              ║\n║  Set $GBRAIN_ADMIN_BOOTSTRAP_TOKEN for stable access ║\n╚══════════════════════════════════════════════════════╝'}
 `);
   });
 }

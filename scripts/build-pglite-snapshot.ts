@@ -23,6 +23,7 @@ import { dirname } from "node:path";
 import * as crypto from "node:crypto";
 
 import { PGLiteEngine, computeSnapshotSchemaHash } from "../src/core/pglite-engine.ts";
+import { configureGateway } from "../src/core/ai/gateway.ts";
 import { MIGRATIONS } from "../src/core/migrate.ts";
 import { PGLITE_SCHEMA_SQL } from "../src/core/pglite-schema.ts";
 
@@ -38,6 +39,17 @@ async function main() {
   const schemaHash = computeSchemaHash();
   console.log(`[build-pglite-snapshot] schema hash: ${schemaHash.slice(0, 16)}...`);
   console.log(`[build-pglite-snapshot] booting PGLite (in-memory)...`);
+
+  // The test harness preloads the legacy OpenAI/1536 shape because many
+  // fixtures intentionally contain 1536-d vectors. `bun run` does not load
+  // bunfig's test preload, so pin the same shape here before initSchema.
+  // Without this, the snapshot is silently built at the production 1280-d
+  // default while its version hash describes PGLITE_SCHEMA_SQL's 1536 shape.
+  configureGateway({
+    embedding_model: "openai:text-embedding-3-large",
+    embedding_dimensions: 1536,
+    env: { ...process.env },
+  });
   const engine = new PGLiteEngine();
 
   // Bypass the env-aware short-circuit: we WANT a real init here.

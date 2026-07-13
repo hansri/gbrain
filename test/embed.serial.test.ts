@@ -1,5 +1,19 @@
-import { describe, test, expect, mock, beforeEach, afterEach } from 'bun:test';
+import { describe, test, expect, mock, beforeEach, afterEach, afterAll } from 'bun:test';
 import type { BrainEngine } from '../src/core/engine.ts';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const priorGbrainHome = process.env.GBRAIN_HOME;
+const embedTestHome = mkdtempSync(join(tmpdir(), 'gbrain-embed-serial-'));
+mkdirSync(join(embedTestHome, '.gbrain'), { recursive: true, mode: 0o700 });
+writeFileSync(join(embedTestHome, '.gbrain', 'config.json'), JSON.stringify({
+  engine: 'pglite',
+  embedding_model: 'openai:text-embedding-3-large',
+  embedding_dimensions: 1536,
+  embedding_disabled: false,
+}));
+process.env.GBRAIN_HOME = embedTestHome;
 
 // Mock the embedding module BEFORE importing runEmbed, so runEmbed picks up
 // the mocked embedBatch. We track max concurrent invocations via a counter
@@ -79,6 +93,12 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env.GBRAIN_EMBED_CONCURRENCY;
   delete process.env.GBRAIN_EMBED_TIME_BUDGET_MS;
+});
+
+afterAll(() => {
+  rmSync(embedTestHome, { recursive: true, force: true });
+  if (priorGbrainHome === undefined) delete process.env.GBRAIN_HOME;
+  else process.env.GBRAIN_HOME = priorGbrainHome;
 });
 
 describe('runEmbed --all (parallel)', () => {

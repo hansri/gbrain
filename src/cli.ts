@@ -44,12 +44,12 @@ for (const op of operations) {
 }
 
 // CLI-only commands that bypass the operation layer
-const CLI_ONLY = new Set(['init', 'reinit-pglite', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'extract-conversation-facts', 'enrich', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'takes', 'think', 'salience', 'anomalies', 'transcripts', 'models', 'remote', 'recall', 'forget', 'edges-backfill', 'cache', 'ze-switch', 'founder', 'brainstorm', 'lsd', 'schema', 'capture', 'onboard', 'conversation-parser', 'status', 'connect', 'skillopt', 'quarantine', 'self-upgrade', 'advisor', 'watch']);
+const CLI_ONLY = new Set(['init', 'reinit-pglite', 'upgrade', 'upgrade-preflight', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'extract-conversation-facts', 'enrich', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'takes', 'think', 'salience', 'anomalies', 'transcripts', 'models', 'remote', 'recall', 'forget', 'edges-backfill', 'cache', 'ze-switch', 'founder', 'brainstorm', 'lsd', 'schema', 'capture', 'onboard', 'conversation-parser', 'status', 'connect', 'skillopt', 'quarantine', 'self-upgrade', 'advisor', 'watch']);
 // CLI-only commands whose handlers print their own --help text. These are
 // excluded from the generic short-circuit so detailed per-command and
 // per-subcommand usage stays reachable.
 const CLI_ONLY_SELF_HELP = new Set([
-  'upgrade', 'post-upgrade', 'check-update',
+  'upgrade', 'upgrade-preflight', 'post-upgrade', 'check-update',
   'embed', 'config',
   'skillpack', 'skillpack-check',
   'integrations', 'friction',
@@ -202,6 +202,12 @@ async function main() {
   // BEFORE command dispatch, so `gbrain --progress-json doctor` works.
   // The stripped argv is what the command sees.
   const rawArgs = process.argv.slice(2);
+  // A bound post-upgrade transition may authorize exactly one same-release
+  // migration child. Validate and atomically consume that bearer before any
+  // early-return command, startup hook, config read, or database connection.
+  // Partial/invalid capability env is fatal even when upgrade state is healthy.
+  const { consumeUpgradeChildCapability } = await import('./core/upgrade-child-capability.ts');
+  const upgradeChildAuthorized = consumeUpgradeChildCapability(rawArgs);
   const { cliOpts, rest: args } = parseGlobalFlags(rawArgs);
   setCliOptions(cliOpts);
 
@@ -223,17 +229,36 @@ async function main() {
     return;
   }
 
-  // v0.42 self-upgrade: ride this invocation as an update heartbeat. Cache-read-
-  // only, fail-open, never blocks. Skips the update path's own commands + sets
-  // GBRAIN_SKIP_STARTUP_HOOKS for their children. Runs for every real command.
-  maybeEmitUpdateMarker(command);
-
   const subArgs = args.slice(1);
 
   // DX alias: `ask` is a natural-language alias for `query`
   if (command === 'ask') {
     command = 'query';
   }
+
+  // Upgrade authority is a global pre-dispatch fence. Run it before startup
+  // hooks, special DB-free commands, argument transforms, or connectEngine so
+  // an interrupted binary handoff cannot leak into any normal side effect.
+  const {
+    assertUpgradeStateAllowsCliCommand,
+    isAutopilotDaemonStartInvocation,
+    resumeDeferredPostUpgradeAtBoot,
+  } = await import('./commands/upgrade.ts');
+  if (!upgradeChildAuthorized) assertUpgradeStateAllowsCliCommand(command, subArgs);
+  if (!upgradeChildAuthorized
+    && command === 'autopilot'
+    && isAutopilotDaemonStartInvocation(subArgs)) {
+    // A swap-only relaunch must consume deferred/running state under the
+    // upgrade owner lock before startup hooks or connectEngine. Install/status
+    // child commands are deliberately excluded to avoid lock re-entry.
+    await resumeDeferredPostUpgradeAtBoot();
+  }
+
+  // v0.42 self-upgrade: ride this invocation as an update heartbeat. Cache-read-
+  // only, fail-open, never blocks. Skips the update path's own commands + sets
+  // GBRAIN_SKIP_STARTUP_HOOKS for their children. Runs for every permitted real
+  // command, after the upgrade fence above.
+  maybeEmitUpdateMarker(command);
 
   // T5 — `gbrain search modes|stats|tune` is the read-only config dashboard,
   // NOT a free-text search for the literal word "modes". Free-text
@@ -285,13 +310,15 @@ async function main() {
   }
 
   // DB-free durability pull (v0.42.44 D2): the harden cron calls
-  // `gbrain sources pull --path <dir>` every ~30 min. It must NOT open PGLite
+  // `gbrain sources pull --path <dir> --expected-remote <url>` every ~30 min.
   // (a live long-lived session holds the single-writer lock), so handle it
   // BEFORE connectEngine. The `sources pull <id>` form (no --path) still routes
   // through handleCliOnly → runSources with an engine.
-  if (command === 'sources' && subArgs[0] === 'pull' && subArgs.includes('--path')) {
-    const { runPull } = await import('./commands/sources-harden.ts');
-    await runPull(null, subArgs.slice(1));
+  if (command === 'sources' && ['pull', 'push', 'commit-push'].includes(subArgs[0] ?? '') && subArgs.includes('--path')) {
+    const { runPull, runPush, runCommitPush } = await import('./commands/sources-harden.ts');
+    if (subArgs[0] === 'push') await runPush(subArgs.slice(1));
+    else if (subArgs[0] === 'commit-push') await runCommitPush(subArgs.slice(1));
+    else await runPull(null, subArgs.slice(1));
     return;
   }
 
@@ -956,7 +983,7 @@ export function formatResult(opName: string, result: unknown): string {
  * `runRemoteDoctor` for thin-client installs.
  */
 const THIN_CLIENT_REFUSED_COMMANDS = new Set([
-  'sync', 'embed', 'extract', 'extract-conversation-facts', 'enrich', 'migrate', 'apply-migrations',
+  'sync', 'embed', 'extract', 'extract-conversation-facts', 'enrich', 'migrate', 'apply-migrations', 'upgrade-preflight',
   'repair-jsonb', 'orphans', 'integrity', 'serve',
   // v0.43 (#2095): watch streams against a LOCAL engine; thin clients get
   // the volunteer_context MCP op instead.
@@ -990,17 +1017,18 @@ const THIN_CLIENT_REFUSED_COMMANDS = new Set([
  * place during code review.
  */
 const THIN_CLIENT_REFUSE_HINTS: Record<string, string> = {
-  sync: 'sync runs on the host. Trigger a remote cycle with `gbrain remote ping` (queues an autopilot-cycle job).',
-  embed: 'embed runs on the host as part of the autopilot cycle. `gbrain remote ping` triggers a full cycle including embed.',
-  extract: 'extract runs on the host. Use `gbrain remote ping` to trigger a cycle including extract.',
+  sync: 'sync runs on the host. Use a supervised host maintenance session; generic remote job submission is disabled.',
+  embed: 'embed runs on the host. Use a supervised host maintenance session; generic remote job submission is disabled.',
+  extract: 'extract runs on the host. Use a supervised host maintenance session; generic remote job submission is disabled.',
   'extract-conversation-facts': 'extract-conversation-facts runs on the host (requires local engine + chat gateway). Run on the host machine.',
   enrich: 'enrich runs on the host (requires local engine + chat gateway for grounded synthesis). Run on the host machine.',
   migrate: "migrate runs on the host's local engine. Run on the host machine.",
   'apply-migrations': 'schema migrations run on the host. SSH and run there.',
+  'upgrade-preflight': 'upgrade preflight and ownership repair run on the host database only.',
   'repair-jsonb': 'repair-jsonb operates on the local DB only.',
   integrity: 'integrity scans local files. Run on the host machine.',
   serve: 'serve starts a server. Run on the host, not the thin client.',
-  dream: 'dream runs the autopilot cycle on the host. `gbrain remote ping` queues one. (Native `gbrain dream` thin-client routing planned for v0.31.2.)',
+  dream: 'dream runs on the host. Use a supervised host maintenance session; remote GBrain is not a command queue.',
   orphans: "orphans needs the host's brain. Run on the host or use the `find_orphans` MCP tool from your agent.",
   transcripts: 'transcripts is server-private (raw chat exports stay on the host). Read transcripts on the host machine.',
   storage: 'storage operates on the local repo on disk. Run on the host.',
@@ -1089,6 +1117,11 @@ async function handleCliOnly(command: string, args: string[]) {
   if (command === 'upgrade') {
     const { runUpgrade } = await import('./commands/upgrade.ts');
     await runUpgrade(args);
+    return;
+  }
+  if (command === 'upgrade-preflight') {
+    const { runUpgradePreflight } = await import('./commands/upgrade-preflight.ts');
+    await runUpgradePreflight(args);
     return;
   }
   if (command === 'post-upgrade') {
@@ -1212,7 +1245,8 @@ async function handleCliOnly(command: string, args: string[]) {
     // connecting a second time when the orchestrator shells out to
     // `gbrain init --migrate-only` and `gbrain jobs smoke`.
     const { runApplyMigrations } = await import('./commands/apply-migrations.ts');
-    await runApplyMigrations(args);
+    const result = await runApplyMigrations(args);
+    setCliExitVerdict(result.exitCode);
     return;
   }
   if (command === 'repair-jsonb') {
@@ -1577,16 +1611,22 @@ async function handleCliOnly(command: string, args: string[]) {
   try {
     switch (command) {
       case 'import': {
-        const { runImport } = await import('./commands/import.ts');
+        const { runImport, ImportInvocationError } = await import('./commands/import.ts');
         // v0.41 (Codex r2 #3 fix): honor errors counter for exit code.
         // runImport's per-file catch already records failures, but the
         // CLI was discarding the result so the process exited 0 even
         // when files failed (e.g. content-sanity hard-block throws,
-        // size-cap throws, parse errors). Surface non-zero on errors > 0
-        // so wrappers (sync, CI scripts, `&& gbrain doctor`) propagate.
-        const importResult = await runImport(engine, args);
-        if (importResult.errors > 0) {
-          setCliExitVerdict(1);
+        // size-cap throws, parse errors, and returned validation failures).
+        // Surface the import verdict so wrappers (sync, CI scripts,
+        // `&& gbrain doctor`) cannot mistake a partial import for success.
+        try {
+          const importResult = await runImport(engine, args);
+          setCliExitVerdict(importResult.exitCode);
+        } catch (error) {
+          if (!(error instanceof ImportInvocationError)) throw error;
+          if (args.includes('--json')) console.log(JSON.stringify(error.importResult));
+          else console.error(error.message);
+          setCliExitVerdict(error.exitCode);
         }
         break;
       }
@@ -2209,6 +2249,7 @@ SETUP
   init [--pglite|--supabase|--url]   Create brain (PGLite default, no server)
   migrate --to <supabase|pglite>     Transfer brain between engines
   upgrade                            Self-update
+  upgrade-preflight [--json]         Check/repair ownership conflicts before upgrade
   check-update [--json]              Check for new versions
   doctor [--json] [--fast]            Health check (resolver, skills, pgvector, RLS, embeddings)
   integrations [subcommand]          Manage integration recipes (senses + reflexes)
@@ -2333,8 +2374,6 @@ ADMIN
   serve                              MCP server (stdio)
   serve --http [--port N]            HTTP MCP server with OAuth 2.1
     --token-ttl N                    Access token TTL in seconds (default: 3600)
-    --enable-dcr                     Enable Dynamic Client Registration (DCR clients default to authorization_code)
-    --enable-dcr-insecure            Also allow the consent-bypassing client_credentials grant on DCR (implies --enable-dcr)
     --public-url URL                 Public issuer URL (required behind proxy/tunnel)
   connect <mcp-url> --token <t>      Wire Claude Code to a remote gbrain (bearer token)
         [--install] [--json]         Print the paste-ready command, or --install to run it

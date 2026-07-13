@@ -15,13 +15,11 @@
  * Phases (all idempotent):
  *   A. Schema — gbrain init --migrate-only (creates tables via SCHEMA_SQL).
  *   B. Verify — confirm all three tables exist.
- *   C. Record — append completed.jsonl.
+ *   C. Record — runner-owned brain-scoped receipt.
  */
 
 import type { Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult } from './types.ts';
-import { appendCompletedMigration } from '../../core/preferences.ts';
-import { loadConfig, toEngineConfig } from '../../core/config.ts';
-import { createEngine } from '../../core/engine-factory.ts';
+import { runSnapshotMigrateOnly, withMigrationEngine } from './snapshot.ts';
 
 const REQUIRED_TABLES = ['subagent_messages', 'subagent_tool_executions', 'subagent_rate_leases'] as const;
 
@@ -30,8 +28,7 @@ const REQUIRED_TABLES = ['subagent_messages', 'subagent_tool_executions', 'subag
 async function phaseASchema(opts: OrchestratorOpts): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) return { name: 'schema', status: 'skipped', detail: 'dry-run' };
   try {
-    const { runMigrateOnlyCore } = await import('./in-process.ts');
-    await runMigrateOnlyCore();
+    await runSnapshotMigrateOnly(opts);
     return { name: 'schema', status: 'complete' };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -44,13 +41,7 @@ async function phaseASchema(opts: OrchestratorOpts): Promise<OrchestratorPhaseRe
 async function phaseBVerify(opts: OrchestratorOpts): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) return { name: 'verify', status: 'skipped', detail: 'dry-run' };
   try {
-    const config = loadConfig();
-    if (!config) {
-      return { name: 'verify', status: 'skipped', detail: 'no brain configured' };
-    }
-    const engine = await createEngine(toEngineConfig(config));
-    await engine.connect(toEngineConfig(config));
-    try {
+    return await withMigrationEngine(opts, async engine => {
       const rows = await engine.executeRaw<{ table_name: string }>(
         `SELECT table_name FROM information_schema.tables
          WHERE table_schema = current_schema()
@@ -66,9 +57,7 @@ async function phaseBVerify(opts: OrchestratorOpts): Promise<OrchestratorPhaseRe
         };
       }
       return { name: 'verify', status: 'complete', detail: `${REQUIRED_TABLES.length} tables present` };
-    } finally {
-      try { await engine.disconnect(); } catch {}
-    }
+    });
   } catch (e) {
     return {
       name: 'verify',
@@ -103,18 +92,6 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
 }
 
 function finalize(phases: OrchestratorPhaseResult[], status: 'complete' | 'partial' | 'failed'): OrchestratorResult {
-  if (status !== 'failed') {
-    try {
-      appendCompletedMigration({
-        version: '0.16.0',
-        completed_at: new Date().toISOString(),
-        status: status as 'complete' | 'partial',
-        phases: phases.map(p => ({ name: p.name, status: p.status })),
-      });
-    } catch {
-      // Recording is best-effort.
-    }
-  }
   return { version: '0.16.0', status, phases };
 }
 

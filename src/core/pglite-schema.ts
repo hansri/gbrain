@@ -337,8 +337,8 @@ CREATE INDEX IF NOT EXISTS idx_raw_data_page ON raw_data(page_id);
 -- ============================================================
 -- files: binary asset metadata (v0.27.1 — PGLite parity for multimodal)
 -- Image bytes never enter the DB; storage_path references a path in the
--- brain repo. Identity is (source_id, storage_path) via the UNIQUE
--- constraint on storage_path; upserts replace metadata in place.
+-- brain repo. The composite identity is present, while the legacy global
+-- constraint remains during the canary for previous-binary rollback.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS files (
   id           SERIAL PRIMARY KEY,
@@ -353,13 +353,15 @@ CREATE TABLE IF NOT EXISTS files (
   content_hash TEXT   NOT NULL,
   metadata     JSONB  NOT NULL DEFAULT '{}',
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE(storage_path)
+  CONSTRAINT files_storage_path_key UNIQUE(storage_path)
 );
 
 CREATE INDEX IF NOT EXISTS idx_files_page ON files(page_slug);
 CREATE INDEX IF NOT EXISTS idx_files_page_id ON files(page_id);
 CREATE INDEX IF NOT EXISTS idx_files_source_id ON files(source_id);
 CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_files_source_storage_path
+  ON files(source_id, storage_path);
 
 -- ============================================================
 -- timeline_entries: structured timeline
@@ -371,6 +373,8 @@ CREATE TABLE IF NOT EXISTS timeline_entries (
   source   TEXT    NOT NULL DEFAULT '',
   summary  TEXT    NOT NULL,
   detail   TEXT    NOT NULL DEFAULT '',
+  -- Explicit extractor ownership; NULL rows are manual/legacy/unowned.
+  managed_by TEXT,
   -- v0.42.x (Life Chronicle #2390): event-projection pointer. NULL for
   -- ordinary rows. See src/schema.sql for the full rationale.
   event_page_id INTEGER REFERENCES pages(id) ON DELETE CASCADE,
@@ -379,6 +383,8 @@ CREATE TABLE IF NOT EXISTS timeline_entries (
 
 CREATE INDEX IF NOT EXISTS idx_timeline_page ON timeline_entries(page_id);
 CREATE INDEX IF NOT EXISTS idx_timeline_date ON timeline_entries(date);
+CREATE INDEX IF NOT EXISTS idx_timeline_managed_page
+  ON timeline_entries(managed_by, page_id) WHERE managed_by IS NOT NULL;
 -- Dedup constraint: same (page, date, summary) treated as same event
 -- v0.41.18.0 (codex finding #11): widened to include source so distinct
 -- meeting provenance survives. Legacy rows have source='' (schema default).
@@ -599,6 +605,7 @@ CREATE TABLE IF NOT EXISTS gbrain_cycle_locks (
   id                 TEXT        PRIMARY KEY,
   holder_pid         INT         NOT NULL,
   holder_host        TEXT,
+  holder_token       TEXT        NOT NULL DEFAULT 'legacy-unfenced',
   acquired_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   ttl_expires_at     TIMESTAMPTZ NOT NULL,
   -- v0.41.13.0 (migration v97 + D-V3-4): bumped on every withRefreshingLock

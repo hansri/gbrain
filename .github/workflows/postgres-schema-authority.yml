@@ -1,0 +1,49 @@
+name: Postgres Schema Authority Gate
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-schema-authority:
+    # Release-blocking proof that schema replay/migrations cannot drift through
+    # transaction pooling, a shadow search_path, or a same-named wrong direct
+    # database. Keep this topology and command list in one callable workflow so
+    # PR/push validation and tag publication cannot diverge.
+    name: Postgres schema authority (PgBouncer)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: 1.3.13
+      - run: bun install --frozen-lockfile
+      - name: Start authority topology
+        run: >-
+          docker compose -f docker-compose.ci.yml up -d --wait
+          postgres-1 postgres-2 pgbouncer
+      - name: Run Postgres authority regressions
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5434/gbrain_test
+          GBRAIN_TEST_DB: '1'
+          GBRAIN_PGBOUNCER_URL: postgresql://postgres:postgres@127.0.0.1:6543/gbrain_test
+          GBRAIN_PGBOUNCER_DIRECT_URL: postgresql://postgres:postgres@127.0.0.1:5434/gbrain_test
+          GBRAIN_PGBOUNCER_WRONG_DIRECT_URL: postgresql://postgres:postgres@127.0.0.1:5435/gbrain_test
+        run: |
+          test -n "$DATABASE_URL"
+          test -n "$GBRAIN_PGBOUNCER_URL"
+          test -n "$GBRAIN_PGBOUNCER_DIRECT_URL"
+          test -n "$GBRAIN_PGBOUNCER_WRONG_DIRECT_URL"
+          # Separate processes are intentional: postgres-bootstrap exercises
+          # the legacy module singleton, while the PgBouncer fixture must start
+          # with process-clean connection state before it seeds its own DB.
+          # The CLI smoke must also resolve its isolated config, not inherit the
+          # bootstrap job's DATABASE_URL and silently connect to gbrain_test.
+          bun test --max-concurrency=1 test/e2e/postgres-bootstrap.test.ts
+          env -u DATABASE_URL bun test --max-concurrency=1 test/e2e/pgbouncer-teardown.test.ts
+      - name: Stop authority topology
+        if: always()
+        run: docker compose -f docker-compose.ci.yml down -v --remove-orphans

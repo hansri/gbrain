@@ -1,5 +1,7 @@
 import type { BrainEngine } from '../core/engine.ts';
 import { loadConfig, loadConfigWithEngine } from '../core/config.ts';
+import { DATABASE_INSTANCE_ID_CONFIG_KEY } from '../core/database-instance-id.ts';
+import { MIGRATION_INFLIGHT_KEY_PREFIX } from '../core/migration-inflight.ts';
 import {
   getEmbeddingColumnRegistry,
   validateColumnKey,
@@ -33,6 +35,18 @@ export function redactConfigValue(key: string, value: string): string {
   if (value.includes('postgresql://')) return redactUrl(value);
   if (isSensitiveConfigKey(key)) return '***';
   return value;
+}
+
+/** These keys are mutated only by the dedicated, audited migration flows. */
+export function isProtectedMigrationAuthorityKey(key: string): boolean {
+  return key === DATABASE_INSTANCE_ID_CONFIG_KEY
+    || key.startsWith(MIGRATION_INFLIGHT_KEY_PREFIX);
+}
+
+function refuseProtectedMigrationAuthority(key: string): never {
+  console.error(`[config] ${key} is protected migration authority state.`);
+  console.error('[config] Use the dedicated migration recovery command; generic config mutation is disabled.');
+  process.exit(1);
 }
 
 export async function runConfig(engine: BrainEngine, args: string[]) {
@@ -69,6 +83,8 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
         console.log(`No keys match prefix "${prefix}".`);
         return;
       }
+      const protectedKey = keys.find(isProtectedMigrationAuthorityKey);
+      if (protectedKey) refuseProtectedMigrationAuthority(protectedKey);
       let deleted = 0;
       for (const k of keys) {
         const n = await engine.unsetConfig(k);
@@ -84,6 +100,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       console.error('Usage: gbrain config unset <key> | --pattern <prefix>');
       process.exit(1);
     }
+    if (isProtectedMigrationAuthorityKey(key)) refuseProtectedMigrationAuthority(key);
     const n = await engine.unsetConfig(key);
     if (n > 0) {
       console.log(`Unset ${key}`);
@@ -106,6 +123,7 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       process.exit(1);
     }
   } else if (action === 'set' && key && value) {
+    if (isProtectedMigrationAuthorityKey(key)) refuseProtectedMigrationAuthority(key);
     // v0.37.11.0 fix wave (Lane C.2 + CDX2-13): refuse writes to schema-sizing
     // fields unconditionally. These fields size the `content_chunks.embedding`
     // column at init time and are file-plane canonical. `gbrain config set

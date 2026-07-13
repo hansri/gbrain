@@ -499,9 +499,10 @@ describe('MinionSupervisor', () => {
         expect(existsSync(outFile)).toBe(true);
         const argv = readFileSync(outFile, 'utf8').trim();
         expect(argv).toContain(`--max-rss ${expected}`);
-        // Auto-sized value is clamped into the sane range, never the old 2048
-        // unless the box genuinely resolves there.
-        expect(expected).toBeGreaterThanOrEqual(4096);
+        // The cap stays positive and bounded. A 4 GiB cgroup intentionally
+        // resolves to 2048 so the watchdog drains before the kernel OOM-kills
+        // the worker; only larger memory bases apply the 4096 floor.
+        expect(expected).toBeGreaterThan(0);
         expect(expected).toBeLessThanOrEqual(16384);
       } finally {
         try { unlinkSync(outFile); } catch { /* noop */ }

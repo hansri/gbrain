@@ -24,6 +24,7 @@ import { createEngine } from '../src/core/engine-factory.ts';
 import { __testing, __setTestEngineOverride } from '../src/commands/migrations/v0_31_0.ts';
 import { runMigrationsUpTo } from './e2e/helpers.ts';
 import type { BrainEngine } from '../src/core/engine.ts';
+import { migrationTestOpts } from './helpers/migration-opts.ts';
 
 describe('v0.31.0 orchestrator — phaseASchema gate', () => {
   let tmp: string;
@@ -47,7 +48,7 @@ describe('v0.31.0 orchestrator — phaseASchema gate', () => {
     await engine.connect({ engine: 'pglite', database_path: dbPath });
     await engine.initSchema();
     __setTestEngineOverride(engine);
-  });
+  }, 60_000);
 
   afterEach(async () => {
     __setTestEngineOverride(null);
@@ -55,13 +56,13 @@ describe('v0.31.0 orchestrator — phaseASchema gate', () => {
     if (oldGbrainHome === undefined) delete process.env.GBRAIN_HOME;
     else process.env.GBRAIN_HOME = oldGbrainHome;
     rmSync(tmp, { recursive: true, force: true });
-  });
+  }, 60_000);
 
   test('schema_version < 45 fails with operator-facing message naming v45 + recovery command', async () => {
     // Roll the version backwards to simulate a brain stuck at pre-v45.
     await engine.setConfig('version', '40');
 
-    const result = await __testing.phaseASchema(engine, { yes: true, dryRun: false, noAutopilotInstall: true });
+    const result = await __testing.phaseASchema(engine, migrationTestOpts());
 
     expect(result.name).toBe('schema');
     expect(result.status).toBe('failed');
@@ -79,21 +80,21 @@ describe('v0.31.0 orchestrator — phaseASchema gate', () => {
     const { LATEST_VERSION } = await import('../src/core/migrate.ts');
     await runMigrationsUpTo(engine as never, LATEST_VERSION);
 
-    const result = await __testing.phaseASchema(engine, { yes: true, dryRun: false, noAutopilotInstall: true });
+    const result = await __testing.phaseASchema(engine, migrationTestOpts());
 
     expect(result.status).toBe('complete');
     expect(result.detail).toContain('facts table present');
   });
 
   test('dryRun short-circuits before any DB read', async () => {
-    const result = await __testing.phaseASchema(engine, { yes: true, dryRun: true, noAutopilotInstall: true });
+    const result = await __testing.phaseASchema(engine, migrationTestOpts({ dryRun: true }));
 
     expect(result.status).toBe('skipped');
     expect(result.detail).toBe('dry-run');
   });
 
   test('null engine short-circuits with no_brain_configured', async () => {
-    const result = await __testing.phaseASchema(null, { yes: true, dryRun: false, noAutopilotInstall: true });
+    const result = await __testing.phaseASchema(null, migrationTestOpts());
 
     expect(result.status).toBe('skipped');
     expect(result.detail).toBe('no_brain_configured');

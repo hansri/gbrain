@@ -7,13 +7,18 @@
  * (R1/R2-clean). The git-runner seam drives the unavailable branches.
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, writeFileSync, rmSync, mkdirSync, renameSync } from 'fs';
-import { execSync } from 'child_process';
+import { mkdtempSync, writeFileSync, rmSync, mkdirSync, renameSync, symlinkSync } from 'fs';
+import { execFileSync, execSync, spawn } from 'child_process';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import {
   computeSyncDelta,
   buildDetachedWorkingTreeManifest,
+  listGitCommitBlobs,
+  openGitCommitSnapshot,
+  resolveGitCommitBlob,
+  readGitCommitBlob,
+  type SpawnGit,
   _setGitRunnerForTests,
 } from '../src/core/sync-delta.ts';
 
@@ -42,6 +47,169 @@ afterEach(() => {
 });
 
 describe('computeSyncDelta — commit diff', () => {
+  test('[CRITICAL] commit blob reads ignore post-commit worktree edits', () => {
+    writeFileSync(join(repo, 'topics/a.md'), 'committed authority');
+    const commit = commitAll('base');
+    const blob = resolveGitCommitBlob(repo, commit, 'topics/a.md');
+
+    // A same-path edit after the anchor must never change the bytes imported
+    // for that anchor. This is the production pipeline race in miniature.
+    writeFileSync(join(repo, 'topics/a.md'), 'mutable worktree poison');
+
+    expect(readGitCommitBlob(repo, blob, 5_000_000).toString('utf8')).toBe('committed authority');
+    expect(listGitCommitBlobs(repo, commit).map(entry => entry.path)).toContain('topics/a.md');
+  });
+
+  test('commit blob reader enforces its byte limit before returning content', () => {
+    writeFileSync(join(repo, 'topics/a.md'), '12345');
+    const commit = commitAll('base');
+    const blob = resolveGitCommitBlob(repo, commit, 'topics/a.md');
+    expect(() => readGitCommitBlob(repo, blob, 4)).toThrow('Git blob too large');
+  });
+
+  test('[CRITICAL] commit reader ignores Git replace refs', async () => {
+    writeFileSync(join(repo, 'topics/a.md'), 'committed authority');
+    const commit = commitAll('base');
+    const originalOid = git('rev-parse HEAD:topics/a.md');
+    const poisonOid = execSync('git hash-object -w --stdin', {
+      cwd: repo,
+      input: 'replace-ref poison',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).toString().trim();
+    execSync(`git replace ${originalOid} ${poisonOid}`, { cwd: repo, stdio: 'pipe' });
+
+    const snapshot = openGitCommitSnapshot(repo, commit);
+    try {
+      expect((await snapshot.read('topics/a.md', 1024)).toString('utf8')).toBe('committed authority');
+    } finally {
+      await snapshot.close();
+    }
+  });
+
+  test('[CRITICAL] authority subprocess scrubs inherited Git repository/object/config poisoning', () => {
+    writeFileSync(join(repo, 'topics/a.md'), 'committed authority');
+    const commit = commitAll('base');
+    const originalOid = git('rev-parse HEAD:topics/a.md');
+    const poisonOid = execSync('git hash-object -w --stdin', {
+      cwd: repo,
+      input: 'replace-ref poison',
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).toString().trim();
+    execSync(`git replace ${originalOid} ${poisonOid}`, { cwd: repo, stdio: 'pipe' });
+
+    const emptyObjects = join(repo, 'poison-objects');
+    mkdirSync(emptyObjects);
+    const poisonConfig = join(repo, 'poison.gitconfig');
+    writeFileSync(poisonConfig, '[core]\nrepositoryFormatVersion = 999\n');
+    const moduleUrl = new URL('../src/core/sync-delta.ts', import.meta.url).href;
+    const script = [
+      `import { openGitCommitSnapshot } from ${JSON.stringify(moduleUrl)};`,
+      `const snapshot = openGitCommitSnapshot(${JSON.stringify(repo)}, ${JSON.stringify(commit)});`,
+      `try { process.stdout.write((await snapshot.read('topics/a.md', 1024)).toString('utf8')); }`,
+      `finally { await snapshot.close(); }`,
+    ].join('\n');
+
+    const output = execFileSync(process.execPath, ['-e', script], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        GIT_DIR: '/dev/null',
+        GIT_WORK_TREE: '/dev/null',
+        GIT_COMMON_DIR: '/dev/null',
+        GIT_OBJECT_DIRECTORY: emptyObjects,
+        GIT_ALTERNATE_OBJECT_DIRECTORIES: emptyObjects,
+        GIT_GRAFT_FILE: join(repo, 'poison-grafts'),
+        GIT_REPLACE_REF_BASE: 'refs/replace-poisoned/',
+        GIT_CONFIG_GLOBAL: poisonConfig,
+        GIT_CONFIG_SYSTEM: poisonConfig,
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'core.repositoryformatversion',
+        GIT_CONFIG_VALUE_0: '999',
+      },
+    });
+    expect(output).toBe('committed authority');
+  });
+
+  test('colon paths are literal and survive snapshot lookup/read', async () => {
+    writeFileSync(join(repo, 'topics/meeting:notes.md'), 'literal colon path');
+    const commit = commitAll('colon');
+    const snapshot = openGitCommitSnapshot(repo, commit);
+    try {
+      expect((await snapshot.read('topics/meeting:notes.md', 1024)).toString('utf8'))
+        .toBe('literal colon path');
+    } finally {
+      await snapshot.close();
+    }
+  });
+
+  test('NUL-delimited diff preserves tabs and newlines in committed paths', () => {
+    writeFileSync(join(repo, 'topics/base.md'), 'base');
+    const base = commitAll('base');
+    const special = 'topics/line\nbreak\tname.md';
+    writeFileSync(join(repo, special), 'special');
+    const head = commitAll('special path');
+
+    const result = computeSyncDelta(repo, base, head);
+    expect(result.status).toBe('ok');
+    if (result.status === 'ok') expect(result.manifest.added).toContain(special);
+  });
+
+  test('large tree uses one persistent cat-file process, not one process per file', async () => {
+    const FILE_COUNT = 1000;
+    for (let i = 0; i < FILE_COUNT; i++) writeFileSync(join(repo, `topics/page-${i}.md`), `page ${i}`);
+    const commit = commitAll('many');
+    let processCount = 0;
+    const spawnGit: SpawnGit = (command, args, options) => {
+      processCount++;
+      return spawn(command, [...args], options as any) as any;
+    };
+    const snapshot = openGitCommitSnapshot(repo, commit, {
+      spawnGit,
+    });
+    try {
+      const contents = await Promise.all(
+        Array.from({ length: FILE_COUNT }, (_, i) => snapshot.read(`topics/page-${i}.md`, 1024)),
+      );
+      expect(contents.map(buf => buf.toString('utf8'))).toHaveLength(FILE_COUNT);
+      expect(processCount).toBe(1);
+    } finally {
+      await snapshot.close();
+    }
+  }, 30_000);
+
+  test('cat-file spawn failure is a rejected snapshot read, not a process crash', async () => {
+    writeFileSync(join(repo, 'topics/a.md'), 'committed authority');
+    const commit = commitAll('base');
+    const spawnMissing: SpawnGit = (_command, _args, options) =>
+      spawn('/definitely/missing/gbrain-git', [], options as any) as any;
+    const snapshot = openGitCommitSnapshot(repo, commit, { spawnGit: spawnMissing });
+    try {
+      await expect(snapshot.read('topics/a.md', 1024)).rejects.toThrow('Git cat-file');
+    } finally {
+      await snapshot.close();
+    }
+  });
+
+  test('hung cat-file reads and close are bounded', async () => {
+    writeFileSync(join(repo, 'topics/a.md'), 'committed authority');
+    const commit = commitAll('base');
+    const spawnHung: SpawnGit = (_command, _args, options) =>
+      spawn(
+        process.execPath,
+        ['-e', 'process.stdin.resume(); setInterval(() => {}, 1000)'],
+        options as any,
+      ) as any;
+    const snapshot = openGitCommitSnapshot(repo, commit, {
+      spawnGit: spawnHung,
+      readTimeoutMs: 75,
+      closeTimeoutMs: 75,
+    });
+    const started = Date.now();
+    await expect(snapshot.read('topics/a.md', 1024)).rejects.toThrow('timed out');
+    await snapshot.close();
+    expect(Date.now() - started).toBeLessThan(1_000);
+  });
+
   test('A/M/D classified; only committed changes in the manifest', () => {
     writeFileSync(join(repo, 'topics/a.md'), 'a');
     writeFileSync(join(repo, 'topics/b.md'), 'b');
@@ -69,6 +237,20 @@ describe('computeSyncDelta — commit diff', () => {
     expect(r.status).toBe('ok');
     if (r.status !== 'ok') return;
     expect(r.manifest.renamed.map(x => x.to)).toContain('topics/new.md');
+  });
+
+  test('regular file to symlink is classified as a target type change', () => {
+    writeFileSync(join(repo, 'topics/a.md'), 'regular');
+    const base = commitAll('base');
+    rmSync(join(repo, 'topics/a.md'));
+    symlinkSync('../outside.md', join(repo, 'topics/a.md'));
+    const head = commitAll('regular to symlink');
+
+    const r = computeSyncDelta(repo, base, head);
+    expect(r.status).toBe('ok');
+    if (r.status !== 'ok') return;
+    expect(r.manifest.modified).toContain('topics/a.md');
+    expect(listGitCommitBlobs(repo, head).some(blob => blob.path === 'topics/a.md')).toBe(false);
   });
 
   test('[D2A] attached HEAD: dirty tracked + untracked files are NOT in the manifest', () => {

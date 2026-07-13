@@ -16,6 +16,7 @@ import type {
 import { rowToMinionJob, rowToInboxMessage, rowToAttachment } from './types.ts';
 import { validateAttachment } from './attachments.ts';
 import { isProtectedJobName } from './protected-names.ts';
+import { prepareIngestCaptureJobData } from './ingest-boundary.ts';
 import { defaultTimeoutMsFor } from './handler-timeouts.ts';
 import {
   withRetry, BULK_RETRY_OPTS, resolveBulkRetryOpts, computeNextDelay,
@@ -33,6 +34,32 @@ export interface TrustedSubmitOpts {
   /** When true, allow submission of names in PROTECTED_JOB_NAMES (currently 'shell').
    *  Set only by the CLI path and by `submit_job` when `ctx.remote === false`. */
   allowProtectedSubmit?: boolean;
+  /**
+   * Stamp an ingest_capture job as originating from a trusted local producer.
+   * This flag lives in the separate trusted argument so caller-controlled job
+   * data cannot opt itself into trusted ingestion. Only local operation/daemon
+   * code may set it.
+   */
+  allowTrustedLocalIngest?: boolean;
+}
+
+/** Typed saturation signal for callers that must return retryable backpressure
+ *  instead of silently coalescing a distinct event. */
+export class MinionQueueBackpressureError extends Error {
+  readonly code = 'minion_queue_backpressure';
+
+  constructor(
+    readonly jobName: string,
+    readonly queueName: string,
+    readonly waitingCount: number,
+    readonly maxWaiting: number,
+  ) {
+    super(
+      `queue '${queueName}' has ${waitingCount} waiting '${jobName}' jobs ` +
+      `(maxWaiting=${maxWaiting}); retry later`,
+    );
+    this.name = 'MinionQueueBackpressureError';
+  }
 }
 
 const MIGRATION_VERSION = 7;
@@ -93,6 +120,13 @@ export class MinionQueue {
         `(pass {allowProtectedSubmit: true} as the 4th arg to MinionQueue.add)`,
       );
     }
+    // Durable ingestion trust boundary. A caller-provided copy of the marker
+    // is always removed; only the out-of-band trusted option can stamp it.
+    // This also makes pre-fix queued false/false payloads fail closed in the
+    // worker because they do not carry the server-owned marker.
+    const persistedData = jobName === 'ingest_capture'
+      ? prepareIngestCaptureJobData(data, trusted?.allowTrustedLocalIngest === true)
+      : data;
     // v0.38 (S1.7 + D6) — capability-based gate replaces the v0.31.12 Anthropic
     // pin. The subagent loop now routes through `gateway.toolLoop()` so any
     // provider with native tool calling works. Only refuse-at-submit when
@@ -128,6 +162,19 @@ export class MinionQueue {
     const childStatus: MinionJobStatus = opts?.delay ? 'delayed' : 'waiting';
     const delayUntil = opts?.delay ? new Date(Date.now() + opts.delay) : null;
     const maxSpawnDepth = opts?.max_spawn_depth ?? this.maxSpawnDepth;
+    const maxWaitingKey = opts?.maxWaitingKey;
+    if (maxWaitingKey !== undefined) {
+      if (typeof maxWaitingKey !== 'string' || maxWaitingKey.length === 0 || maxWaitingKey.length > 512) {
+        throw new Error('maxWaitingKey must be between 1 and 512 characters');
+      }
+      if (!opts?.idempotency_key?.startsWith(maxWaitingKey)) {
+        throw new Error('maxWaitingKey must be a prefix of idempotency_key');
+      }
+    }
+    const maxWaitingBehavior = opts?.maxWaitingBehavior ?? 'coalesce';
+    if (maxWaitingBehavior !== 'coalesce' && maxWaitingBehavior !== 'reject') {
+      throw new Error("maxWaitingBehavior must be 'coalesce' or 'reject'");
+    }
 
     return this.engine.transaction(async (tx) => {
       // 1. Idempotency fast path — if a row already exists for this key, return it
@@ -142,12 +189,14 @@ export class MinionQueue {
       }
 
       // 1b. Submission-time backpressure for high-frequency named jobs.
-      // If waiting jobs for this (name, queue) already hit maxWaiting, return
-      // the most-recent waiting row instead of inserting another slot.
+      // If waiting jobs for this (name, queue, optional exact key) already hit
+      // maxWaiting, either return the most-recent waiting row or reject with a
+      // typed retryable error. Event-shaped network inputs use reject so the
+      // server never acknowledges an event that was actually discarded.
       //
       // Correctness: two concurrent submitters could both see waitingCount <
       // maxWaiting and both insert, violating the cap. `pg_advisory_xact_lock`
-      // keyed on (name, queue) serializes concurrent count+insert decisions
+      // keyed on (name, queue, key) serializes concurrent count+insert decisions
       // for the SAME key while leaving different keys fully parallel. The
       // lock releases on txn commit/rollback automatically — no cleanup path
       // to leak. Cost: one no-op SELECT on the hot path per coalesce-guarded
@@ -156,7 +205,10 @@ export class MinionQueue {
       // Queue scope: the filter includes `queue=$2` so a waiting
       // 'autopilot-cycle' in queue 'default' does NOT suppress submissions
       // to queue 'shell' with the same name. Pre-D2 code filtered on `name`
-      // alone — a real cross-queue bleed that sequential tests missed.
+      // alone — a real cross-queue bleed that sequential tests missed. When
+      // maxWaitingKey is present, it must prefix the persisted idempotency key
+      // and the exact prefix is included in BOTH count and coalesce selection.
+      // That is the per-principal/source boundary for webhook ingestion.
       //
       // Engine compatibility: PGLite (WASM Postgres 17) supports
       // pg_advisory_xact_lock, so this works on both engines without branching.
@@ -164,23 +216,38 @@ export class MinionQueue {
         const maxWaiting = Math.max(1, Math.floor(opts.maxWaiting));
         const backpressureQueue = opts?.queue ?? 'default';
         await tx.executeRaw(
-          `SELECT pg_advisory_xact_lock(hashtext('minion_maxwaiting:' || $1 || ':' || $2))`,
-          [jobName, backpressureQueue]
+          `SELECT pg_advisory_xact_lock(hashtext('minion_maxwaiting:' || $1 || ':' || $2 || ':' || $3))`,
+          [jobName, backpressureQueue, maxWaitingKey ?? '']
         );
+        const scopePredicate = maxWaitingKey === undefined
+          ? ''
+          : ` AND idempotency_key IS NOT NULL
+              AND left(idempotency_key, length($3)) = $3`;
+        const scopeParams = maxWaitingKey === undefined
+          ? [jobName, backpressureQueue]
+          : [jobName, backpressureQueue, maxWaitingKey];
         const waitingCountRows = await tx.executeRaw<{ count: string }>(
           `SELECT count(*)::text AS count
            FROM minion_jobs
-           WHERE name = $1 AND queue = $2 AND status = 'waiting'`,
-          [jobName, backpressureQueue]
+           WHERE name = $1 AND queue = $2 AND status = 'waiting'${scopePredicate}`,
+          scopeParams
         );
         const waitingCount = parseInt(waitingCountRows[0]?.count ?? '0', 10);
         if (waitingCount >= maxWaiting) {
+          if (maxWaitingBehavior === 'reject') {
+            throw new MinionQueueBackpressureError(
+              jobName,
+              backpressureQueue,
+              waitingCount,
+              maxWaiting,
+            );
+          }
           const existingWaiting = await tx.executeRaw<Record<string, unknown>>(
             `SELECT * FROM minion_jobs
-             WHERE name = $1 AND queue = $2 AND status = 'waiting'
+             WHERE name = $1 AND queue = $2 AND status = 'waiting'${scopePredicate}
              ORDER BY created_at DESC, id DESC
              LIMIT 1`,
-            [jobName, backpressureQueue]
+            scopeParams
           );
           if (existingWaiting.length > 0) {
             const coalesced = rowToMinionJob(existingWaiting[0]);
@@ -269,7 +336,7 @@ export class MinionQueue {
         opts?.queue ?? 'default',
         childStatus,
         opts?.priority ?? 0,
-        data ?? {},
+        persistedData ?? {},
         opts?.max_attempts ?? 3,
         opts?.backoff_type ?? 'exponential',
         opts?.backoff_delay ?? 1000,

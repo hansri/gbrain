@@ -4,8 +4,8 @@
  * Pins the contract of T4 in the plan: the rename loop in
  * src/commands/sync.ts:~1280 pre-resolves all `from` slugs via
  * engine.resolveSlugsByPaths in batches BEFORE iterating per-file. The
- * per-file updateSlug + importFile calls stay (those are inherently
- * per-file). The win is dropping the slug-resolve N+1.
+ * per-file importer calls stay (the importer owns the short atomic slug-move
+ * transaction). The win is dropping the slug-resolve N+1.
  *
  * Coverage:
  *   - resolveSlugsByPaths returns one Map for an N-path input (not N
@@ -88,5 +88,23 @@ describe('rename loop pre-batched slug resolution', () => {
     expect(m.get('present-2.md')).toBe('present-2');
     expect(m.get('absent.md')).toBeUndefined();
     expect(m.get('absent2.md')).toBeUndefined();
+  });
+
+  test('fails closed if legacy duplicate path owners exist before v124 repair', async () => {
+    await engine.executeRaw(`DROP INDEX pages_source_path_owner_uniq`);
+    try {
+      await seedPageWithPath('dupe/one', 'dupe/shared.md');
+      await seedPageWithPath('dupe/two', 'dupe/shared.md');
+      await expect(engine.resolveSlugsByPaths(
+        ['dupe/shared.md'],
+        { sourceId: 'default' },
+      )).rejects.toThrow('Ambiguous source_path ownership');
+    } finally {
+      await engine.executeRaw(`DELETE FROM pages WHERE slug IN ('dupe/one', 'dupe/two')`);
+      await engine.executeRaw(
+        `CREATE UNIQUE INDEX IF NOT EXISTS pages_source_path_owner_uniq
+           ON pages(source_id, source_path) WHERE source_path IS NOT NULL`,
+      );
+    }
   });
 });

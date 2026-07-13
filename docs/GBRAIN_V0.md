@@ -270,12 +270,15 @@ gbrain export [--dir ./export/]           # export to markdown (round-trip)
 gbrain embed [<slug>|--all|--stale]       # generate/refresh embeddings
 gbrain serve                               # MCP server (stdio)
 gbrain call <tool> '<json>'               # raw tool invocation
-gbrain upgrade                             # self-update (npm, binary, ClawHub)
+gbrain upgrade                             # exact-target, policy-gated self-update
 gbrain version                             # version info
 gbrain config [get|set] <key> [value]     # brain config
 ```
 
-CLI and MCP expose identical operations. Drift tests assert identical results for all operations across both interfaces.
+CLI and MCP share the same engine semantics for operations permitted on both
+surfaces. Remote MCP deliberately omits local filesystem, host maintenance,
+schema/source administration, and other `localOnly` capabilities; drift tests
+compare only the overlapping authorized surface.
 
 ## Database schema
 
@@ -423,7 +426,7 @@ Each skill is a markdown file that AI agents (Claude Code, OpenClaw) read and fo
 
 ## CEO scope expansions (accepted for v0)
 
-1. **CLI/MCP parity with drift tests.** Both interfaces are thin wrappers over the engine. Tests assert identical output.
+1. **CLI/MCP engine parity with explicit capability boundaries.** Both interfaces share engine behavior for overlapping authorized operations; remote MCP omits local and maintenance-only capabilities.
 2. **Smart slug resolution.** Fuzzy matching via pg_trgm for reads. Writes require exact slugs. `gbrain get "dont scale"` resolves to `concepts/do-things-that-dont-scale`.
 3. **Brain health dashboard.** `gbrain health` shows page count, embed coverage, stale pages, orphans, dead links.
 4. **Normalized timeline.** `timeline_entries` table only (no TEXT column). `detail` field supports markdown.
@@ -443,13 +446,15 @@ Single-user, local-only:
 
 ## Upgrade mechanism
 
-`gbrain upgrade` detects the installation method and updates accordingly:
+`gbrain upgrade` resolves one exact locally approved release, detects the
+installation method, pins that target through the swap, and verifies the
+replacement reports the same version:
 
 | Path | How |
 |------|-----|
-| npm | `bun update gbrain` (or npm equivalent) |
-| Compiled binary | Download new binary to temp dir, atomic rename swap, exec new process |
-| ClawHub | `clawhub update gbrain` |
+| Bun package | Install `gbrain@<exact-version>` with exact-version semantics |
+| Compiled binary | Download the exact tagged asset to a temp dir, verify its version, atomic rename swap, exec new process |
+| ClawHub | Inline upgrade denied unless the installer can prove an exact target; use a supervised exact-version install |
 
 Version check: compare local version against latest GitHub release tag.
 
@@ -510,7 +515,7 @@ The CLI connects directly to Supabase Postgres. Trigger.dev and Vercel are for a
 7. `bun test` passes all tests
 8. `clawhub install gbrain` installs the skill and runs guided setup
 9. `bun add gbrain` + `import { PostgresEngine } from 'gbrain'` works in external project
-10. Drift tests pass: CLI and MCP produce identical results
+10. Drift tests pass for the overlapping CLI/MCP capability surface, while remote-only denials remain enforced
 11. `gbrain health` outputs accurate brain health metrics
 12. Migration skill successfully imports an Obsidian vault
 

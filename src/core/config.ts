@@ -1,7 +1,13 @@
-import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from 'fs';
+import { readFileSync, existsSync } from 'fs';
 import { isAbsolute, join } from 'path';
 import { homedir } from 'os';
 import type { EngineConfig, EmbeddingColumnConfig } from './types.ts';
+import {
+  ensureOwnedStateDirectory,
+  writeOwnedStateFileAtomic,
+} from './owned-state-file.ts';
+
+const MAX_CONFIG_FILE_BYTES = 1024 * 1024;
 
 /**
  * Where is the active DB URL coming from? Pure introspection, no connection
@@ -947,13 +953,14 @@ export const KNOWN_CONFIG_KEY_PREFIXES: readonly string[] = [
 ];
 
 export function saveConfig(config: GBrainConfig): void {
-  mkdirSync(getConfigDir(), { recursive: true });
-  writeFileSync(getConfigPath(), JSON.stringify(config, null, 2) + '\n', { mode: 0o600 });
-  try {
-    chmodSync(getConfigPath(), 0o600);
-  } catch {
-    // chmod may fail on some platforms
-  }
+  const dir = getConfigDir();
+  ensureOwnedStateDirectory(dir, dir);
+  writeOwnedStateFileAtomic(
+    getConfigPath(),
+    JSON.stringify(config, null, 2) + '\n',
+    MAX_CONFIG_FILE_BYTES,
+    dir,
+  );
   // v0.35.8.0: ensure the per-home `.gitignore` exists on every config-write
   // path. Cheap, idempotent, doesn't clobber user edits. Catches the case
   // where `~/.gbrain/` lives inside a git worktree (Conductor + gstack
@@ -989,7 +996,7 @@ export function ensureGitignore(): void {
   try {
     const dir = configDir();
     const file = join(dir, '.gitignore');
-    mkdirSync(dir, { recursive: true });
+    ensureOwnedStateDirectory(dir, dir);
     if (existsSync(file)) {
       // Don't clobber user customization. Only write when the file is missing
       // OR when its content is empty (zero-byte placeholder).
@@ -1001,8 +1008,7 @@ export function ensureGitignore(): void {
         return;
       }
     }
-    writeFileSync(file, '*\n', { mode: 0o600 });
-    try { chmodSync(file, 0o600); } catch { /* platform-specific */ }
+    writeOwnedStateFileAtomic(file, '*\n', MAX_CONFIG_FILE_BYTES, dir);
   } catch (e) {
     // Best-effort: log to stderr, never block the caller.
     const msg = e instanceof Error ? e.message : String(e);

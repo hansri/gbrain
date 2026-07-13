@@ -12,6 +12,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
+import { migrationTestOpts } from './helpers/migration-opts.ts';
 
 describe('v0.12.2 — JSONB double-encode repair migration', () => {
   test('registered in the TS migration registry', async () => {
@@ -44,11 +45,11 @@ describe('v0.12.2 — JSONB double-encode repair migration', () => {
 
   test('dry-run skips all side-effect phases', async () => {
     const { v0_12_2 } = await import('../src/commands/migrations/v0_12_2.ts');
-    const result = await v0_12_2.orchestrator({
+    const result = await v0_12_2.orchestrator(migrationTestOpts({
       yes: true,
       dryRun: true,
       noAutopilotInstall: true,
-    });
+    }));
     expect(result.version).toBe('0.12.2');
     expect(result.phases.length).toBeGreaterThanOrEqual(3);
     for (const p of result.phases) {

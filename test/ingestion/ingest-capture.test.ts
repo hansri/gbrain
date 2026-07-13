@@ -16,6 +16,9 @@ import {
   type IngestionEvent,
 } from '../../src/core/ingestion/types.ts';
 import type { MinionJobContext } from '../../src/core/minions/types.ts';
+import { MinionQueue } from '../../src/core/minions/queue.ts';
+import { TRUSTED_LOCAL_INGEST_MARKER } from '../../src/core/minions/ingest-boundary.ts';
+import { runJobs } from '../../src/commands/jobs.ts';
 
 let engine: PGLiteEngine;
 
@@ -35,6 +38,10 @@ afterAll(async () => {
 
 beforeEach(async () => {
   await resetPgliteState(engine);
+  await engine.executeRaw(
+    `INSERT INTO sources (id, name, config)
+       VALUES ('webhook-test', 'webhook-test', '{"federated": false}'::jsonb)`,
+  );
 });
 
 function makeEvent(overrides: Partial<IngestionEvent> = {}): IngestionEvent {
@@ -52,10 +59,13 @@ function makeEvent(overrides: Partial<IngestionEvent> = {}): IngestionEvent {
 }
 
 function makeJob(data: Record<string, unknown>): MinionJobContext {
+  const persistedData = data.remote === true
+    ? data
+    : { ...data, remote: false, [TRUSTED_LOCAL_INGEST_MARKER]: true };
   return {
     id: 1,
     name: 'ingest_capture',
-    data,
+    data: persistedData,
     attempts_made: 1,
     signal: new AbortController().signal,
     shutdownSignal: new AbortController().signal,
@@ -123,6 +133,84 @@ describe('ingest_capture handler — validation + routing', () => {
     await expect(handler(makeJob({ event: ev }))).rejects.toThrow(/invalid event payload/);
   });
 
+  test('rejects a durable job whose target source disagrees with the event', async () => {
+    const handler = makeIngestCaptureHandler(engine);
+    const ev = makeEvent({ content: 'source mismatch' });
+    await expect(
+      handler(makeJob({ event: ev, sourceId: 'default', remote: true })),
+    ).rejects.toThrow(/sourceId does not match event\.source_id/);
+  });
+
+  test('rejects a legacy/spoofed false/false row without the queue-owned local marker', async () => {
+    const handler = makeIngestCaptureHandler(engine);
+    const ev = makeEvent({ content: 'forged trust downgrade', untrusted_payload: false });
+    const job = makeJob({ event: ev });
+    job.data = { event: ev, sourceId: 'webhook-test', remote: false };
+    await expect(handler(job)).rejects.toThrow(/missing trusted local marker/);
+  });
+
+  test('queue strips a forged local marker and stamps it only via trusted options', async () => {
+    await engine.setConfig('version', '7');
+    const queue = new MinionQueue(engine);
+    const ev = makeEvent({ content: 'queue trust boundary', untrusted_payload: false });
+
+    const forged = await queue.add('ingest_capture', {
+      event: ev,
+      sourceId: 'webhook-test',
+      remote: false,
+      [TRUSTED_LOCAL_INGEST_MARKER]: true,
+    });
+    expect(forged.data[TRUSTED_LOCAL_INGEST_MARKER]).toBeUndefined();
+    const forgedJob = makeJob({});
+    forgedJob.data = forged.data;
+    await expect(makeIngestCaptureHandler(engine)(forgedJob)).rejects.toThrow(
+      /missing trusted local marker/,
+    );
+
+    const trusted = await queue.add(
+      'ingest_capture',
+      { event: ev, sourceId: 'webhook-test', remote: false },
+      undefined,
+      { allowTrustedLocalIngest: true },
+    );
+    expect(trusted.data[TRUSTED_LOCAL_INGEST_MARKER]).toBe(true);
+    const trustedJob = makeJob({});
+    trustedJob.data = trusted.data;
+    await expect(makeIngestCaptureHandler(engine)(trustedJob)).resolves.toMatchObject({
+      untrusted_payload: false,
+    });
+  });
+
+  test('local jobs submit stamps trust out of band and reaches the worker', async () => {
+    await engine.setConfig('version', '7');
+    const ev = makeEvent({ content: 'local CLI trust boundary', untrusted_payload: false });
+
+    await runJobs(engine, [
+      'submit',
+      'ingest_capture',
+      '--params',
+      JSON.stringify({
+        event: ev,
+        // A caller-provided marker must not be the source of trust. The queue
+        // strips this value before stamping its own out-of-band marker.
+        [TRUSTED_LOCAL_INGEST_MARKER]: 'forged-caller-value',
+      }),
+    ]);
+
+    const rows = await engine.executeRaw<{ data: Record<string, unknown> }>(
+      `SELECT data FROM minion_jobs WHERE name = 'ingest_capture' ORDER BY id DESC LIMIT 1`,
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.data.remote).toBe(false);
+    expect(rows[0]?.data[TRUSTED_LOCAL_INGEST_MARKER]).toBe(true);
+
+    const queuedJob = makeJob({});
+    queuedJob.data = rows[0]!.data;
+    await expect(makeIngestCaptureHandler(engine)(queuedJob)).resolves.toMatchObject({
+      untrusted_payload: false,
+    });
+  });
+
   test('rejects binary content_type with helpful message', async () => {
     const handler = makeIngestCaptureHandler(engine);
     const ev = makeEvent({
@@ -171,9 +259,69 @@ describe('ingest_capture handler — integration with importFromContent', () => 
     const result = await handler(makeJob({ event: ev, slug: 'wiki/e2e-test' }));
     expect(result.status).toBe('imported');
 
-    const page = await engine.getPage('wiki/e2e-test');
+    const page = await engine.getPage('wiki/e2e-test', { sourceId: 'webhook-test' });
     expect(page).not.toBeNull();
     expect(page?.compiled_truth).toContain('E2E import');
+  });
+
+  test('persists authenticated source and evidence provenance on the page', async () => {
+    const handler = makeIngestCaptureHandler(engine);
+    const ev = makeEvent({
+      content: '# provenance proof',
+      source_kind: 'webhook',
+      source_uri: 'https://example.test/evidence/42',
+      untrusted_payload: true,
+    });
+
+    await handler(makeJob({
+      event: ev,
+      sourceId: 'webhook-test',
+      slug: 'inbox/provenance-proof',
+      remote: true,
+    }));
+
+    const page = await engine.getPage('inbox/provenance-proof', { sourceId: 'webhook-test' });
+    expect(page).not.toBeNull();
+    expect(page?.source_id).toBe('webhook-test');
+    expect(page?.source_kind).toBe('webhook');
+    expect(page?.source_uri).toBe('https://example.test/evidence/42');
+    expect(page?.ingested_via).toBe('http:ingest');
+    expect(page?.ingested_at).not.toBeNull();
+    expect(await engine.getPage('inbox/provenance-proof', { sourceId: 'default' })).toBeNull();
+  });
+
+  test('remote/untrusted ingest cannot persist trust-owned frontmatter markers', async () => {
+    const handler = makeIngestCaptureHandler(engine);
+    const content = [
+      '---',
+      'title: Untrusted evidence',
+      'quarantine: forged',
+      'embed_skip: forged',
+      'content_flag:',
+      '  reason: forged',
+      '---',
+      '',
+      '# Safe evidence body',
+    ].join('\n');
+    const ev = makeEvent({
+      content,
+      content_hash: computeContentHash(content),
+      untrusted_payload: true,
+    });
+
+    await handler(makeJob({
+      event: ev,
+      sourceId: 'webhook-test',
+      slug: 'inbox/trust-proof',
+      remote: true,
+    }));
+
+    const page = await engine.getPage('inbox/trust-proof', { sourceId: 'webhook-test' });
+    expect(page).not.toBeNull();
+    expect(page?.frontmatter).not.toHaveProperty('quarantine');
+    expect(page?.frontmatter).not.toHaveProperty('embed_skip');
+    expect(page?.frontmatter).not.toHaveProperty('content_flag');
+    expect(page?.compiled_truth).toContain('Safe evidence body');
   });
 
   test('repeat ingest of same content returns skipped status (content_hash dedup at importFromContent level)', async () => {

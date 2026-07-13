@@ -124,7 +124,11 @@ gbrain serve --http --port 3001 --bind 0.0.0.0 # v0.34: bind explicitly for remo
                                                 # (defaults to 127.0.0.1 since v0.34)
 gbrain auth register-client neuromancer \
   --grant-types client_credentials \
-  --scopes read,write,admin                    # admin needed for ping/doctor
+  --scopes read,write                          # routine principal
+
+gbrain auth register-client neuromancer-maintenance \
+  --grant-types client_credentials \
+  --scopes admin                               # separate remote-doctor principal
 
 # v0.34: source-scoped client (write to one source, federate reads across
 # multiple sources). Omit both flags for a v0.33-compatible super-client.
@@ -136,9 +140,9 @@ gbrain auth register-client neuromancer-dept \
 ```
 
 The `register-client` command prints a `client_id` and `client_secret`.
-Note both. **Scope must include `admin`** — `submit_job` (used by
-`gbrain remote ping`) and `run_doctor` (used by `gbrain remote doctor`)
-both require it.
+Note both. `gbrain remote doctor` requires `admin` for the bounded
+`run_doctor` operation. Generic remote job submission and `gbrain remote ping`
+are intentionally unavailable.
 
 **Step 2 — On the thin client (neuromancer):**
 
@@ -177,8 +181,7 @@ Example for Claude Desktop's `~/.config/claude/claude_desktop_config.json`:
 
 ```bash
 gbrain doctor             # runs thin-client checks (no local DB needed)
-gbrain remote ping        # triggers an autopilot cycle on the host (Tier B)
-gbrain remote doctor      # asks the host to run its own doctor (Tier B)
+gbrain remote doctor      # asks the host to run bounded health checks (Tier B)
 ```
 
 `gbrain sync` and friends will refuse with a clear thin-client error

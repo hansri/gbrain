@@ -36,27 +36,16 @@ import type {
   Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult,
 } from './types.ts';
 import type { BrainEngine } from '../../core/engine.ts';
-import { loadConfig, toEngineConfig } from '../../core/config.ts';
-import { createEngine } from '../../core/engine-factory.ts';
 import { upsertFactRow, parseFactsFence } from '../../core/facts-fence.ts';
+import { openMigrationEngine } from './snapshot.ts';
 
 let testEngineOverride: BrainEngine | null = null;
 export function __setTestEngineOverride(engine: BrainEngine | null): void {
   testEngineOverride = engine;
 }
 
-async function getEngine(): Promise<BrainEngine | null> {
-  if (testEngineOverride) return testEngineOverride;
-  try {
-    const cfg = loadConfig();
-    if (!cfg) return null;
-    const engineConfig = toEngineConfig(cfg);
-    const engine = await createEngine(engineConfig);
-    await engine.connect(engineConfig);
-    return engine;
-  } catch {
-    return null;
-  }
+async function getEngine(opts: OrchestratorOpts): Promise<BrainEngine> {
+  return (await openMigrationEngine(opts, testEngineOverride)).engine;
 }
 
 // ── Phase A — Schema verify ────────────────────────────────
@@ -417,7 +406,7 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
   if (opts.dryRun) console.log('  (dry-run; no side effects)');
   console.log('');
 
-  const engine = await getEngine();
+  const engine = await getEngine(opts);
   const phases: OrchestratorPhaseResult[] = [];
 
   const a = await phaseASchema(engine, opts);

@@ -23,9 +23,9 @@
 #
 # HOME isolation: E2E tests call paths that resolve to gbrain init / saveConfig
 # (e.g. setupDB writing config for the test container) and would otherwise
-# write the user's real ~/.gbrain/config.json. The wrapper redirects HOME and
-# GBRAIN_HOME to a tmpdir before bun starts so config writes land in the
-# tmpdir, then verifies the user's real config md5 didn't change after the run.
+# write the user's real ~/.gbrain/config.json. The wrapper gives every file a
+# private child HOME + GBRAIN_HOME under one outer tmpdir so config state cannot
+# leak across files, then verifies the user's real config md5 did not change.
 # Both env vars are required: loadConfig/saveConfig resolve via HOME, while
 # configPath/getDbUrlSource honor GBRAIN_HOME; setting only one leaves the
 # other path escaping isolation. HOME is set before bun starts because Bun's
@@ -80,6 +80,10 @@ mkdir -p "$E2E_TMP_HOME/.gbrain"
 for _e2e_var in $(env | grep -oE '^(CONDUCTOR_|MCP_|OPENCLAW_|GBRAIN_)[A-Za-z0-9_]*' | sort -u); do
   case "$_e2e_var" in
     GBRAIN_HOME) ;;  # required for HOME isolation (set above) — keep
+    # Explicit CI topology fixtures, not operator/agent behavior overrides.
+    # Keeping these is what makes the transaction-pooler and wrong-direct
+    # authority regressions execute instead of silently skip.
+    GBRAIN_PGBOUNCER_URL|GBRAIN_PGBOUNCER_DIRECT_URL|GBRAIN_PGBOUNCER_WRONG_DIRECT_URL|GBRAIN_TEST_DB) ;;
     *) unset "$_e2e_var" || true ;;
   esac
 done
@@ -152,15 +156,13 @@ for f in "${files[@]}"; do
   name=$(basename "$f")
   echo ""
   echo "=== $name ==="
-  # Cross-file isolation: terminate any stale connections from the prior
-  # file's pool before the next file's setupDB() runs. Without this,
-  # idle postgres connections from the previous bun process race with
-  # the next file's TRUNCATE CASCADE → cross-file fixture-state pollution
-  # (people/sarah-chen disappears mid-test, etc.). The terminate call is
-  # idempotent + fast (~50ms); on the first iteration there's nothing to
-  # terminate so it's effectively free.
+  # Cross-file Postgres isolation: files intentionally exercise different
+  # embedding dimensions and historical schema states. A TRUNCATE cannot
+  # reset vector typmods/defaults, so sharing the schema makes later files
+  # order-dependent. The reset helper verifies exact gbrain_test authority +
+  # GBRAIN_TEST_DB=1, terminates stale test connections, and recreates public.
   if [ -n "${DATABASE_URL:-}" ]; then
-    psql "$DATABASE_URL" -At -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE pid != pg_backend_pid() AND datname = current_database()" >/dev/null 2>&1 || true
+    bun run scripts/reset-e2e-postgres.ts
   fi
   # Hard outer timeout (180s per file). bun's --timeout is per-test; if a
   # PGLite WASM call hangs in beforeAll/afterAll, --timeout never fires and
@@ -168,13 +170,36 @@ for f in "${files[@]}"; do
   # suite advances. gtimeout (macOS via coreutils) preferred; timeout (Linux)
   # fallback; bare bun (no outer cap) if neither is installed.
   if command -v gtimeout >/dev/null 2>&1; then
-    TIMEOUT_CMD="gtimeout 180"
+    timeout_bin="gtimeout"
   elif command -v timeout >/dev/null 2>&1; then
-    TIMEOUT_CMD="timeout 180"
+    timeout_bin="timeout"
   else
-    TIMEOUT_CMD=""
+    timeout_bin=""
   fi
-  if output=$($TIMEOUT_CMD bun test --timeout=60000 "$f" 2>&1); then
+
+  # A fresh process alone is insufficient isolation when every process shares
+  # the same config directory. Keep only the outer breach-detector root shared;
+  # each file receives a disposable child home and cannot inherit a previous
+  # file's selected model, source, or other persisted configuration.
+  file_home=$(mktemp -d "$E2E_TMP_HOME/file.XXXXXX")
+  mkdir -p "$file_home/.gbrain"
+  file_failed=0
+  if [ -n "$timeout_bin" ]; then
+    if output=$(HOME="$file_home" GBRAIN_HOME="$file_home" "$timeout_bin" 180 bun test --timeout=60000 "$f" 2>&1); then
+      :
+    else
+      file_failed=1
+    fi
+  else
+    if output=$(HOME="$file_home" GBRAIN_HOME="$file_home" bun test --timeout=60000 "$f" 2>&1); then
+      :
+    else
+      file_failed=1
+    fi
+  fi
+  rm -rf "$file_home"
+
+  if [ "$file_failed" = "0" ]; then
     pass_files=$((pass_files + 1))
     # Extract pass/fail counts from bun's summary (e.g., "123 pass")
     p=$(echo "$output" | grep -oE '[0-9]+ pass' | tail -1 | grep -oE '[0-9]+' || echo 0)

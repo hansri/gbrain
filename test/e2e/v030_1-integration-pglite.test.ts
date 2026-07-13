@@ -1,7 +1,7 @@
 /**
  * v0.30.1 integration smoke test — PGLite path.
  *
- * Exercises the Lane A-E surfaces together against an in-memory PGLite
+ * Exercises the Lane A-D surfaces together against an in-memory PGLite
  * brain to prove the new modules integrate. No DATABASE_URL required.
  *
  * What this proves:
@@ -14,8 +14,6 @@
  *           emotional_weight backfill on an empty brain returns
  *           examined=0 (no work).
  *   Lane D: dropZombieIndexes on PGLite returns dropped=[] (no-op).
- *   Lane E: upgrade-checkpoint round-trips with a brain_id derived from
- *           the engine config.
  *
  * Postgres-only e2es (connection-routing, hnsw-lifecycle, migrate-supabase
  * timeout/wedge recovery) live in their own DATABASE_URL-gated files;
@@ -31,14 +29,6 @@ import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
 import { listBackfills, getBackfill } from '../../src/core/backfill-registry.ts';
 import { runBackfill } from '../../src/core/backfill-base.ts';
 import { dropZombieIndexes, checkActiveBuild } from '../../src/core/vector-index.ts';
-import {
-  computeBrainId,
-  writeCheckpoint,
-  loadCheckpoint,
-  validateCheckpoint,
-  markStepComplete,
-  type UpgradeCheckpoint,
-} from '../../src/core/upgrade-checkpoint.ts';
 import { LATEST_VERSION } from '../../src/core/migrate.ts';
 
 let tmpHome: string;
@@ -121,79 +111,6 @@ describe('Lane D — vector-index lifecycle on PGLite', () => {
   test('checkActiveBuild on PGLite returns active: false', async () => {
     const r = await checkActiveBuild(engine, 'idx_chunks_embedding');
     expect(r.active).toBe(false);
-  });
-});
-
-describe('Lane E — upgrade-checkpoint with brain identity', () => {
-  test('round-trips a checkpoint with brain_id', async () => {
-    const brainId = computeBrainId(undefined); // PGLite path
-    const cp: UpgradeCheckpoint = {
-      brain_id: brainId,
-      started_at: new Date().toISOString(),
-      from_version: '0.30.0',
-      to_version: '0.30.1',
-      completed_steps: ['pull', 'install'],
-    };
-    writeCheckpoint(cp);
-    const loaded = loadCheckpoint();
-    expect(loaded?.brain_id).toBe(brainId);
-    expect(loaded?.completed_steps).toEqual(['pull', 'install']);
-  });
-
-  test('validateCheckpoint detects partial completion → resumeAt', async () => {
-    const brainId = computeBrainId(undefined);
-    const cp: UpgradeCheckpoint = {
-      brain_id: brainId,
-      started_at: new Date().toISOString(),
-      from_version: '0.30.0',
-      to_version: '0.30.1',
-      completed_steps: ['pull', 'install', 'schema'],
-    };
-    writeCheckpoint(cp);
-    const r = validateCheckpoint(brainId);
-    expect(r.valid).toBe(true);
-    expect(r.resumeAt).toBe('features');
-  });
-
-  test('cross-brain checkpoint mismatch (X2) refuses', async () => {
-    const brainA = computeBrainId('postgresql://u:p@host:5432/db_a');
-    const brainB = computeBrainId('postgresql://u:p@host:5432/db_b');
-    const cp: UpgradeCheckpoint = {
-      brain_id: brainA,
-      started_at: new Date().toISOString(),
-      from_version: '0.30.0',
-      to_version: '0.30.1',
-      completed_steps: ['pull'],
-    };
-    writeCheckpoint(cp);
-    const r = validateCheckpoint(brainB);
-    expect(r.valid).toBe(false);
-    expect(r.reason).toBe('brain_mismatch');
-  });
-
-  test('full step progression: pull → install → schema → features → backfills → verify', async () => {
-    const brainId = computeBrainId(undefined);
-    let cp: UpgradeCheckpoint = {
-      brain_id: brainId,
-      started_at: new Date().toISOString(),
-      from_version: '0.30.0',
-      to_version: '0.30.1',
-      completed_steps: [],
-    };
-    writeCheckpoint(cp);
-
-    const steps = ['pull', 'install', 'schema', 'features', 'backfills'] as const;
-    for (const s of steps) {
-      cp = markStepComplete(cp, s);
-      writeCheckpoint(cp);
-      const v = validateCheckpoint(brainId);
-      expect(v.valid).toBe(true);
-    }
-    cp = markStepComplete(cp, 'verify');
-    writeCheckpoint(cp);
-    const final = validateCheckpoint(brainId);
-    expect(final.valid).toBe(false);
-    expect(final.reason).toBe('all_complete');
   });
 });
 

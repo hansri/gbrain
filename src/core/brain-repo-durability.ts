@@ -6,38 +6,44 @@
  * sessions edit a stale tree. The moment gbrain is given a PAT + a GitHub URL
  * for a brain repo, `hardenBrainRepo` makes durability work, idempotently:
  *
- *   1. pull current state (divergence-safe rebase; skip-on-dirty)
- *   2. repo-scoped credential wiring (reuse an existing helper if present)
- *   3. LOCAL untracked post-commit hook (best-effort background auto-push)
- *   4. committed `scripts/brain-commit-push.sh` (the DURABILITY GUARANTEE —
- *      synchronous add→commit→push that refuses to exit 0 without a push)
- *   5. durability rules in the ACTIVE resolver file (RESOLVER.md > AGENTS.md)
- *   6. a DB-free pull cron (every 30 min)
- *   7. verify by authenticated push-probe (proves push auth; no heartbeat)
+ *   1. validate exact registered origin + executable Git config
+ *   2. owner-only, URL/path-bound credential-store wiring
+ *   3. pull current state (divergence-safe rebase; skip-on-dirty)
+ *   4. LOCAL untracked post-commit hook (best-effort background auto-push)
+ *   5. remove the retired repo-controlled commit helper
+ *   6. durability rules in the ACTIVE resolver file (RESOLVER.md > AGENTS.md)
+ *   7. a DB-free pull cron + authenticated push-probe
  *
  * Trust boundary (this is gbrain's FIRST push path + FIRST secret storage):
- *  - The hook is LOCAL + untracked so a pulled commit can't rewrite executed
- *    code next to the PAT. Both hook and helper render from ONE bash template
- *    (PUSH_RETRY) — DRY at the TS source level, NOT by the hook sourcing a
- *    repo-controlled script.
- *  - Credential is repo-scoped (local git config), token redacted everywhere
- *    via shell-redact's exact-value scrubber, store file 0600.
+ *  - The hook is LOCAL + untracked. The managed agent instructions invoke the
+ *    installed CLI directly; the committed shim contains no Git mutation logic.
+ *  - Credential lives in an owner-only GBrain store. Network operations reset
+ *    every repo/global helper and append this one deterministic helper only;
+ *    token redaction still applies everywhere.
  *
- * CLI-only by design (writes executables + an OS cron + a credential helper on
+ * CLI-only by design (writes executables + an OS cron + a credential store on
  * the host): never exposed over MCP.
  */
 
 import {
-  existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, rmSync, statSync, appendFileSync,
+  existsSync, readFileSync, writeFileSync, mkdirSync, chmodSync, rmSync,
+  mkdtempSync, copyFileSync, openSync, closeSync, fsyncSync, renameSync, lstatSync,
+  fstatSync, fchmodSync, unlinkSync, linkSync, readSync,
+  constants as fsConstants,
+  realpathSync,
+  type Stats,
 } from 'fs';
-import { join, dirname, relative, isAbsolute } from 'path';
+import { join, dirname, relative, isAbsolute, resolve, basename } from 'path';
 import { execFileSync, execSync } from 'child_process';
+import { randomUUID } from 'crypto';
 import {
-  GIT_ENV, GIT_ENV_AUTH, divergenceSafePull, detectDefaultBranch, pushProbe,
+  GIT_ENV, divergenceSafePull, detectDefaultBranch, pushProbe,
+  pushBranch, validateOriginRemote, canonicalRemoteUrl, GIT_EXECUTION_FENCE_FLAGS,
   type PullOutcome, type PushProbeResult,
 } from './git-remote.ts';
 import { findResolverFile, RESOLVER_FILENAMES } from './resolver-filenames.ts';
 import { redactSecretsInText } from './minions/handlers/shell-redact.ts';
+import { cleanInheritedGitEnvironment } from './git-environment.ts';
 // Static import → bundled into the --compile binary so the taxonomy never drifts
 // and needs no runtime skills/ directory.
 import filingRulesDoc from '../../skills/_brain-filing-rules.json';
@@ -69,6 +75,8 @@ export interface HardenOpts {
   repoPath: string;
   sourceId: string;
   branch?: string;          // default: detectDefaultBranch
+  /** Registered canonical source remote; drift fails before any repo action. */
+  expectedRemoteUrl: string;
   pat?: string;             // already-loaded token; never logged
   installCron?: boolean;    // default true
   verify?: boolean;         // default true
@@ -80,17 +88,24 @@ export interface HardenOpts {
 export interface UnhardenOpts {
   repoPath: string;
   sourceId: string;
+  expectedRemoteUrl?: string;
   logger?: (line: string) => void;
 }
 
 // ── Banners / markers (idempotency keys) ────────────────────────────────────
 
 const HOOK_BANNER = '# gbrain brain-durability post-commit hook (v0.42.44+)';
-const HELPER_BANNER = '# gbrain brain-commit-push helper (v0.42.44+)';
 const AGENTS_BEGIN = '<!-- BEGIN gbrain-brain-durability (managed; do not edit between markers) -->';
 const AGENTS_END = '<!-- END gbrain-brain-durability -->';
 const HELPER_REL = 'scripts/brain-commit-push.sh';
 const CRED_MANAGED_KEY = 'gbrain.durability.managedcredential';
+const CRED_URL_KEY = 'gbrain.durability.credentialurl';
+const MAX_CREDENTIAL_STORE_BYTES = 1024 * 1024;
+const MAX_PAT_FILE_BYTES = 64 * 1024;
+const CREDENTIAL_LOCK_WAIT_MS = 5_000;
+const CREDENTIAL_LOCK_STALE_MS = 60_000;
+const NO_FOLLOW = typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0;
+const NONBLOCK = typeof fsConstants.O_NONBLOCK === 'number' ? fsConstants.O_NONBLOCK : 0;
 
 function gbrainHome(): string {
   return process.env.GBRAIN_HOME || join(process.env.HOME || '', '.gbrain');
@@ -116,30 +131,317 @@ function pushLogPath(): string {
   return join(gbrainHome(), 'brain-push.log');
 }
 
+interface OwnedFileIdentity {
+  dev: number;
+  ino: number;
+  size: number;
+  mtimeMs: number;
+  ctimeMs: number;
+  uid: number;
+  nlink: number;
+  mode: number;
+}
+
+interface OwnedFileSnapshot {
+  content: string;
+  identity: OwnedFileIdentity;
+}
+
+function errnoCode(error: unknown): string | undefined {
+  return typeof error === 'object' && error !== null
+    ? (error as NodeJS.ErrnoException).code
+    : undefined;
+}
+
+function identityFromStat(stat: Stats): OwnedFileIdentity {
+  return {
+    dev: stat.dev,
+    ino: stat.ino,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    ctimeMs: stat.ctimeMs,
+    uid: stat.uid,
+    nlink: stat.nlink,
+    mode: stat.mode,
+  };
+}
+
+function sameOwnedFileIdentity(left: OwnedFileIdentity, right: OwnedFileIdentity): boolean {
+  return left.dev === right.dev
+    && left.ino === right.ino
+    && left.size === right.size
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs;
+}
+
+function sameOwnedFileInode(left: OwnedFileIdentity, right: OwnedFileIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function assertCurrentUserOwner(stat: { uid: number }, label: string): void {
+  if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+    throw new Error(`Refusing ${label}: file is not owned by the current user`);
+  }
+}
+
+function assertOwnedRegularFile(
+  stat: Stats,
+  label: string,
+  opts: { requirePrivate?: boolean } = {},
+): void {
+  if (!stat.isFile()) throw new Error(`Refusing ${label}: expected a regular file`);
+  assertCurrentUserOwner(stat, label);
+  if (stat.nlink !== 1) throw new Error(`Refusing ${label}: expected exactly one hard link`);
+  if (!opts.requirePrivate && (stat.mode & 0o022) !== 0) {
+    throw new Error(`Refusing ${label}: file is group/other-writable`);
+  }
+  if (opts.requirePrivate && (stat.mode & 0o077) !== 0) {
+    throw new Error(`Refusing ${label}: file must be owner-only (mode 0600)`);
+  }
+}
+
+function ensureOwnedDirectory(
+  path: string,
+  opts: { mode: number; privateDirectory: boolean; label: string },
+): void {
+  mkdirSync(path, { recursive: true, mode: opts.mode });
+  assertExistingOwnedDirectory(path, opts);
+  if (opts.privateDirectory) {
+    const stat = lstatSync(path);
+    if ((stat.mode & 0o077) !== 0) chmodSync(path, opts.mode);
+  }
+}
+
+function assertExistingOwnedDirectory(
+  path: string,
+  opts: { privateDirectory: boolean; label: string },
+): void {
+  const stat = lstatSync(path);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error(`Refusing ${opts.label}: expected a real directory, not a symlink`);
+  }
+  assertCurrentUserOwner(stat, opts.label);
+  if (!opts.privateDirectory && (stat.mode & 0o022) !== 0) {
+    throw new Error(`Refusing ${opts.label}: directory is group/other-writable`);
+  }
+}
+
+function fsyncDirectory(path: string): void {
+  const flags = fsConstants.O_RDONLY
+    | (typeof fsConstants.O_DIRECTORY === 'number' ? fsConstants.O_DIRECTORY : 0)
+    | NO_FOLLOW;
+  const fd = openSync(path, flags);
+  try { fsyncSync(fd); } finally { closeSync(fd); }
+}
+
+function inspectOwnedPath(
+  path: string,
+  label: string,
+  opts: { requirePrivate?: boolean } = {},
+): OwnedFileIdentity | null {
+  let stat: ReturnType<typeof lstatSync>;
+  try { stat = lstatSync(path); }
+  catch (error) {
+    if (errnoCode(error) === 'ENOENT') return null;
+    throw error;
+  }
+  if (stat.isSymbolicLink() || !stat.isFile()) {
+    throw new Error(`Refusing ${label}: expected a regular non-symlink file`);
+  }
+  assertCurrentUserOwner(stat, label);
+  if (stat.nlink !== 1) throw new Error(`Refusing ${label}: expected exactly one hard link`);
+  if (!opts.requirePrivate && (stat.mode & 0o022) !== 0) {
+    throw new Error(`Refusing ${label}: file is group/other-writable`);
+  }
+  if (opts.requirePrivate && (stat.mode & 0o077) !== 0) {
+    throw new Error(`Refusing ${label}: file must be owner-only (mode 0600)`);
+  }
+  return {
+    dev: stat.dev,
+    ino: stat.ino,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    ctimeMs: stat.ctimeMs,
+    uid: stat.uid,
+    nlink: stat.nlink,
+    mode: stat.mode,
+  };
+}
+
+function readOwnedFileSnapshot(
+  path: string,
+  label: string,
+  maxBytes: number,
+  opts: { requirePrivate?: boolean } = {},
+): OwnedFileSnapshot | null {
+  let fd: number;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY | NO_FOLLOW | NONBLOCK);
+  } catch (error) {
+    if (errnoCode(error) === 'ENOENT') return null;
+    throw new Error(`Refusing ${label}: cannot open safely (${errnoCode(error) ?? 'open_failed'})`);
+  }
+  try {
+    const before = fstatSync(fd);
+    assertOwnedRegularFile(before, label, opts);
+    if (before.size > maxBytes) throw new Error(`Refusing ${label}: file exceeds ${maxBytes} bytes`);
+    // Bound the actual fd read too: a same-user writer could grow the file
+    // after the first fstat, and readFileSync(fd) would otherwise read it all.
+    const bytes = Buffer.allocUnsafe(maxBytes + 1);
+    let total = 0;
+    while (total < bytes.length) {
+      const count = readSync(fd, bytes, total, bytes.length - total, null);
+      if (count === 0) break;
+      total += count;
+    }
+    if (total > maxBytes) throw new Error(`Refusing ${label}: file exceeds ${maxBytes} bytes`);
+    const after = fstatSync(fd);
+    assertOwnedRegularFile(after, label, opts);
+    const beforeIdentity = identityFromStat(before);
+    const afterIdentity = identityFromStat(after);
+    if (!sameOwnedFileIdentity(beforeIdentity, afterIdentity) || total !== after.size) {
+      throw new Error(`Refusing ${label}: file changed while being read`);
+    }
+    return { content: bytes.subarray(0, total).toString('utf8'), identity: afterIdentity };
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function assertExpectedOwnedPath(
+  path: string,
+  label: string,
+  expected: OwnedFileIdentity | null,
+  opts: { requirePrivate?: boolean } = {},
+): void {
+  const current = inspectOwnedPath(path, label, opts);
+  if (expected === null) {
+    if (current !== null) throw new Error(`Refusing ${label}: file appeared during atomic update`);
+    return;
+  }
+  if (!current || !sameOwnedFileIdentity(expected, current)) {
+    throw new Error(`Refusing ${label}: file changed during atomic update`);
+  }
+}
+
+function writeOwnedFileAtomic(
+  path: string,
+  content: string,
+  mode: number,
+  opts: {
+    label: string;
+    expected?: OwnedFileIdentity | null;
+    requirePrivateExisting?: boolean;
+  },
+): void {
+  const parent = dirname(path);
+  const expected = Object.prototype.hasOwnProperty.call(opts, 'expected')
+    ? opts.expected!
+    : inspectOwnedPath(path, opts.label, { requirePrivate: opts.requirePrivateExisting });
+  const temp = join(parent, `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
+  let fd: number | null = null;
+  try {
+    fd = openSync(
+      temp,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | NO_FOLLOW,
+      mode,
+    );
+    writeFileSync(fd, content);
+    fchmodSync(fd, mode);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+    assertExpectedOwnedPath(path, opts.label, expected, {
+      requirePrivate: opts.requirePrivateExisting,
+    });
+    renameSync(temp, path);
+    fsyncDirectory(parent);
+  } finally {
+    if (fd !== null) closeSync(fd);
+    rmSync(temp, { force: true });
+  }
+}
+
+function restoreQuarantineNoClobber(quarantine: string, target: string): boolean {
+  try {
+    linkSync(quarantine, target);
+    fsyncDirectory(dirname(target));
+    unlinkSync(quarantine);
+    fsyncDirectory(dirname(target));
+    return true;
+  } catch (error) {
+    if (errnoCode(error) === 'EEXIST' || errnoCode(error) === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+function removeOwnedFileExact(
+  path: string,
+  expected: OwnedFileIdentity,
+  opts: { label: string; requirePrivate?: boolean },
+): void {
+  assertExpectedOwnedPath(path, opts.label, expected, { requirePrivate: opts.requirePrivate });
+  const quarantine = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.remove`);
+  renameSync(path, quarantine);
+  try {
+    const captured = inspectOwnedPath(quarantine, opts.label, { requirePrivate: opts.requirePrivate });
+    if (!captured || !sameOwnedFileInode(expected, captured)) {
+      restoreQuarantineNoClobber(quarantine, path);
+      throw new Error(`Refusing ${opts.label}: file revision changed during removal`);
+    }
+    unlinkSync(quarantine);
+    fsyncDirectory(dirname(path));
+  } catch (error) {
+    if (existsSync(quarantine) && !existsSync(path)) {
+      try { restoreQuarantineNoClobber(quarantine, path); } catch { /* preserve quarantine */ }
+    }
+    throw error;
+  }
+}
+
+function removeOwnedFileIfSameInode(
+  path: string,
+  expected: OwnedFileIdentity,
+  opts: { label: string; requirePrivate?: boolean },
+): void {
+  const current = inspectOwnedPath(path, opts.label, { requirePrivate: opts.requirePrivate });
+  if (!current) return;
+  if (!sameOwnedFileInode(expected, current)) {
+    throw new Error(`Refusing ${opts.label}: file was replaced before cleanup`);
+  }
+  removeOwnedFileExact(path, current, opts);
+}
+
 // ── Shared bash push-retry template (DRY at the TS source — D7) ──────────────
-// Rendered into BOTH the (committed) helper and the (local, untracked) hook so
-// there is one source of truth without the hook executing repo-controlled code.
+// Rendered only into the local, untracked hook. Persistent writes use the
+// installed trusted CLI directly; no executable is shipped inside evidence.
 const PUSH_RETRY = `# --- gbrain durability push-retry (generated; one source of truth) ---
 brain_push() {
   _branch="$1"
+  _remote="$2"
+  _root="$3"
   _log="\${GBRAIN_HOME:-$HOME/.gbrain}/brain-push.log"
+  _gbrain="$(command -v gbrain 2>/dev/null || true)"
   mkdir -p "$(dirname "$_log")" 2>/dev/null || true
-  _gd="$(git rev-parse --git-dir 2>/dev/null || echo .git)"
+  if [ -z "$_gbrain" ]; then
+    echo "$(date -u +%FT%TZ) [push] gbrain CLI missing; refusing unguarded git network operation" >>"$_log"
+    return 1
+  fi
+  _gd="$_root/.git"
   # Serialize concurrent pushes (commit bursts) so they coalesce instead of a
   # rebase-retry herd. No-op if flock is unavailable.
   if command -v flock >/dev/null 2>&1; then
     exec 9>"$_gd/gbrain-push.lock"
     flock -w 30 9 || { echo "$(date -u +%FT%TZ) [push] lock-timeout $_branch" >>"$_log"; return 0; }
   fi
-  if git push origin "HEAD:$_branch" >>"$_log" 2>&1; then
-    echo "$(date -u +%FT%TZ) [push] ok $_branch $(git rev-parse --short HEAD 2>/dev/null)" >>"$_log"; return 0
+  if "$_gbrain" sources push --path "$_root" --branch "$_branch" --expected-remote "$_remote" >>"$_log" 2>&1; then
+    echo "$(date -u +%FT%TZ) [push] ok $_branch" >>"$_log"; return 0
   fi
   echo "$(date -u +%FT%TZ) [push] rejected; rebase-pull $_branch" >>"$_log"
-  if git pull --rebase origin "$_branch" >>"$_log" 2>&1 && git push origin "HEAD:$_branch" >>"$_log" 2>&1; then
-    echo "$(date -u +%FT%TZ) [push] ok-after-rebase $_branch $(git rev-parse --short HEAD 2>/dev/null)" >>"$_log"; return 0
+  if "$_gbrain" sources pull --path "$_root" --branch "$_branch" --expected-remote "$_remote" >>"$_log" 2>&1 && "$_gbrain" sources push --path "$_root" --branch "$_branch" --expected-remote "$_remote" >>"$_log" 2>&1; then
+    echo "$(date -u +%FT%TZ) [push] ok-after-rebase $_branch" >>"$_log"; return 0
   fi
-  git rebase --abort >/dev/null 2>&1 || true
-  echo "$(date -u +%FT%TZ) [push] LOCAL-ONLY, NEEDS ATTENTION: $_branch @ $(git rev-parse --short HEAD 2>/dev/null) could not reach origin. Run: gbrain sources pull <id> && git push" >>"$_log"
+  echo "$(date -u +%FT%TZ) [push] LOCAL-ONLY, NEEDS ATTENTION: $_branch could not reach registered origin" >>"$_log"
   return 1
 }`;
 
@@ -147,12 +449,16 @@ function shellSingleQuote(value: string): string {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
-function renderPostCommitHook(): string {
+function renderPostCommitHook(repoPath: string, branch: string, expectedRemoteUrl: string): string {
   const installedGbrainHome = shellSingleQuote(gbrainHome());
+  const installedRepo = shellSingleQuote(repoPath);
+  const installedBranch = shellSingleQuote(branch);
+  const installedRemote = shellSingleQuote(expectedRemoteUrl);
   return `#!/usr/bin/env bash
 ${HOOK_BANNER}
 # LOCAL + untracked — NEVER commit this file. Best-effort background auto-push so
-# agent writes don't sit local-only. The real guarantee is ${HELPER_REL}.
+# agent writes don't sit local-only. Persistent writes use the installed
+# trusted gbrain sources commit-push CLI directly.
 # Internal scaffolding commits set GBRAIN_DURABILITY_SKIP_HOOK=1 because they
 # push synchronously before hardenBrainRepo returns.
 set -euo pipefail
@@ -168,54 +474,12 @@ if [ "\${GBRAIN_DURABILITY_SKIP_HOOK:-0}" = "1" ]; then
   exit 0
 fi
 
-_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
-if [ "$_branch" = "HEAD" ]; then
-  echo "$(date -u +%FT%TZ) [push] detached HEAD; skip" >> "\${GBRAIN_HOME:-$HOME/.gbrain}/brain-push.log" 2>/dev/null || true
-  exit 0
-fi
-
 ${PUSH_RETRY}
 
 # Detach so the commit returns instantly; all output goes to the log.
-( brain_push "$_branch" ) </dev/null >/dev/null 2>&1 &
+( brain_push ${installedBranch} ${installedRemote} ${installedRepo} ) </dev/null >/dev/null 2>&1 &
 disown 2>/dev/null || true
 exit 0
-`;
-}
-
-function renderCommitPushHelper(): string {
-  return `#!/usr/bin/env bash
-${HELPER_BANNER}
-# THE DURABILITY GUARANTEE: add -> commit -> push, atomically. Refuses to exit 0
-# without a confirmed push. Usage:
-#   scripts/brain-commit-push.sh "message" <path> [path ...]
-#   scripts/brain-commit-push.sh --push-only [branch]
-set -euo pipefail
-
-${PUSH_RETRY}
-
-_branch="$(git rev-parse --abbrev-ref HEAD)"
-if [ "\${1:-}" = "--push-only" ]; then
-  brain_push "\${2:-$_branch}"; exit $?
-fi
-
-_msg="\${1:?usage: brain-commit-push.sh <message> <path> [paths...]}"; shift || true
-# Pull first so the local tree is current before we stage.
-git fetch origin >/dev/null 2>&1 || true
-git pull --rebase origin "$_branch" || { git rebase --abort >/dev/null 2>&1 || true; echo "rebase conflict: manual attention needed" >&2; exit 3; }
-
-# EXPLICIT paths only — never a blind 'git add -A' (would risk committing
-# secrets, temp files, or unrelated edits).
-if [ "$#" -eq 0 ]; then
-  echo "refusing blind 'git add -A' — pass explicit path(s) to commit" >&2; exit 2
-fi
-git add -- "$@"
-if git diff --cached --quiet; then echo "nothing to commit"; exit 0; fi
-git commit -m "$_msg"
-
-if brain_push "$_branch"; then exit 0; fi
-echo "PUSH FAILED — commit is local-only, NEEDS ATTENTION (see ${'$'}{GBRAIN_HOME:-$HOME/.gbrain}/brain-push.log)" >&2
-exit 4
 `;
 }
 
@@ -233,7 +497,11 @@ function renderTaxonomyLines(): string {
   return lines.join('\n');
 }
 
-function renderManagedBlock(): string {
+export function renderManagedBlock(expectedRemoteUrl: string): string {
+  // This block is copied into agent instructions and may later be pasted into
+  // a shell. Treat the registered URL as data even after URL validation: a
+  // quote or shell-shaped path segment must never escape its argument.
+  const remoteArg = shellSingleQuote(expectedRemoteUrl.replace(/`/g, ''));
   return `${AGENTS_BEGIN}
 <!-- gbrain durability rules. This block is regenerated by \`gbrain sources harden\`.
      Do not index as user knowledge; do not edit between the markers. -->
@@ -246,22 +514,89 @@ ${renderTaxonomyLines()}
    meant to persist.
 
 2. **Every write is committed AND pushed — push is never deferred.** After any
-   persistent write, run \`scripts/brain-commit-push.sh "<msg>" <path>\` (it commits,
-   pushes, and FAILS LOUDLY if the push doesn't land), then confirm links resolve
-   with \`gbrain check-resolvable\`. Do not move on until the push succeeded. The
-   post-commit hook is only a best-effort fallback — the helper is the guarantee.
+   persistent write, run the installed trusted CLI (not repository code):
+   \`gbrain sources commit-push --path . --expected-remote ${remoteArg} --message "<msg>" -- <path>\`.
+   It commits through an isolated index, pushes, and fails loudly if the push
+   does not land. Then confirm links resolve with \`gbrain check-resolvable\`.
 
-3. **Pull before you touch anything.** Run \`git fetch && git pull --rebase\` at
+3. **Pull before you touch anything.** Run \`gbrain sources pull --path . --expected-remote ${remoteArg}\` at
    session start and again before each batch of writes, so a long-lived session
    never edits a stale tree (a cron also pulls every ~30 min).
 ${AGENTS_END}`;
 }
 
+/**
+ * Reject checkout-controlled resolver path tricks before any hardening side
+ * effect. Git can materialize a tracked RESOLVER.md / AGENTS.md symlink; a
+ * normal readFileSync/writeFileSync would follow it outside the clone.
+ */
+function assertSafeResolverTargets(repoPath: string): void {
+  const root = resolve(repoPath);
+  for (const name of RESOLVER_FILENAMES) {
+    const candidate = resolve(root, name);
+    const rel = relative(root, candidate);
+    if (!rel || rel.startsWith('..') || isAbsolute(rel)) {
+      throw new Error(`Refusing resolver target outside repository: ${name}`);
+    }
+    let st: ReturnType<typeof lstatSync>;
+    try {
+      st = lstatSync(candidate);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+      throw error;
+    }
+    if (st.isSymbolicLink()) {
+      throw new Error(`Refusing checkout-controlled resolver symlink: ${name}`);
+    }
+    if (!st.isFile()) {
+      throw new Error(`Refusing non-regular resolver target: ${name}`);
+    }
+  }
+}
+
+/**
+ * Replace a resolver file without ever opening the checkout-controlled target
+ * for writing. The new sibling is O_EXCL/O_NOFOLLOW, fsynced, then renamed;
+ * if an attacker swaps the target after validation, rename replaces the link
+ * itself instead of following it.
+ */
+function writeResolverAtomic(target: string, content: string): void {
+  let mode = 0o644;
+  try {
+    const targetStat = lstatSync(target);
+    if (!targetStat.isSymbolicLink() && targetStat.isFile()) mode = targetStat.mode & 0o777;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  const temp = join(
+    dirname(target),
+    `.${basename(target)}.gbrain-${process.pid}-${Date.now().toString(36)}`,
+  );
+  const noFollow = typeof fsConstants.O_NOFOLLOW === 'number' ? fsConstants.O_NOFOLLOW : 0;
+  let fd: number | null = null;
+  try {
+    fd = openSync(
+      temp,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | noFollow,
+      mode,
+    );
+    writeFileSync(fd, content);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = null;
+    renameSync(temp, target);
+  } finally {
+    if (fd !== null) closeSync(fd);
+    rmSync(temp, { force: true });
+  }
+}
+
 /** Patch the active resolver file with the managed block (idempotent). */
-function patchResolverFile(repoPath: string, dryRun: boolean): { status: StepStatus; detail: string } {
+function patchResolverFile(repoPath: string, expectedRemoteUrl: string, dryRun: boolean): { status: StepStatus; detail: string } {
+  assertSafeResolverTargets(repoPath);
   const existing = findResolverFile(repoPath);
   const target = existing ?? join(repoPath, RESOLVER_FILENAMES[1]); // default AGENTS.md
-  const block = renderManagedBlock();
+  const block = renderManagedBlock(expectedRemoteUrl);
   const name = relative(repoPath, target) || target;
 
   let current = '';
@@ -282,26 +617,14 @@ function patchResolverFile(repoPath: string, dryRun: boolean): { status: StepSta
   }
 
   if (dryRun) return { status: 'fixed', detail: `${name}: would write durability rules (dry-run)` };
-  writeFileSync(target, next);
+  writeResolverAtomic(target, next);
   return { status: 'fixed', detail: `${name}: durability rules written` };
 }
 
 // ── Local untracked post-commit hook (D9) ───────────────────────────────────
 
-/** Resolve the active hooks dir (honors a pre-existing core.hooksPath). */
+/** Managed hooks live only in the checkout-local untracked Git directory. */
 function resolveHooksDir(repoPath: string): { dir: string; tracked: boolean } {
-  let hooksPath = '';
-  try {
-    hooksPath = execFileSync('git', ['-C', repoPath, 'config', '--get', 'core.hooksPath'], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
-    }).toString().trim();
-  } catch { /* unset — normal */ }
-  if (hooksPath) {
-    const dir = isAbsolute(hooksPath) ? hooksPath : join(repoPath, hooksPath);
-    // A hooksPath outside .git/ (e.g. .githooks) is a TRACKED location.
-    const tracked = !dir.includes(`${join('.git', '')}`) && !dir.endsWith('.git/hooks');
-    return { dir, tracked };
-  }
   return { dir: join(repoPath, '.git', 'hooks'), tracked: false };
 }
 
@@ -319,10 +642,10 @@ function ensureExcluded(repoPath: string, relPath: string): void {
   } catch { /* best-effort */ }
 }
 
-function installLocalHook(repoPath: string, dryRun: boolean): { status: StepStatus; detail: string } {
+function installLocalHook(repoPath: string, branch: string, expectedRemoteUrl: string, dryRun: boolean): { status: StepStatus; detail: string } {
   const { dir, tracked } = resolveHooksDir(repoPath);
   const hookPath = join(dir, 'post-commit');
-  const script = renderPostCommitHook();
+  const script = renderPostCommitHook(repoPath, branch, expectedRemoteUrl);
 
   if (existsSync(hookPath)) {
     const cur = readFileSync(hookPath, 'utf-8');
@@ -354,20 +677,83 @@ function uninstallLocalHook(repoPath: string): boolean {
   return true;
 }
 
-// ── Committed helper ────────────────────────────────────────────────────────
+// ── Retired repo-controlled helper migration ────────────────────────────────
 
-function installHelper(repoPath: string, dryRun: boolean): { status: StepStatus; detail: string } {
-  const helperPath = join(repoPath, HELPER_REL);
-  const script = renderCommitPushHelper();
-  if (existsSync(helperPath) && readFileSync(helperPath, 'utf-8') === script) {
-    // Ensure exec bit even when content is current.
-    try { chmodSync(helperPath, 0o755); } catch { /* */ }
-    return { status: 'ok', detail: `${HELPER_REL} already current` };
+/**
+ * Remove the exact legacy executable path without reading or executing it.
+ * harden used to overwrite this path, so it is reserved migration state rather
+ * than user content. Directories are refused because recursive deletion would
+ * broaden the boundary beyond one file/symlink.
+ */
+function inspectLegacyHelperAncestor(
+  repoPath: string,
+): { parentPath: string; parentStat: Stats } | null {
+  const root = realpathSync(resolve(repoPath));
+  const parentPath = join(root, dirname(HELPER_REL));
+  let parentStat: Stats;
+  try { parentStat = lstatSync(parentPath); }
+  catch (error) {
+    if (errnoCode(error) === 'ENOENT') return null;
+    throw error;
   }
-  if (dryRun) return { status: 'fixed', detail: `would write ${HELPER_REL} (dry-run)` };
-  mkdirSync(dirname(helperPath), { recursive: true });
-  writeFileSync(helperPath, script); chmodSync(helperPath, 0o755);
-  return { status: 'fixed', detail: `wrote ${HELPER_REL}` };
+  if (parentStat.isSymbolicLink() || !parentStat.isDirectory() || realpathSync(parentPath) !== parentPath) {
+    throw new Error(`Refusing checkout-controlled ancestor at ${dirname(HELPER_REL)}`);
+  }
+  const rel = relative(root, parentPath);
+  if (rel.startsWith('..') || isAbsolute(rel)) {
+    throw new Error(`Refusing legacy-helper ancestor outside repository: ${dirname(HELPER_REL)}`);
+  }
+  return { parentPath, parentStat };
+}
+
+function assertSafeLegacyHelperTarget(repoPath: string): void {
+  inspectLegacyHelperAncestor(repoPath);
+}
+
+function removeLegacyHelper(repoPath: string, dryRun: boolean): { status: StepStatus; detail: string } {
+  const inspected = inspectLegacyHelperAncestor(repoPath);
+  if (!inspected) return { status: 'ok', detail: `no legacy repo executable at ${HELPER_REL}` };
+  const { parentPath, parentStat } = inspected;
+  const helperPath = join(parentPath, basename(HELPER_REL));
+  let stat: Stats;
+  try { stat = lstatSync(helperPath); }
+  catch (error) {
+    if (errnoCode(error) === 'ENOENT') return { status: 'ok', detail: `no legacy repo executable at ${HELPER_REL}` };
+    throw error;
+  }
+  if (stat.isDirectory()) {
+    return { status: 'needs_attention', detail: `refusing recursive removal of directory at reserved path ${HELPER_REL}` };
+  }
+  if (dryRun) return { status: 'fixed', detail: `would remove legacy repo executable ${HELPER_REL} (dry-run)` };
+  const quarantine = join(parentPath, `.${basename(HELPER_REL)}.${process.pid}.${randomUUID()}.retired`);
+  renameSync(helperPath, quarantine);
+  try {
+    const parentAfter = lstatSync(parentPath);
+    const captured = lstatSync(quarantine);
+    if (
+      parentAfter.isSymbolicLink() ||
+      !parentAfter.isDirectory() ||
+      parentAfter.dev !== parentStat.dev ||
+      parentAfter.ino !== parentStat.ino ||
+      realpathSync(parentPath) !== parentPath ||
+      captured.dev !== stat.dev ||
+      captured.ino !== stat.ino
+    ) {
+      if (!existsSync(helperPath)) renameSync(quarantine, helperPath);
+      throw new Error(`Legacy helper ancestor or revision changed during removal: ${HELPER_REL}`);
+    }
+    rmSync(quarantine);
+    fsyncDirectory(parentPath);
+  } catch (error) {
+    if (existsSync(quarantine) && !existsSync(helperPath)) {
+      try {
+        renameSync(quarantine, helperPath);
+        fsyncDirectory(parentPath);
+      } catch { /* preserve quarantine */ }
+    }
+    throw error;
+  }
+  return { status: 'fixed', detail: `removed legacy repo executable ${HELPER_REL}` };
 }
 
 // ── Repo-scoped credential wiring (D11) ─────────────────────────────────────
@@ -375,78 +761,277 @@ function installHelper(repoPath: string, dryRun: boolean): { status: StepStatus;
 function gitConfigGet(repoPath: string, key: string, localOnly = false): string {
   try {
     const scope = localOnly ? ['--local'] : [];
-    return execFileSync('git', ['-C', repoPath, 'config', ...scope, '--get', key], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+    return execFileSync('git', ['-C', repoPath, ...GIT_EXECUTION_FENCE_FLAGS, 'config', ...scope, '--get', key], {
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: cleanInheritedGitEnvironment(process.env, GIT_ENV),
     }).toString().trim();
   } catch { return ''; }
 }
 function gitConfigSet(repoPath: string, key: string, value: string): void {
-  execFileSync('git', ['-C', repoPath, 'config', key, value], {
-    stdio: 'ignore', timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+  execFileSync('git', ['-C', repoPath, ...GIT_EXECUTION_FENCE_FLAGS, 'config', key, value], {
+    stdio: 'ignore', timeout: 10_000, env: cleanInheritedGitEnvironment(process.env, GIT_ENV),
   });
 }
 function gitConfigUnset(repoPath: string, key: string): void {
   try {
-    execFileSync('git', ['-C', repoPath, 'config', '--unset-all', key], {
-      stdio: 'ignore', timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+    execFileSync('git', ['-C', repoPath, ...GIT_EXECUTION_FENCE_FLAGS, 'config', '--unset-all', key], {
+      stdio: 'ignore', timeout: 10_000, env: cleanInheritedGitEnvironment(process.env, GIT_ENV),
     });
   } catch { /* not set */ }
 }
 
-function remoteHost(repoPath: string): string {
+function credentialLine(remoteUrl: string, pat: string): string | null {
+  const canonical = canonicalRemoteUrl(remoteUrl);
+  if (isAbsolute(canonical) || canonical.startsWith('file:')) return null;
+  const parsed = new URL(canonical);
+  parsed.username = 'x-access-token';
+  parsed.password = pat;
+  return parsed.href;
+}
+
+function credentialTarget(line: string): string | null {
   try {
-    const url = execFileSync('git', ['-C', repoPath, 'remote', 'get-url', 'origin'], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
-    }).toString().trim();
-    return new URL(url).hostname || 'github.com';
-  } catch { return 'github.com'; }
+    const parsed = new URL(line);
+    parsed.username = '';
+    parsed.password = '';
+    return canonicalRemoteUrl(parsed.href);
+  } catch {
+    return null;
+  }
+}
+
+function sleepSync(ms: number): void {
+  const state = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+  Atomics.wait(state, 0, 0, ms);
+}
+
+function processIsAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return errnoCode(error) !== 'ESRCH';
+  }
+}
+
+function tryReapStaleCredentialLock(lockPath: string): boolean {
+  const snapshot = readOwnedFileSnapshot(
+    lockPath,
+    'credential-store lock',
+    4096,
+    { requirePrivate: true },
+  );
+  if (!snapshot) return true;
+  let pid = 0;
+  try {
+    const parsed = JSON.parse(snapshot.content) as { pid?: unknown };
+    pid = typeof parsed.pid === 'number' ? parsed.pid : 0;
+  } catch {
+    throw new Error('Refusing credential-store lock: malformed live lock file');
+  }
+  if (Date.now() - snapshot.identity.mtimeMs < CREDENTIAL_LOCK_STALE_MS || processIsAlive(pid)) {
+    return false;
+  }
+  removeOwnedFileExact(lockPath, snapshot.identity, {
+    label: 'credential-store lock',
+    requirePrivate: true,
+  });
+  return true;
+}
+
+function withCredentialStoreLock<T>(fn: () => T): T {
+  const home = gbrainHome();
+  ensureOwnedDirectory(home, {
+    mode: 0o700,
+    privateDirectory: true,
+    label: 'GBrain credential directory',
+  });
+  const lockPath = `${credStoreFile()}.lock`;
+  const deadline = Date.now() + CREDENTIAL_LOCK_WAIT_MS;
+  let lockFd: number | null = null;
+  let lockIdentity: OwnedFileIdentity | null = null;
+  while (lockFd === null) {
+    try {
+      lockFd = openSync(
+        lockPath,
+        fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | NO_FOLLOW,
+        0o600,
+      );
+      const stat = fstatSync(lockFd);
+      assertOwnedRegularFile(stat, 'credential-store lock', { requirePrivate: true });
+      lockIdentity = identityFromStat(stat);
+      writeFileSync(lockFd, JSON.stringify({ pid: process.pid, created_at: new Date().toISOString() }) + '\n');
+      fchmodSync(lockFd, 0o600);
+      fsyncSync(lockFd);
+      const readyStat = fstatSync(lockFd);
+      assertOwnedRegularFile(readyStat, 'credential-store lock', { requirePrivate: true });
+      const readyIdentity = identityFromStat(readyStat);
+      if (!sameOwnedFileInode(lockIdentity, readyIdentity)) {
+        throw new Error('Refusing credential-store lock: lock inode changed during initialization');
+      }
+      lockIdentity = readyIdentity;
+      fsyncDirectory(home);
+    } catch (error) {
+      if (lockFd !== null) {
+        try { closeSync(lockFd); } finally {
+          if (lockIdentity) {
+            removeOwnedFileIfSameInode(lockPath, lockIdentity, {
+              label: 'credential-store lock',
+              requirePrivate: true,
+            });
+          }
+        }
+        lockFd = null;
+        lockIdentity = null;
+      }
+      if (errnoCode(error) !== 'EEXIST') throw error;
+      if (tryReapStaleCredentialLock(lockPath)) continue;
+      if (Date.now() >= deadline) {
+        throw new Error('Credential store is busy; another harden/unharden operation still holds the lock');
+      }
+      sleepSync(25);
+    }
+  }
+
+  try {
+    return fn();
+  } finally {
+    closeSync(lockFd);
+    if (lockIdentity) {
+      removeOwnedFileExact(lockPath, lockIdentity, {
+        label: 'credential-store lock',
+        requirePrivate: true,
+      });
+    }
+  }
+}
+
+function readCredentialStore(): OwnedFileSnapshot | null {
+  return readOwnedFileSnapshot(
+    credStoreFile(),
+    'GBrain credential store',
+    MAX_CREDENTIAL_STORE_BYTES,
+    { requirePrivate: true },
+  );
+}
+
+function upsertCredentialLine(canonical: string, line: string | null): boolean {
+  return withCredentialStoreLock(() => {
+    const store = credStoreFile();
+    const snapshot = readCredentialStore();
+    const current = snapshot?.content.split('\n').filter(Boolean) ?? [];
+    const next = current.filter(candidate => credentialTarget(candidate) !== canonical);
+    if (line !== null) next.push(line);
+    const nextContent = next.length > 0 ? `${next.join('\n')}\n` : '';
+    if (Buffer.byteLength(nextContent) > MAX_CREDENTIAL_STORE_BYTES) {
+      throw new Error(`Refusing GBrain credential store: content exceeds ${MAX_CREDENTIAL_STORE_BYTES} bytes`);
+    }
+    if (snapshot?.content === nextContent) return false;
+    writeOwnedFileAtomic(store, nextContent, 0o600, {
+      label: 'GBrain credential store',
+      expected: snapshot?.identity ?? null,
+      requirePrivateExisting: true,
+    });
+    return true;
+  });
+}
+
+function removeCredentialLine(canonical: string): boolean {
+  let homeStat: ReturnType<typeof lstatSync>;
+  try { homeStat = lstatSync(gbrainHome()); }
+  catch (error) {
+    if (errnoCode(error) === 'ENOENT') return false;
+    throw error;
+  }
+  if (homeStat.isSymbolicLink() || !homeStat.isDirectory()) {
+    throw new Error('Refusing GBrain credential directory: expected a real directory');
+  }
+  return withCredentialStoreLock(() => {
+    const store = credStoreFile();
+    const snapshot = readCredentialStore();
+    if (!snapshot) return false;
+    const current = snapshot.content.split('\n').filter(Boolean);
+    const next = current.filter(line => credentialTarget(line) !== canonical);
+    if (next.length === current.length) return false;
+    if (next.length === 0) {
+      removeOwnedFileExact(store, snapshot.identity, {
+        label: 'GBrain credential store',
+        requirePrivate: true,
+      });
+    } else {
+      writeOwnedFileAtomic(store, `${next.join('\n')}\n`, 0o600, {
+        label: 'GBrain credential store',
+        expected: snapshot.identity,
+        requirePrivateExisting: true,
+      });
+    }
+    return true;
+  });
 }
 
 /**
- * Wire a repo-scoped credential. If a working helper is already configured,
- * reuse it (no plaintext write). Otherwise fall back to a 0600 store file wired
- * via the repo's LOCAL config only (least-privilege — not every github.com
- * remote under the account). The token is never returned or logged.
+ * Wire the owner-only credential store consumed explicitly by git-remote.ts.
+ * Repo-local helpers are deliberately neither trusted nor executed: a checkout
+ * can edit .git/config, and `credential.helper=!command` is shell execution.
+ * The token is never returned or logged.
  */
-function wireRepoCredential(repoPath: string, pat: string, dryRun: boolean): { status: StepStatus; detail: string } {
-  // Only a REPO-LOCAL helper triggers reuse. A global helper (e.g. the macOS
-  // osxkeychain default) must NOT block wiring the explicitly-provided PAT —
-  // the user gave us a token expressly to use for this repo (D11).
+function wireRepoCredential(repoPath: string, remoteUrl: string, pat: string, dryRun: boolean): { status: StepStatus; detail: string } {
   const existing = gitConfigGet(repoPath, 'credential.helper', /*localOnly*/ true);
   const ours = gitConfigGet(repoPath, CRED_MANAGED_KEY, true) === 'true';
-  if (existing && !ours) {
-    return { status: 'ok', detail: `reusing repo-local credential.helper (no plaintext store written)` };
+  const canonical = canonicalRemoteUrl(remoteUrl);
+  const line = credentialLine(canonical, pat);
+  const configCurrent = ours && gitConfigGet(repoPath, CRED_URL_KEY, true) === canonical;
+  if (dryRun) {
+    let snapshot: OwnedFileSnapshot | null = null;
+    if (existsSync(gbrainHome())) {
+      assertExistingOwnedDirectory(gbrainHome(), {
+        privateDirectory: true,
+        label: 'GBrain credential directory',
+      });
+      snapshot = readCredentialStore();
+    }
+    const storeCurrent = line === null
+      ? snapshot !== null
+      : snapshot?.content.split('\n').includes(line) === true;
+    return configCurrent && storeCurrent
+      ? { status: 'ok', detail: 'owner-only credential store already wired for exact source URL/path' }
+      : { status: 'fixed', detail: 'would wire owner-only credential store (dry-run)' };
   }
 
-  const host = remoteHost(repoPath);
-  const store = credStoreFile();
-  const line = `https://x-access-token:${pat}@${host}`;
-  // Already fully wired by us with this credential present → idempotent no-op.
-  if (ours && existing && existsSync(store) && readFileSync(store, 'utf-8').split('\n').includes(line)) {
-    return { status: 'ok', detail: `repo-scoped credential already wired for ${host}` };
-  }
-  if (dryRun) return { status: 'fixed', detail: 'would wire repo-scoped credential (dry-run)' };
-
-  mkdirSync(dirname(store), { recursive: true, mode: 0o700 });
-  try { chmodSync(gbrainHome(), 0o700); } catch { /* */ }
-  let body = existsSync(store) ? readFileSync(store, 'utf-8') : '';
-  if (!body.split('\n').some(l => l === line)) {
-    if (body.length && !body.endsWith('\n')) body += '\n';
-    body += `${line}\n`;
-    writeFileSync(store, body, { mode: 0o600 });
-  }
-  try { chmodSync(store, 0o600); } catch { /* */ }
-  // Repo-LOCAL wiring → only this repo uses the store (D11).
-  gitConfigSet(repoPath, 'credential.helper', `store --file ${store}`);
+  // One locked atomic mutation preserves sibling repositories' credentials and
+  // makes a crash leave either the old complete store or the new complete store.
+  const storeChanged = upsertCredentialLine(canonical, line);
   gitConfigSet(repoPath, CRED_MANAGED_KEY, 'true');
-  return { status: 'fixed', detail: `wired repo-scoped credential for ${host} (store 0600)` };
+  gitConfigSet(repoPath, CRED_URL_KEY, canonical);
+  if (configCurrent && !storeChanged) {
+    return { status: 'ok', detail: 'owner-only credential store already wired for exact source URL/path' };
+  }
+  return {
+    status: 'fixed',
+    detail: `wired owner-only credential store for exact source URL/path (0600; repo helper${existing ? ' ignored' : ' absent'})`,
+  };
 }
 
-function removeCredentialWiring(repoPath: string): boolean {
-  if (gitConfigGet(repoPath, CRED_MANAGED_KEY, true) !== 'true') return false; // only what we created
-  gitConfigUnset(repoPath, 'credential.helper');
-  gitConfigUnset(repoPath, CRED_MANAGED_KEY);
-  return true;
+function removeCredentialWiring(repoPath: string, expectedRemoteUrl?: string): boolean {
+  const repoAvailable = isGitRepo(repoPath);
+  const ours = repoAvailable && gitConfigGet(repoPath, CRED_MANAGED_KEY, true) === 'true';
+  const configured = repoAvailable ? gitConfigGet(repoPath, CRED_URL_KEY, true) : '';
+  const target = expectedRemoteUrl ? canonicalRemoteUrl(expectedRemoteUrl) : configured;
+  // Without a trusted registered URL, only a surviving marker may authorize
+  // removal. With the DB-bound URL, teardown remains possible after a clone is
+  // deleted or its Git metadata is corrupt.
+  if (!target || (!expectedRemoteUrl && !ours)) return false;
+  if (target && configured && target !== configured) {
+    throw new Error('Refusing to remove credential: registered source URL differs from hardened credential URL');
+  }
+  let removed = false;
+  if (removeCredentialLine(target)) removed = true;
+  if (ours) {
+    gitConfigUnset(repoPath, CRED_MANAGED_KEY);
+    gitConfigUnset(repoPath, CRED_URL_KEY);
+    removed = true;
+  }
+  return removed;
 }
 
 // ── Minimal DB-free pull cron (D2 + D12) ────────────────────────────────────
@@ -461,29 +1046,33 @@ function launchdPlistPath(sourceId: string): string {
   return join(process.env.HOME || '', 'Library', 'LaunchAgents', `${cronLabel(sourceId)}.plist`);
 }
 
-/** Pure cron-wrapper renderer (DB-free pull; secret-free — sources the shell
- *  profile rather than baking keys in). Exported for tests. */
-export function renderCronWrapper(sourceId: string, repoPath: string, branch: string, cli: string, logPath: string): string {
-  const q = (s: string) => s.replace(/'/g, "'\\''");
+/** Pure cron-wrapper renderer (DB-free pull, secret-free, and profile-free).
+ *  The controlled credential store handles auth; unattended maintenance must
+ *  never execute arbitrary interactive shell startup code. Exported for tests. */
+export function renderCronWrapper(_sourceId: string, repoPath: string, branch: string, expectedRemoteUrl: string, cli: string, logPath: string): string {
   return `#!/bin/bash
-# Auto-generated by gbrain sources harden — DB-free durability pull (${sourceId}).
-# Sources the shell profile for secrets, then runs the hardened, DB-free pull.
-[ -f ~/.zshenv ] && source ~/.zshenv 2>/dev/null
-source ~/.zshrc 2>/dev/null || source ~/.bashrc 2>/dev/null || true
+# Auto-generated by gbrain sources harden — DB-free durability pull.
+# Use only a fixed system PATH and the captured CLI path. Never source an
+# interactive shell profile from an unattended maintenance job.
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 # Self-disable if the captured checkout is gone (rename/relocation).
-if [ ! -d '${q(repoPath)}/.git' ]; then
-  echo "$(date -u +%FT%TZ) [cron] path gone, skipping: ${q(repoPath)}" >> "${q(logPath)}" 2>/dev/null || true
+if [ ! -d ${shellSingleQuote(join(repoPath, '.git'))} ]; then
+  printf '%s%s\n' "$(date -u +%FT%TZ) [cron] path gone, skipping: " ${shellSingleQuote(repoPath)} >> ${shellSingleQuote(logPath)} 2>/dev/null || true
   exit 0
 fi
-exec '${q(cli)}' sources pull --path '${q(repoPath)}' --branch '${q(branch)}'
+exec ${shellSingleQuote(cli)} sources pull --path ${shellSingleQuote(repoPath)} --branch ${shellSingleQuote(branch)} --expected-remote ${shellSingleQuote(expectedRemoteUrl)}
 `;
 }
 
-function writeCronWrapper(sourceId: string, repoPath: string, branch: string): string {
+function writeCronWrapper(sourceId: string, repoPath: string, branch: string, expectedRemoteUrl: string): string {
   const wrapper = cronWrapperPath(sourceId);
-  const body = renderCronWrapper(sourceId, repoPath, branch, resolveGbrainCliPath(), pushLogPath());
-  mkdirSync(dirname(wrapper), { recursive: true });
-  writeFileSync(wrapper, body, { mode: 0o755 });
+  const body = renderCronWrapper(sourceId, repoPath, branch, expectedRemoteUrl, resolveGbrainCliPath(), pushLogPath());
+  ensureOwnedDirectory(dirname(wrapper), {
+    mode: 0o700,
+    privateDirectory: true,
+    label: 'GBrain cron directory',
+  });
+  writeOwnedFileAtomic(wrapper, body, 0o755, { label: 'GBrain cron wrapper' });
   return wrapper;
 }
 
@@ -502,29 +1091,71 @@ export function generateBrainPullPlist(label: string, wrapperPath: string, home:
 </plist>`;
 }
 
-function installDurabilityCron(sourceId: string, repoPath: string, branch: string, intervalSec: number, dryRun: boolean): { status: StepStatus; detail: string } {
-  const wrapper = dryRun ? cronWrapperPath(sourceId) : writeCronWrapper(sourceId, repoPath, branch);
+export interface DurabilityCronRuntime {
+  platform: string;
+  execFile: (
+    command: string,
+    args: string[],
+    options: Record<string, unknown>,
+  ) => string | Buffer | void;
+}
+
+const defaultCronRuntime: DurabilityCronRuntime = {
+  platform: process.platform,
+  execFile: (command, args, options) => execFileSync(command, args, options as never),
+};
+
+function installDurabilityCron(
+  sourceId: string,
+  repoPath: string,
+  branch: string,
+  expectedRemoteUrl: string,
+  intervalSec: number,
+  dryRun: boolean,
+  runtime: DurabilityCronRuntime = defaultCronRuntime,
+): { status: StepStatus; detail: string } {
+  const wrapper = dryRun ? cronWrapperPath(sourceId) : writeCronWrapper(sourceId, repoPath, branch, expectedRemoteUrl);
   const home = process.env.HOME || '';
-  if (process.platform === 'darwin') {
+  if (runtime.platform === 'darwin') {
     const plistPath = launchdPlistPath(sourceId);
     if (dryRun) return { status: 'fixed', detail: `would install launchd ${cronLabel(sourceId)} every ${intervalSec}s (dry-run)` };
-    mkdirSync(dirname(plistPath), { recursive: true });
-    writeFileSync(plistPath, generateBrainPullPlist(cronLabel(sourceId), wrapper, home, intervalSec));
-    try { execSync(`launchctl unload "${plistPath}" 2>/dev/null`, { stdio: 'ignore' }); } catch { /* */ }
-    try { execSync(`launchctl load "${plistPath}"`, { stdio: 'ignore' }); } catch { /* loaded best-effort */ }
+    ensureOwnedDirectory(dirname(plistPath), {
+      mode: 0o700,
+      privateDirectory: false,
+      label: 'LaunchAgents directory',
+    });
+    writeOwnedFileAtomic(
+      plistPath,
+      generateBrainPullPlist(cronLabel(sourceId), wrapper, home, intervalSec),
+      0o600,
+      { label: 'GBrain launchd plist' },
+    );
+    try { runtime.execFile('launchctl', ['unload', plistPath], { stdio: 'ignore' }); } catch { /* not loaded */ }
+    try {
+      runtime.execFile('launchctl', ['load', plistPath], { stdio: 'ignore' });
+    } catch (error) {
+      return {
+        status: 'needs_attention',
+        detail: `launchd load failed: ${error instanceof Error ? error.message.slice(0, 120) : String(error).slice(0, 120)}`,
+      };
+    }
     return { status: 'fixed', detail: `launchd ${cronLabel(sourceId)} every ${intervalSec}s` };
   }
   // Linux: crontab line, deduped on the label marker.
   const minutes = Math.max(1, Math.round(intervalSec / 60));
   const marker = `# ${cronLabel(sourceId)}`;
-  const cronLine = `*/${minutes} * * * * ${wrapper} ${marker}`;
+  const cronLine = `*/${minutes} * * * * ${shellSingleQuote(wrapper)} ${marker}`;
   if (dryRun) return { status: 'fixed', detail: `would install crontab (every ${minutes}m) (dry-run)` };
   let existingCron = '';
-  try { existingCron = execSync('crontab -l 2>/dev/null', { encoding: 'utf-8' }); } catch { /* none */ }
+  try {
+    existingCron = String(runtime.execFile('crontab', ['-l'], {
+      encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'],
+    }) ?? '');
+  } catch { /* none */ }
   const kept = existingCron.split('\n').filter(l => l && !l.includes(marker));
   const next = [...kept, cronLine, ''].join('\n');
   try {
-    execSync('crontab -', { input: next, stdio: ['pipe', 'ignore', 'ignore'] });
+    runtime.execFile('crontab', ['-'], { input: next, stdio: ['pipe', 'ignore', 'ignore'] });
     return { status: 'fixed', detail: `crontab every ${minutes}m` };
   } catch (e) {
     return { status: 'needs_attention', detail: `crontab install failed: ${(e as Error).message.slice(0, 120)}` };
@@ -535,25 +1166,38 @@ function removeDurabilityCron(sourceId: string): boolean {
   let removed = false;
   if (process.platform === 'darwin') {
     const plistPath = launchdPlistPath(sourceId);
-    if (existsSync(plistPath)) {
-      try { execSync(`launchctl unload "${plistPath}" 2>/dev/null`, { stdio: 'ignore' }); } catch { /* */ }
-      rmSync(plistPath); removed = true;
+    const plist = inspectOwnedPath(plistPath, 'GBrain launchd plist');
+    if (plist) {
+      try { execFileSync('launchctl', ['unload', plistPath], { stdio: 'ignore' }); } catch { /* */ }
+      removeOwnedFileExact(plistPath, plist, { label: 'GBrain launchd plist' });
+      removed = true;
     }
   } else {
     const marker = `# ${cronLabel(sourceId)}`;
     try {
-      const cur = execSync('crontab -l 2>/dev/null', { encoding: 'utf-8' });
+      const cur = execFileSync('crontab', ['-l'], {
+        encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'],
+      });
       if (cur.includes(marker)) {
         const next = cur.split('\n').filter(l => l && !l.includes(marker)).join('\n') + '\n';
-        execSync('crontab -', { input: next, stdio: ['pipe', 'ignore', 'ignore'] });
+        execFileSync('crontab', ['-'], { input: next, stdio: ['pipe', 'ignore', 'ignore'] });
         removed = true;
       }
     } catch { /* none */ }
   }
   const wrapper = cronWrapperPath(sourceId);
-  if (existsSync(wrapper)) { rmSync(wrapper); removed = true; }
+  const wrapperIdentity = inspectOwnedPath(wrapper, 'GBrain cron wrapper');
+  if (wrapperIdentity) {
+    removeOwnedFileExact(wrapper, wrapperIdentity, { label: 'GBrain cron wrapper' });
+    removed = true;
+  }
   return removed;
 }
+
+export const __durabilityTesting = {
+  installDurabilityCron,
+  writeCronWrapper,
+};
 
 // ── PAT acceptance (D8) ─────────────────────────────────────────────────────
 
@@ -561,19 +1205,32 @@ export interface AcceptPatResult { token: string; source: string; warnings: stri
 
 /**
  * Resolve a PAT: --pat-file (preferred) > GBRAIN_GITHUB_PAT env. Never a bare CLI
- * arg (process-listing leak). Validates non-empty; WARNs loudly on loose perms
- * but continues (mirrors GBRAIN_ALLOW_PRIVATE_REMOTES). Returns null if none.
+ * arg (process-listing leak). The file is opened once without following the
+ * final symlink, then fstat-validated before and after the bounded read. Loose
+ * read permissions still WARN for compatibility; writable-by-others, foreign,
+ * multi-link, symlink, and non-regular inputs fail closed. Returns null if none.
  */
 export function acceptPat(opts: { patFile?: string }): AcceptPatResult | null {
   const warnings: string[] = [];
   if (opts.patFile) {
-    if (!existsSync(opts.patFile)) throw new Error(`--pat-file not found: ${opts.patFile}`);
-    try {
-      const mode = statSync(opts.patFile).mode;
-      if (mode & 0o077) warnings.push(`WARN: PAT file ${opts.patFile} is group/other-readable (mode ${(mode & 0o777).toString(8)}); chmod 600 it`);
-    } catch { /* */ }
-    const token = readFileSync(opts.patFile, 'utf-8').trim();
+    const snapshot = readOwnedFileSnapshot(
+      opts.patFile,
+      'PAT file',
+      MAX_PAT_FILE_BYTES,
+    );
+    if (!snapshot) throw new Error(`--pat-file not found: ${opts.patFile}`);
+    const mode = snapshot.identity.mode;
+    if (mode & 0o077) {
+      warnings.push(
+        `WARN: PAT file ${opts.patFile} is group/other-readable ` +
+        `(mode ${(mode & 0o777).toString(8)}); chmod 600 it`,
+      );
+    }
+    const token = snapshot.content.trim();
     if (!token) throw new Error(`--pat-file is empty: ${opts.patFile}`);
+    if (/\r|\n/.test(token)) {
+      throw new Error(`--pat-file must contain exactly one token line: ${opts.patFile}`);
+    }
     return { token, source: 'pat-file', warnings };
   }
   const env = (process.env.GBRAIN_GITHUB_PAT || '').trim();
@@ -589,16 +1246,16 @@ function isGitRepo(repoPath: string): boolean {
 
 function currentBranch(repoPath: string): string {
   try {
-    return execFileSync('git', ['-C', repoPath, 'rev-parse', '--abbrev-ref', 'HEAD'], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+    return execFileSync('git', ['-C', repoPath, ...GIT_EXECUTION_FENCE_FLAGS, 'rev-parse', '--abbrev-ref', 'HEAD'], {
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: cleanInheritedGitEnvironment(process.env, GIT_ENV),
     }).toString().trim();
   } catch { return 'HEAD'; }
 }
 
 function headSha(repoPath: string): string {
   try {
-    return execFileSync('git', ['-C', repoPath, 'rev-parse', 'HEAD'], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+    return execFileSync('git', ['-C', repoPath, ...GIT_EXECUTION_FENCE_FLAGS, 'rev-parse', 'HEAD'], {
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: cleanInheritedGitEnvironment(process.env, GIT_ENV),
     }).toString().trim();
   } catch { return ''; }
 }
@@ -625,8 +1282,18 @@ export async function hardenBrainRepo(opts: HardenOpts): Promise<DurabilityRepor
   const redact = opts.pat ? (s: string) => redactSecretsInText(s, new Map([['github_pat', opts.pat!]])) : (s: string) => s;
   const log = (l: string) => opts.logger?.(redact(l));
 
+  if (!opts.expectedRemoteUrl) throw new Error('registered expectedRemoteUrl is required for hardening');
   if (!isGitRepo(repoPath)) throw new Error(`not a git repo: ${repoPath}`);
 
+  // Validate remote-controlled resolver entries before credentials, hooks,
+  // pulls, cron files, or any other host-side mutation.
+  assertSafeResolverTargets(repoPath);
+  assertSafeLegacyHelperTarget(repoPath);
+
+  // First Git boundary: validate executable config and exact registered origin
+  // before branch/status/rev-parse can consult checkout-controlled config.
+  validateOriginRemote(repoPath, opts.expectedRemoteUrl);
+  const expectedRemoteUrl = canonicalRemoteUrl(opts.expectedRemoteUrl);
   const branch = opts.branch || detectDefaultBranch(repoPath);
   const steps: DurabilityStep[] = [];
   const push = (step: StepName, r: { status: StepStatus; detail: string }) => {
@@ -635,40 +1302,47 @@ export async function hardenBrainRepo(opts: HardenOpts): Promise<DurabilityRepor
     return s;
   };
 
+  // Authentication is bound only after exact origin validation, but before
+  // the first pull so a newly registered private source does not falsely fail
+  // its own hardening pass for lack of credentials.
+  const credentialResult = opts.pat
+    ? wireRepoCredential(repoPath, expectedRemoteUrl, opts.pat, dryRun)
+    : { status: 'skipped' as const, detail: 'no PAT provided — relying on existing git auth' };
+
   // Refuse on detached HEAD — pushing to a wrong ref is worse than not pushing.
   if (currentBranch(repoPath) === 'HEAD') {
     push('pull', { status: 'needs_attention', detail: 'detached HEAD — checkout a branch before hardening' });
   } else {
     // 1. pull current state
-    try { push('pull', pullDetail(divergenceSafePull(repoPath, branch))); }
+    try { push('pull', pullDetail(divergenceSafePull(repoPath, branch, { expectedRemoteUrl }))); }
     catch (e) { push('pull', { status: 'needs_attention', detail: `fetch/pull failed: ${(e as Error).message.slice(0, 140)}` }); }
   }
 
   // 2. credential
-  if (opts.pat) push('credential', wireRepoCredential(repoPath, opts.pat, dryRun));
-  else push('credential', { status: 'skipped', detail: 'no PAT provided — relying on existing git auth' });
+  push('credential', credentialResult);
 
   // 3. local untracked hook
-  push('hook', installLocalHook(repoPath, dryRun));
-  // 4. committed helper
-  push('helper', installHelper(repoPath, dryRun));
+  push('hook', installLocalHook(repoPath, branch, expectedRemoteUrl, dryRun));
+  // 4. remove the retired repo-controlled executable. The installed CLI is
+  // the sole persistent-write boundary.
+  push('helper', removeLegacyHelper(repoPath, dryRun));
   // 5. resolver/AGENTS rules
-  push('agents', patchResolverFile(repoPath, dryRun));
+  push('agents', patchResolverFile(repoPath, expectedRemoteUrl, dryRun));
   // 6. cron
-  if (installCron) push('cron', installDurabilityCron(sourceId, repoPath, branch, intervalSec, dryRun));
+  if (installCron) push('cron', installDurabilityCron(sourceId, repoPath, branch, expectedRemoteUrl, intervalSec, dryRun));
   else push('cron', { status: 'skipped', detail: '--no-cron' });
 
   // 7. verify (push-probe) + commit scaffolding if push works
   let clean = false;
   if (verify && !dryRun) {
-    const probe: PushProbeResult = pushProbe(repoPath, branch, { redactDetail: redact });
+    const probe: PushProbeResult = pushProbe(repoPath, branch, { redactDetail: redact, expectedRemoteUrl });
     if (!probe.ok) {
       push('verify', { status: 'needs_attention', detail: `push-probe failed (${probe.reason}): ${probe.detail}` });
     } else {
       push('verify', { status: 'ok', detail: 'push-probe ok — push auth confirmed' });
-      // Commit the durability scaffolding (helper + rules) — real content, the
-      // genuine end-to-end proof (no synthetic heartbeat). No-op when unchanged.
-      const committed = commitScaffolding(repoPath, branch, redact);
+      // Commit the durability rules and any legacy-helper deletion — real
+      // content, the genuine end-to-end proof. No-op when unchanged.
+      const committed = commitScaffolding(repoPath, branch, expectedRemoteUrl, redact);
       if (committed) push('commit', committed);
       clean = headMatchesOrigin(repoPath, branch);
     }
@@ -684,53 +1358,240 @@ export async function hardenBrainRepo(opts: HardenOpts): Promise<DurabilityRepor
   return { source_id: sourceId, repo_path: repoPath, branch, steps, missing, fixed, needs_attention, clean_against_origin: clean };
 }
 
-function commitScaffolding(repoPath: string, branch: string, redact: (s: string) => string): { status: StepStatus; detail: string } | null {
-  // Stage only the durability artifacts we manage — never a blind add.
+/**
+ * Bring only automation-owned, still-unchanged paths in the real index forward
+ * to the commit created through the alternate index. The real index lock is
+ * acquired before it is copied and held through atomic replacement, so a
+ * concurrent `git add` either lands before the snapshot (and is preserved) or
+ * after the replacement. A concurrently staged managed path is detected
+ * against baseHead and deliberately left untouched.
+ */
+function reconcileRealIndexAfterIsolatedCommit(
+  repoPath: string,
+  baseHead: string,
+  committed: string,
+  paths: readonly string[],
+  baseEnv: NodeJS.ProcessEnv,
+): void {
+  const gitPath = execFileSync(
+    'git',
+    ['-C', repoPath, ...GIT_EXECUTION_FENCE_FLAGS, 'rev-parse', '--git-path', 'index'],
+    { stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: baseEnv },
+  ).toString().trim();
+  if (!gitPath) throw new Error('Cannot resolve the real Git index path');
+  const indexPath = isAbsolute(gitPath) ? gitPath : resolve(repoPath, gitPath);
+  const lockPath = `${indexPath}.lock`;
+  let lockFd: number | null = null;
+  let ownsLock = false;
+  let reconcileDir: string | null = null;
+  try {
+    try {
+      lockFd = openSync(lockPath, 'wx', 0o600);
+      ownsLock = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+        throw new Error('Refusing real-index reconciliation while another Git index writer is active');
+      }
+      throw error;
+    }
+
+    reconcileDir = mkdtempSync(join(dirname(indexPath), '.gbrain-index-reconcile-'));
+    const reconcileIndex = join(reconcileDir, 'index');
+    const reconcileEnv = cleanInheritedGitEnvironment(process.env, {
+      ...baseEnv,
+      GIT_INDEX_FILE: reconcileIndex,
+      GIT_LITERAL_PATHSPECS: '1',
+    });
+    const run = (args: string[]): void => {
+      execFileSync('git', ['-C', repoPath, ...GIT_EXECUTION_FENCE_FLAGS, ...args], {
+        stdio: 'ignore', timeout: 30_000, env: reconcileEnv,
+      });
+    };
+
+    if (existsSync(indexPath)) copyFileSync(indexPath, reconcileIndex);
+    else run(['read-tree', baseHead]);
+
+    const unchanged: string[] = [];
+    for (const path of paths) {
+      try {
+        run(['diff-index', '--cached', '--quiet', '--no-ext-diff', baseHead, '--', path]);
+        unchanged.push(path);
+      } catch (error) {
+        if ((error as { status?: number }).status !== 1) {
+          throw new Error(`Cannot compare real-index path before reconciliation: ${path}`);
+        }
+        // Exit 1 means this path was staged concurrently. Preserve it exactly.
+      }
+    }
+    if (unchanged.length > 0) run(['reset', '-q', committed, '--', ...unchanged]);
+
+    writeFileSync(lockFd, readFileSync(reconcileIndex));
+    fsyncSync(lockFd);
+    closeSync(lockFd);
+    lockFd = null;
+    renameSync(lockPath, indexPath);
+    ownsLock = false;
+  } finally {
+    if (lockFd !== null) closeSync(lockFd);
+    if (ownsLock) rmSync(lockPath, { force: true });
+    if (reconcileDir) rmSync(reconcileDir, { recursive: true, force: true });
+  }
+}
+
+function commitPathsWithIsolatedIndex(
+  repoPath: string,
+  message: string,
+  paths: readonly string[],
+): string | null {
+  if (paths.length === 0) throw new Error('Refusing blind commit: at least one explicit path is required');
+  for (const path of paths) {
+    if (!path || isAbsolute(path) || path.split(/[\\/]/).includes('..')) {
+      throw new Error(`Refusing unsafe commit path: ${path || '(empty)'}`);
+    }
+  }
+  const baseEnv = cleanInheritedGitEnvironment(process.env, {
+    ...GIT_ENV,
+    GBRAIN_DURABILITY_SKIP_HOOK: '1',
+  });
+  const preStaged = execFileSync(
+    'git',
+    ['-C', repoPath, ...GIT_EXECUTION_FENCE_FLAGS, 'diff', '--cached', '--name-only', '-z'],
+    { stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: baseEnv },
+  ).toString().split('\0').filter(Boolean);
+  if (preStaged.length > 0) {
+    throw new Error(
+      `Refusing durability commit while the user index has pre-staged paths ` +
+      `(first: ${preStaged[0]}); staging was left unchanged`,
+    );
+  }
+  mkdirSync(gbrainHome(), { recursive: true, mode: 0o700 });
+  const temp = mkdtempSync(join(gbrainHome(), 'git-index-'));
+  const index = join(temp, 'index');
+  const env = cleanInheritedGitEnvironment(process.env, {
+    ...baseEnv,
+    GIT_INDEX_FILE: index,
+    GIT_LITERAL_PATHSPECS: '1',
+    GBRAIN_DURABILITY_SKIP_HOOK: '1',
+  });
+  const run = (args: string[], stdio: 'ignore' | ['ignore', 'pipe', 'ignore'] = 'ignore'): string => {
+    const output = execFileSync('git', ['-C', repoPath, ...GIT_EXECUTION_FENCE_FLAGS, ...args], {
+      stdio,
+      timeout: 30_000,
+      env,
+    });
+    return output?.toString() ?? '';
+  };
+  try {
+    const baseHead = run(['rev-parse', 'HEAD'], ['ignore', 'pipe', 'ignore']).trim();
+    run(['read-tree', 'HEAD']);
+    const stageable = paths.filter(path => {
+      try { lstatSync(join(repoPath, path)); return true; }
+      catch { /* absent in the worktree; include only a tracked deletion */ }
+      try {
+        run(['ls-files', '--error-unmatch', '--', path]);
+        return true;
+      } catch (error) {
+        if ((error as { status?: number }).status === 1) return false;
+        throw error;
+      }
+    });
+    if (stageable.length > 0) run(['add', '--', ...stageable]);
+    const staged = run(['diff', '--cached', '--name-only', '-z'], ['ignore', 'pipe', 'ignore'])
+      .split('\0').filter(Boolean);
+    if (staged.length === 0) return null;
+    const allowed = new Set(paths);
+    const unexpected = staged.find(path => !allowed.has(path));
+    if (unexpected) throw new Error(`Isolated index staged unexpected path: ${unexpected}`);
+    run(['commit', '--no-gpg-sign', '-m', message]);
+    const committed = run(['rev-parse', 'HEAD'], ['ignore', 'pipe', 'ignore']).trim();
+    reconcileRealIndexAfterIsolatedCommit(repoPath, baseHead, committed, paths, baseEnv);
+    return committed;
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
+}
+
+export interface CommitPushResult {
+  committed: boolean;
+  commit: string;
+  pullStatus: PullOutcome['status'];
+}
+
+/** Trusted CLI implementation used instead of executing repository helpers. */
+export function commitAndPushPaths(opts: {
+  repoPath: string;
+  branch?: string;
+  expectedRemoteUrl: string;
+  message: string;
+  paths: readonly string[];
+}): CommitPushResult {
+  const remote = validateOriginRemote(opts.repoPath, opts.expectedRemoteUrl);
+  const branch = opts.branch || detectDefaultBranch(opts.repoPath);
+  if (currentBranch(opts.repoPath) !== branch) {
+    throw new Error(`Refusing commit on unexpected branch (expected ${branch})`);
+  }
+  const pull = divergenceSafePull(opts.repoPath, branch, { expectedRemoteUrl: remote });
+  if (pull.status === 'conflict_aborted') throw new Error(pull.detail);
+  const commit = commitPathsWithIsolatedIndex(opts.repoPath, opts.message, opts.paths);
+  pushBranch(opts.repoPath, branch, { expectedRemoteUrl: remote, timeoutMs: 120_000 });
+  return { committed: commit !== null, commit: commit ?? headSha(opts.repoPath), pullStatus: pull.status };
+}
+
+function commitScaffolding(repoPath: string, branch: string, expectedRemoteUrl: string, redact: (s: string) => string): { status: StepStatus; detail: string } | null {
+  // Stage only the durability artifacts we manage — the legacy helper path is
+  // included so an existing tracked executable is removed by the migration.
   const paths: string[] = [HELPER_REL];
   const resolver = findResolverFile(repoPath);
   if (resolver) paths.push(relative(repoPath, resolver));
   try {
-    execFileSync('git', ['-C', repoPath, 'add', '--', ...paths], { stdio: 'ignore', timeout: 30_000, env: { ...process.env, ...GIT_ENV } });
-    const staged = execFileSync('git', ['-C', repoPath, 'diff', '--cached', '--name-only'], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
-    }).toString().trim();
-    if (!staged) return { status: 'ok', detail: 'scaffolding already committed' };
-    execFileSync('git', ['-C', repoPath, 'commit', '-m', 'chore(gbrain): install brain durability scaffolding'], {
-      stdio: 'ignore', timeout: 30_000,
-      // The scaffolding push below is synchronous. Suppress the freshly
-      // installed background hook for this one internal commit so it cannot
-      // race the caller's first post-hardening write via a rebase/index.lock.
-      env: { ...process.env, ...GIT_ENV, GBRAIN_DURABILITY_SKIP_HOOK: '1' },
-    });
-    execFileSync('git', ['-C', repoPath, ...['-c', 'http.followRedirects=false'], 'push', 'origin', `HEAD:${branch}`], {
-      stdio: ['ignore', 'pipe', 'pipe'], timeout: 120_000, env: { ...process.env, ...GIT_ENV_AUTH },
-    });
+    const commit = commitPathsWithIsolatedIndex(
+      repoPath,
+      'chore(gbrain): install brain durability scaffolding',
+      paths,
+    );
+    if (!commit) return { status: 'ok', detail: 'scaffolding already committed' };
+    pushBranch(repoPath, branch, { timeoutMs: 120_000, expectedRemoteUrl });
     return { status: 'fixed', detail: 'committed + pushed durability scaffolding' };
   } catch (e) {
-    return { status: 'needs_attention', detail: redact(`scaffolding commit/push failed: ${(e as Error).message.slice(0, 140)}`) };
+    return { status: 'needs_attention', detail: redact(`scaffolding commit/push failed: ${(e as Error).message.slice(0, 500)}`) };
   }
 }
 
 function headMatchesOrigin(repoPath: string, branch: string): boolean {
   try {
     const local = headSha(repoPath);
-    const remote = execFileSync('git', ['-C', repoPath, 'rev-parse', `origin/${branch}`], {
-      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: { ...process.env, ...GIT_ENV },
+    const remote = execFileSync('git', ['-C', repoPath, ...GIT_EXECUTION_FENCE_FLAGS, 'rev-parse', `origin/${branch}`], {
+      stdio: ['ignore', 'pipe', 'ignore'], timeout: 10_000, env: cleanInheritedGitEnvironment(process.env, GIT_ENV),
     }).toString().trim();
     return !!local && local === remote;
   } catch { return false; }
 }
 
-/** Remove durability scaffolding: cron, local hook, credential wiring. Leaves
- *  committed content (helper, resolver block) intact. Idempotent. */
+/** Remove durability scaffolding: cron, local hook, retired helper, and exact
+ * credential wiring. The non-executable resolver block stays. Idempotent. */
 export async function unhardenBrainRepo(opts: UnhardenOpts): Promise<DurabilityStep[]> {
   const { repoPath, sourceId } = opts;
   const steps: DurabilityStep[] = [];
+  // A tracked `scripts` symlink is checkout-controlled. Refuse it before cron,
+  // hook, credential, or any other host-side teardown mutation.
+  if (repoPath && existsSync(repoPath)) assertSafeLegacyHelperTarget(repoPath);
   const cronRemoved = removeDurabilityCron(sourceId);
   steps.push({ step: 'cron', status: cronRemoved ? 'fixed' : 'skipped', detail: cronRemoved ? 'cron removed' : 'no cron' });
   const hookRemoved = isGitRepo(repoPath) ? uninstallLocalHook(repoPath) : false;
   steps.push({ step: 'hook', status: hookRemoved ? 'fixed' : 'skipped', detail: hookRemoved ? 'hook removed' : 'no gbrain hook' });
-  const credRemoved = isGitRepo(repoPath) ? removeCredentialWiring(repoPath) : false;
+  // Remove the retired evidence-resident executable whenever the checkout is
+  // still present. This never reads or executes its contents.
+  const helperResult = repoPath && existsSync(repoPath)
+    ? removeLegacyHelper(repoPath, false)
+    : { status: 'skipped' as const, detail: 'no checkout for legacy helper removal' };
+  steps.push({
+    step: 'helper',
+    status: helperResult.status === 'ok' ? 'skipped' : helperResult.status,
+    detail: helperResult.detail,
+  });
+  // The registered remote URL is sufficient authority to remove only this
+  // source's credential even after the checkout was deleted or corrupted.
+  const credRemoved = removeCredentialWiring(repoPath, opts.expectedRemoteUrl);
   steps.push({ step: 'credential', status: credRemoved ? 'fixed' : 'skipped', detail: credRemoved ? 'credential wiring removed' : 'no gbrain credential wiring' });
   opts.logger?.(steps.map(s => `[${s.step}] ${s.status}: ${s.detail}`).join('\n'));
   return steps;

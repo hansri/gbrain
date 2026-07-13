@@ -3,13 +3,12 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createEngine } from '../src/core/engine-factory.ts';
+import { getOrCreateDatabaseInstanceId } from '../src/core/database-instance-id.ts';
 import { __testing } from '../src/commands/migrations/v0_29_1.ts';
+import { migrationTestOpts } from './helpers/migration-opts.ts';
+import type { OrchestratorOpts } from '../src/commands/migrations/types.ts';
 
-const opts = {
-  yes: true,
-  dryRun: false,
-  noAutopilotInstall: true,
-};
+let opts: OrchestratorOpts;
 
 describe('v0.29.1 migration', () => {
   let tmp: string;
@@ -22,6 +21,7 @@ describe('v0.29.1 migration', () => {
 
     const gbrainHome = join(tmp, '.gbrain');
     const dbPath = join(tmp, 'brain-db');
+    opts = migrationTestOpts({}, { engine: 'pglite', database_path: dbPath });
     mkdirSync(gbrainHome, { recursive: true });
     writeFileSync(
       join(gbrainHome, 'config.json'),
@@ -32,6 +32,7 @@ describe('v0.29.1 migration', () => {
     await engine.connect({ engine: 'pglite', database_path: dbPath });
     try {
       await engine.initSchema();
+      opts.brainId = await getOrCreateDatabaseInstanceId(engine);
     } finally {
       await engine.disconnect();
     }

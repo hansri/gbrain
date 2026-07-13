@@ -1,4 +1,6 @@
 import type { BrainEngine } from '../core/engine.ts';
+import { readDatabaseInstanceId } from '../core/database-instance-id.ts';
+import { listMigrationInflight } from '../core/migration-inflight.ts';
 import { setCliExitVerdict } from '../core/cli-force-exit.ts';
 import * as db from '../core/db.ts';
 import { LATEST_VERSION, getIdleBlockers } from '../core/migrate.ts';
@@ -19,13 +21,21 @@ import {
   appendAuditEventsForTransitions,
 } from '../core/audit-skill-brain-first.ts';
 import { loadCompletedMigrations } from '../core/preferences.ts';
-import { compareVersions } from './migrations/index.ts';
+import {
+  listUnresolvedMigrationStates,
+  type UnresolvedMigrationState,
+} from '../core/migration-state.ts';
 import { createProgress, startHeartbeat, type ProgressReporter } from '../core/progress.ts';
 import { categorizeCheck, type CheckCategory } from '../core/doctor-categories.ts';
 import { rankIssues, type RankedIssue } from '../core/doctor-cause-rank.ts';
 import { getCliOptions, cliOptsToProgressOptions } from '../core/cli-options.ts';
 import type { DbUrlSource } from '../core/config.ts';
 import { gbrainPath, loadConfig } from '../core/config.ts';
+import { readOwnedStateFile, withOwnedStateReadPolicy } from '../core/owned-state-file.ts';
+import {
+  loadReconciledUpgradeState,
+  type ReconciledUpgradeState,
+} from './upgrade.ts';
 import { reflexEnabled } from '../core/context/reflex.ts';
 import { resolveSocketPath } from '../core/context/resolve-ipc.ts';
 import { homedir } from 'os';
@@ -51,6 +61,17 @@ import { isUndefinedColumnError } from '../core/utils.ts';
 // drift from what search actually filters.
 import { resolveHardExcludes, DEFAULT_HARD_EXCLUDES } from '../core/search/source-boost.ts';
 import { escapeLikePattern, buildVisibilityClause } from '../core/search/sql-ranking.ts';
+import {
+  verifyFileStorageIndex,
+  verifySourcePathOwnerIndex,
+} from '../core/source-path-owner-index.ts';
+
+const MAX_UPGRADE_ERROR_LOG_BYTES = 4 * 1024 * 1024;
+
+function isMissingFilesystemEntry(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error
+    && (error as { code?: unknown }).code === 'ENOENT';
+}
 
 export interface Check {
   name: string;
@@ -85,6 +106,410 @@ export interface Check {
    * Source of truth: `src/core/doctor-categories.ts`.
    */
   category?: CheckCategory;
+}
+
+interface UpgradeErrorEvidence {
+  ts: string;
+  phase: string;
+  from_version: string;
+  to_version: string;
+  error: string;
+  hint: string;
+  transition_id?: string;
+  brain_id?: string | null;
+}
+
+interface LoadedUpgradeErrorEvidence extends UpgradeErrorEvidence {
+  tsMs: number;
+  source: 'canonical' | 'legacy';
+  ordinal: number;
+}
+
+const UPGRADE_ERROR_TRANSITION_ID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const UPGRADE_ERROR_BRAIN_ID_RE =
+  /^db:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function safeEvidenceLabel(value: unknown, maxChars: number): string {
+  return String(value ?? '')
+    .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxChars);
+}
+
+function completedStateSupersedesError(
+  error: UpgradeErrorEvidence,
+  state: ReconciledUpgradeState,
+): boolean {
+  if (state.kind !== 'complete') return false;
+  // A same-version success from another upgrade attempt or database must never
+  // suppress this failure. Legacy unbound evidence remains visible.
+  if (typeof error.transition_id !== 'string'
+    || state.transitionId !== error.transition_id
+    || !Object.prototype.hasOwnProperty.call(error, 'brain_id')
+    || state.brainId !== error.brain_id
+    || state.from !== error.from_version
+    || state.to !== error.to_version) {
+    return false;
+  }
+  const errorAt = Date.parse(error.ts);
+  return Boolean(error.to_version)
+    && Number.isFinite(errorAt)
+    && Number.isFinite(state.tsMs)
+    && state.tsMs > errorAt;
+}
+
+function parseUpgradeErrorLine(
+  line: string,
+  source: LoadedUpgradeErrorEvidence['source'],
+  ordinal: number,
+): LoadedUpgradeErrorEvidence {
+  const parsed = JSON.parse(line) as Partial<UpgradeErrorEvidence>;
+  const tsMs = typeof parsed.ts === 'string' ? Date.parse(parsed.ts) : Number.NaN;
+  if (!Number.isFinite(tsMs)
+    || typeof parsed.phase !== 'string'
+    || typeof parsed.from_version !== 'string'
+    || typeof parsed.to_version !== 'string'
+    || typeof parsed.error !== 'string'
+    || typeof parsed.hint !== 'string') {
+    throw new Error('invalid upgrade error record');
+  }
+
+  const hasTransition = Object.prototype.hasOwnProperty.call(parsed, 'transition_id');
+  const hasBrain = Object.prototype.hasOwnProperty.call(parsed, 'brain_id');
+  if (hasTransition !== hasBrain) throw new Error('partially bound upgrade error record');
+  if (hasTransition) {
+    if (typeof parsed.transition_id !== 'string'
+      || !UPGRADE_ERROR_TRANSITION_ID_RE.test(parsed.transition_id)
+      || !(parsed.brain_id === null || (
+        typeof parsed.brain_id === 'string' && UPGRADE_ERROR_BRAIN_ID_RE.test(parsed.brain_id)
+      ))) {
+      throw new Error('invalid upgrade error binding');
+    }
+  }
+
+  return { ...(parsed as UpgradeErrorEvidence), tsMs, source, ordinal };
+}
+
+function upgradeErrorRecordKey(record: UpgradeErrorEvidence): string {
+  return JSON.stringify({
+    ts: record.ts,
+    phase: record.phase,
+    from_version: record.from_version,
+    to_version: record.to_version,
+    error: record.error,
+    hint: record.hint,
+    transition_id: record.transition_id ?? null,
+    brain_id: Object.prototype.hasOwnProperty.call(record, 'brain_id')
+      ? record.brain_id
+      : '<unbound>',
+  });
+}
+
+/** Read and merge both append-only authorities; never let fallback order hide a newer row. */
+function loadNewestUpgradeErrorEvidence(): LoadedUpgradeErrorEvidence | null {
+  return withOwnedStateReadPolicy(false, () => {
+    const canonicalRoot = gbrainPath();
+    const legacyRoot = join(process.env.HOME || homedir(), '.gbrain');
+    const candidates: Array<{
+      source: LoadedUpgradeErrorEvidence['source'];
+      root: string;
+      path: string;
+    }> = [{
+      source: 'canonical',
+      root: canonicalRoot,
+      path: gbrainPath('upgrade-errors.jsonl'),
+    }];
+    const legacyPath = join(legacyRoot, 'upgrade-errors.jsonl');
+    if (resolvePath(legacyPath) !== resolvePath(candidates[0]!.path)) {
+      candidates.push({ source: 'legacy', root: legacyRoot, path: legacyPath });
+    }
+
+    const records: LoadedUpgradeErrorEvidence[] = [];
+    for (const candidate of candidates) {
+      let raw: string;
+      try {
+        raw = readOwnedStateFile(
+          candidate.path,
+          MAX_UPGRADE_ERROR_LOG_BYTES,
+          candidate.root,
+        );
+      } catch (error) {
+        if (isMissingFilesystemEntry(error)) continue;
+        throw error;
+      }
+      let ordinal = 0;
+      for (const line of raw.split('\n')) {
+        if (!line.trim()) continue;
+        records.push(parseUpgradeErrorLine(line, candidate.source, ordinal++));
+      }
+    }
+    if (records.length === 0) return null;
+
+    // Append order breaks same-millisecond ties within one log. Across two
+    // independent logs no such ordering exists, so conflicting newest rows at
+    // the same timestamp are an authority disagreement rather than a guess.
+    const latestBySource = new Map<LoadedUpgradeErrorEvidence['source'], LoadedUpgradeErrorEvidence>();
+    for (const record of records) {
+      const current = latestBySource.get(record.source);
+      if (!current
+        || record.tsMs > current.tsMs
+        || (record.tsMs === current.tsMs && record.ordinal > current.ordinal)) {
+        latestBySource.set(record.source, record);
+      }
+    }
+    const sourceHeads = [...latestBySource.values()];
+    const newestAt = Math.max(...sourceHeads.map(record => record.tsMs));
+    const newest = sourceHeads.filter(record => record.tsMs === newestAt);
+    const newestKeys = new Set(newest.map(upgradeErrorRecordKey));
+    if (newestKeys.size > 1) {
+      throw new Error('canonical and legacy upgrade error logs disagree at the newest timestamp');
+    }
+    return newest[0]!;
+  });
+}
+
+/** Append-only errors stay auditable; a later safe same-target completion only suppresses the alert. */
+export function buildUpgradeErrorEvidenceCheck(): Check | null {
+  let latest: UpgradeErrorEvidence;
+  try {
+    const loaded = loadNewestUpgradeErrorEvidence();
+    if (!loaded) return null;
+    latest = loaded;
+  } catch {
+    return {
+      name: 'upgrade_errors',
+      status: 'fail',
+      message:
+        'Canonical/legacy upgrade evidence is unreadable, malformed, unsafe, oversized, or contradictory; ' +
+        'inspect both configured and HOME upgrade-errors.jsonl files.',
+    };
+  }
+
+  // Only the reconciled canonical+legacy authority may suppress a failure.
+  // Pending, missing, unsafe, and contradictory state always leave it visible.
+  const state = loadReconciledUpgradeState();
+  if (completedStateSupersedesError(latest, state)) return null;
+
+  const dateMs = Date.parse(latest.ts);
+  const date = Number.isFinite(dateMs) ? new Date(dateMs).toISOString().slice(0, 10) : 'unknown date';
+  return {
+    name: 'upgrade_errors',
+    status: 'warn',
+    message:
+      `Post-upgrade failure on ${date} ` +
+      `(${safeEvidenceLabel(latest.from_version, 64)} → ${safeEvidenceLabel(latest.to_version, 64)}, ` +
+      `phase: ${safeEvidenceLabel(latest.phase, 64)}). ` +
+      `Recovery: ${safeEvidenceLabel(latest.hint, 512)}`,
+  };
+}
+
+/** A pending handoff is independently unhealthy even when no error row exists. */
+export function buildUpgradeStateCheck(): Check | null {
+  const state = loadReconciledUpgradeState();
+  if (state.kind === 'missing' || state.kind === 'complete') return null;
+  if (state.kind === 'invalid') {
+    return {
+      name: 'upgrade_state',
+      status: 'fail',
+      message:
+        'Canonical/legacy upgrade state is unreadable, malformed, unsafe, oversized, or contradictory; ' +
+        'normal operation must remain blocked.',
+    };
+  }
+
+  if (state.legacy || state.transitionId === null) {
+    return {
+      name: 'upgrade_state',
+      status: 'fail',
+      message: 'Legacy upgrade handoff has not been adopted. Run `gbrain post-upgrade` before normal operation.',
+    };
+  }
+  return {
+    name: 'upgrade_state',
+    status: 'fail',
+    message:
+      `Upgrade handoff is ${safeEvidenceLabel(state.status, 64)}. ` +
+      'Run `gbrain post-upgrade` before normal operation.',
+  };
+}
+
+function migrationStateLabel(state: UnresolvedMigrationState): string {
+  const scope = state.brain_id
+    ? state.brain_id.replace(/[\u0000-\u001f\u007f-\u009f]/g, '?')
+    : 'legacy-unscoped';
+  return `[${scope}] ${state.version}`;
+}
+
+/** One renderer for both local and remote doctor migration-ledger checks. */
+export function buildMigrationLedgerCheck(
+  entries: ReturnType<typeof loadCompletedMigrations>,
+  brainId?: string,
+  location = '',
+): Check | null {
+  // Each orchestrator owns independent host/schema work. A later version's
+  // completion cannot prove an older partial settled; only that version's own
+  // postcondition-backed terminal receipt may clear it.
+  const unresolved = listUnresolvedMigrationStates(entries, brainId);
+  const ambiguous = unresolved.filter(state => state.status === 'ambiguous');
+  const wedged = unresolved.filter(state => state.status === 'wedged');
+  const partial = unresolved.filter(state => state.status === 'partial');
+  const where = location ? ` ${location}` : '';
+
+  if (ambiguous.length > 0) {
+    return {
+      name: 'minions_migration',
+      status: 'fail',
+      message:
+        `AMBIGUOUS MIGRATION(s)${where}: ${ambiguous.map(migrationStateLabel).join(', ')}. ` +
+        'Verify each named database before using --force-retry; do not auto-retry.',
+    };
+  }
+  if (wedged.length > 0) {
+    const versions = wedged.map(state => state.version);
+    const recovery = brainId
+      ? versions.map(version => `gbrain apply-migrations --force-retry ${version}`).join(' && ')
+      : 'select the named brain, then run `gbrain apply-migrations --force-retry <version>`';
+    return {
+      name: 'minions_migration',
+      status: 'fail',
+      message:
+        `WEDGED MIGRATION(s)${where}: ${wedged.map(migrationStateLabel).join(', ')} ` +
+        `(>=3 trailing consecutive partials). Recovery: ${recovery}`,
+    };
+  }
+  if (partial.length > 0) {
+    return {
+      name: 'minions_migration',
+      status: 'fail',
+      message:
+        `MINIONS HALF-INSTALLED${where}: ${partial.map(migrationStateLabel).join(', ')}. ` +
+        (brainId
+          ? 'Run: gbrain apply-migrations --yes'
+          : 'Select the named brain, then run `gbrain apply-migrations --yes`.'),
+    };
+  }
+  return null;
+}
+
+export interface DatabaseMigrationAuthorityChecks {
+  brainId: string | null;
+  checks: Check[];
+}
+
+/**
+ * Shared local/remote authority probe. Filesystem receipts are only meaningful
+ * after the database-owned UUID is known, and a DB-only inflight fence must
+ * stay unhealthy even if the local JSONL ledger was lost or never written.
+ */
+export async function buildDatabaseMigrationAuthorityChecks(
+  engine: Pick<BrainEngine, 'executeRaw'>,
+  location = '',
+): Promise<DatabaseMigrationAuthorityChecks> {
+  const checks: Check[] = [];
+  const where = location ? ` ${location}` : '';
+  let brainId: string | null = null;
+  try {
+    brainId = await readDatabaseInstanceId(engine);
+    checks.push(brainId
+      ? {
+          name: 'migration_identity',
+          status: 'ok',
+          message: `Durable database migration identity is present${where}`,
+        }
+      : {
+          name: 'migration_identity',
+          status: 'fail',
+          message:
+            `This brain has no durable database instance identity${where}. ` +
+            'Run `gbrain apply-migrations --yes` before trusting migration receipts.',
+        });
+  } catch {
+    checks.push({
+      name: 'migration_identity',
+      status: 'fail',
+      message:
+        `Database migration identity is malformed, duplicated, or unreadable${where}. ` +
+        'Stop migrations and repair config.database_instance_id before retrying.',
+    });
+  }
+
+  try {
+    const inflight = await listMigrationInflight(engine);
+    if (inflight.length === 0) {
+      checks.push({
+        name: 'migration_inflight',
+        status: 'ok',
+        message: `No unresolved database migration attempts${where}`,
+      });
+    } else {
+      const labels = inflight.slice(0, 10).map(record => {
+        const version = safeEvidenceLabel(record.version, 64);
+        const binding = brainId && record.brain_id !== brainId ? ' identity-mismatch' : '';
+        return `${version}${binding}`;
+      });
+      checks.push({
+        name: 'migration_inflight',
+        status: 'fail',
+        message:
+          `${inflight.length} unresolved database migration attempt(s)${where}: ${labels.join(', ')}` +
+          (inflight.length > labels.length ? `, +${inflight.length - labels.length} more` : '') +
+          '. Do not auto-retry; inspect the database and matching local receipt before force-retry.',
+      });
+    }
+  } catch {
+    checks.push({
+      name: 'migration_inflight',
+      status: 'fail',
+      message:
+        `Database migration inflight state is malformed or unreadable${where}. ` +
+        'Stop migrations and inspect config migration_inflight:* rows before retrying.',
+    });
+  }
+  return { brainId, checks };
+}
+
+export async function buildCriticalOwnershipIndexCheck(
+  engine: BrainEngine,
+  schemaVersion: number,
+): Promise<Check | null> {
+  if (schemaVersion < 123) return null;
+  try {
+    // v123 introduced the file identity index. The page ownership index is a
+    // v124 post-condition; a database durably stopped between those versions
+    // must remain able to run v124 rather than being diagnosed as drift first.
+    const [pageOk, fileOk] = await Promise.all([
+      schemaVersion >= 124 ? verifySourcePathOwnerIndex(engine) : Promise.resolve(true),
+      verifyFileStorageIndex(engine),
+    ]);
+    const invalid = [
+      ...(!pageOk ? ['pages_source_path_owner_uniq'] : []),
+      ...(!fileOk ? ['idx_files_source_storage_path'] : []),
+    ];
+    if (invalid.length === 0) {
+      return {
+        name: 'multi_source_ownership_indexes',
+        status: 'ok',
+        message: schemaVersion >= 124
+          ? 'Critical page-path and file-path ownership indexes are canonical'
+          : 'Critical file-path ownership index is canonical (page-path index starts at v124)',
+      };
+    }
+    return {
+      name: 'multi_source_ownership_indexes',
+      status: 'fail',
+      message:
+        `Critical ownership index drift: ${invalid.join(', ')}. Stop writers and run ` +
+        '`gbrain upgrade-preflight`; do not resume ingestion until repaired.',
+    };
+  } catch (error) {
+    return {
+      name: 'multi_source_ownership_indexes',
+      status: 'fail',
+      message: `Could not verify critical ownership indexes: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
 }
 
 /**
@@ -489,9 +914,11 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
 
   // 2. Schema version. Uses engine.getConfig('version') — the same engine-
   // agnostic API the local doctor uses, works on both Postgres and PGLite.
+  let remoteSchemaVersion = 0;
   try {
     const versionStr = await engine.getConfig('version');
     const version = parseInt(versionStr || '0', 10);
+    remoteSchemaVersion = version;
     if (version >= LATEST_VERSION) {
       checks.push({ name: 'schema_version', status: 'ok', message: `Version ${version} (latest: ${LATEST_VERSION})` });
     } else if (version === 0) {
@@ -510,6 +937,9 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
   } catch {
     checks.push({ name: 'schema_version', status: 'warn', message: 'Could not check schema version' });
   }
+
+  const remoteOwnershipIndexCheck = await buildCriticalOwnershipIndexCheck(engine, remoteSchemaVersion);
+  if (remoteOwnershipIndexCheck) checks.push(remoteOwnershipIndexCheck);
 
   // 2b. #2038: idx_timeline_dedup shape. A renumbered-during-merge migration
   // (v102) can be recorded-as-applied without its DDL running, leaving the
@@ -582,49 +1012,34 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
     });
   }
 
-  // 3b. Migration wedge hint (v0.31.8 — D14 + D19). The brain server's
+  // 3b. Database identity + durable inflight authority. This must precede
+  // filesystem-ledger scoping and is shared with the local doctor.
+  const remoteMigrationAuthority = await buildDatabaseMigrationAuthorityChecks(
+    engine,
+    'on brain host',
+  );
+  checks.push(...remoteMigrationAuthority.checks);
+
+  // 3c. Migration wedge hint (v0.31.8 — D14 + D19). The brain server's
   // filesystem holds the migration ledger; the wedge condition (>=3 consecutive
   // partials with no later complete) needs the force-retry hint, not plain
   // --yes. Same shape as the local doctor at line ~336.
   try {
     const completed = loadCompletedMigrations();
-    const byVersion = new Map<string, { complete: boolean; partial: boolean }>();
-    for (const entry of completed) {
-      const seen = byVersion.get(entry.version) ?? { complete: false, partial: false };
-      if (entry.status === 'complete') seen.complete = true;
-      if (entry.status === 'partial') seen.partial = true;
-      byVersion.set(entry.version, seen);
-    }
-    const completedVersions = Array.from(byVersion.entries()).filter(([, s]) => s.complete).map(([v]) => v);
-    const stuck = Array.from(byVersion.entries())
-      .filter(([v, s]) => {
-        if (!s.partial || s.complete) return false;
-        const supersededBy = completedVersions.find(cv => compareVersions(cv, v) >= 0);
-        return supersededBy === undefined;
-      })
-      .map(([v]) => v);
-    const wedged: string[] = [];
-    for (const v of stuck) {
-      const partialCount = completed.filter(e => e.version === v && e.status === 'partial').length;
-      if (partialCount >= 3) wedged.push(v);
-    }
-    if (wedged.length > 0) {
-      const cmd = wedged.map(v => `gbrain apply-migrations --force-retry ${v}`).join(' && ');
-      checks.push({
-        name: 'minions_migration',
-        status: 'fail',
-        message: `WEDGED MIGRATION(s) on brain host: ${wedged.join(', ')}. Run on the host: ${cmd}`,
-      });
-    } else if (stuck.length > 0) {
-      checks.push({
-        name: 'minions_migration',
-        status: 'fail',
-        message: `MINIONS HALF-INSTALLED on brain host: ${stuck.join(', ')}. Run on the host: gbrain apply-migrations --yes`,
-      });
-    }
+    const migrationCheck = buildMigrationLedgerCheck(
+      completed,
+      remoteMigrationAuthority.brainId ?? undefined,
+      'on brain host',
+    );
+    if (migrationCheck) checks.push(migrationCheck);
   } catch {
-    // Best-effort. A broken JSONL on the brain server should not stop the
-    // remote doctor.
+    checks.push({
+      name: 'minions_migration',
+      status: 'fail',
+      message:
+        'Migration ledger is unreadable or corrupt on the brain host. ' +
+        'Stop upgrades and repair ~/.gbrain/migrations/completed.jsonl before retrying.',
+    });
   }
 
   // 4. Sync failures (file-plane ledger; see src/core/sync-failure-ledger.ts).
@@ -4158,6 +4573,184 @@ export function buildRetrievalReflexCheck(skillsDir: string | null): Check {
   }
 }
 
+type ImageAssetStorageProbe = {
+  exists(path: string): Promise<boolean>;
+};
+
+export interface ImageAssetsHealthDeps {
+  /** Test seam; undefined resolves the configured backend, null forces legacy mode. */
+  resolveStorage?: () => Promise<ImageAssetStorageProbe | null>;
+  /** Legacy absolute-path probe. Object keys must never reach this seam. */
+  statLocalPath?: (path: string) => void;
+}
+
+async function resolveConfiguredImageAssetStorage(): Promise<ImageAssetStorageProbe | null> {
+  const config = loadConfig();
+  if (!config?.storage) return null;
+  const { createStorage } = await import('../core/storage.ts');
+  return createStorage(config.storage as any);
+}
+
+/**
+ * Verify image-file references through the configured storage backend.
+ *
+ * `files.storage_path` is an object key for current S3/Supabase/local-storage
+ * rows, not a host filesystem path. Only an absolute path is treated as a
+ * legacy local-file row, even when a backend is configured. Relative keys with a
+ * missing storage configuration are reported as unverifiable instead of being
+ * misclassified by `statSync()` against the doctor's current working directory.
+ */
+export async function imageAssetsHealthCheck(
+  engine: BrainEngine,
+  deps: ImageAssetsHealthDeps = {},
+): Promise<Check | null> {
+  let rows: Array<{ source_id: string; storage_path: string }>;
+  try {
+    rows = await engine.executeRaw<{ source_id: string; storage_path: string }>(
+      `SELECT source_id, storage_path FROM files WHERE mime_type LIKE 'image/%' LIMIT 1000`,
+    );
+  } catch {
+    // Pre-v36 brains may not have the files table on PGLite — quiet skip.
+    return null;
+  }
+
+  if (rows.length === 0) {
+    return { name: 'image_assets', status: 'ok', message: 'No image assets indexed yet' };
+  }
+
+  let storage: ImageAssetStorageProbe | null;
+  try {
+    storage = await (deps.resolveStorage ?? resolveConfiguredImageAssetStorage)();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      name: 'image_assets',
+      status: 'warn',
+      message:
+        `Could not initialize configured storage to verify ${rows.length} image(s): ${message}. ` +
+        'Fix the storage configuration, then run `gbrain files verify --source <id>`.',
+      details: { checked: 0, missing: 0, unverifiable: rows.length, probe_errors: 1 },
+    };
+  }
+
+  const statLocalPath = deps.statLocalPath ?? ((path: string) => { statSync(path); });
+  let checked = 0;
+  let storageChecked = 0;
+  let legacyChecked = 0;
+  let missing = 0;
+  let storageMissing = 0;
+  let legacyMissing = 0;
+  let unverifiable = 0;
+  let probeErrors = 0;
+  const storageMissingPaths: string[] = [];
+  const legacyMissingPaths: string[] = [];
+  const unverifiablePaths: string[] = [];
+
+  for (const row of rows) {
+    const label = `${row.source_id}:${row.storage_path}`;
+    // Absolute paths are the only supported legacy-local representation.
+    // Current publishers always emit relative source-qualified object keys.
+    if (isAbsolute(row.storage_path)) {
+      try {
+        statLocalPath(row.storage_path);
+        checked++;
+        legacyChecked++;
+      } catch {
+        missing++;
+        legacyMissing++;
+        if (legacyMissingPaths.length < 5) legacyMissingPaths.push(label);
+      }
+      continue;
+    }
+
+    if (storage) {
+      try {
+        if (await storage.exists(row.storage_path)) {
+          checked++;
+          storageChecked++;
+        } else {
+          missing++;
+          storageMissing++;
+          if (storageMissingPaths.length < 5) storageMissingPaths.push(label);
+        }
+      } catch {
+        probeErrors++;
+        if (unverifiablePaths.length < 5) unverifiablePaths.push(label);
+      }
+      continue;
+    }
+
+    unverifiable++;
+    if (unverifiablePaths.length < 5) unverifiablePaths.push(label);
+  }
+
+  const mode = storageChecked > 0 && legacyChecked > 0
+    ? 'mixed'
+    : storageChecked > 0
+      ? 'configured_storage'
+      : legacyChecked > 0
+        ? 'legacy_local_paths'
+        : storage
+          ? 'configured_storage'
+          : 'unconfigured';
+  const details = {
+    checked,
+    storage_checked: storageChecked,
+    legacy_checked: legacyChecked,
+    missing,
+    storage_missing: storageMissing,
+    legacy_missing: legacyMissing,
+    unverifiable,
+    probe_errors: probeErrors,
+    mode,
+  };
+  if (missing === 0 && unverifiable === 0 && probeErrors === 0) {
+    return {
+      name: 'image_assets',
+      status: 'ok',
+      message: mode === 'mixed'
+        ? `${rows.length} image(s) all present across configured storage and legacy absolute local paths`
+        : mode === 'configured_storage'
+          ? `${rows.length} image(s) all present in configured storage`
+          : `${rows.length} image(s) all present at legacy absolute local paths`,
+      details,
+    };
+  }
+
+  const issues: string[] = [];
+  if (storageMissing > 0) {
+    issues.push(
+      `${storageMissing} of ${rows.length} image(s) missing from configured storage ` +
+      `(e.g. ${storageMissingPaths.join(', ')})`,
+    );
+  }
+  if (legacyMissing > 0) {
+    issues.push(
+      `${legacyMissing} of ${rows.length} image(s) missing from legacy absolute local paths ` +
+      `(e.g. ${legacyMissingPaths.join(', ')})`,
+    );
+  }
+  if (unverifiable > 0) {
+    issues.push(
+      `${unverifiable} relative object key(s) unverifiable because no storage backend is configured ` +
+      `(e.g. ${unverifiablePaths.join(', ')})`,
+    );
+  }
+  if (probeErrors > 0) {
+    issues.push(
+      `${probeErrors} configured-storage probe(s) errored ` +
+      `(e.g. ${unverifiablePaths.join(', ')})`,
+    );
+  }
+  return {
+    name: 'image_assets',
+    status: 'warn',
+    message: `${issues.join('; ')}. Fix the storage configuration or object, then run ` +
+      '`gbrain files verify --source <id>`.',
+    details,
+  };
+}
+
 export async function buildChecks(
   engine: BrainEngine | null,
   args: string[],
@@ -4311,102 +4904,44 @@ export async function buildChecks(
   //
   // Forward-progress override: a partial entry for vX.Y.Z is treated as
   // stale (not stuck) if there is a `complete` entry for any vA.B.C >= vX.Y.Z
-  // anywhere in the file. The reasoning: if a newer migration successfully
-  // landed, the install moved past the older partial — the old record is
-  // historical noise from a stopgap that never finished cleanly, but the
-  // schema clearly advanced. Without this, every install that went through
-  // a v0.11.0 stopgap and then upgraded carries the "MINIONS HALF-INSTALLED"
-  // flag forever, even on installs that have been at v0.22+ for months.
+  // in the SAME brain partition. The reasoning: if that brain completed a
+  // newer migration, an ordinary old stopgap partial is historical noise.
+  // Ambiguity is never suppressed, and receipts from another brain never
+  // establish forward progress for this one.
+  let migrationBrainId: string | null = null;
+  if (engine) {
+    const migrationAuthority = await buildDatabaseMigrationAuthorityChecks(engine);
+    migrationBrainId = migrationAuthority.brainId;
+    checks.push(...migrationAuthority.checks);
+  }
   try {
     const completed = loadCompletedMigrations();
-    const byVersion = new Map<string, { complete: boolean; partial: boolean }>();
-    for (const entry of completed) {
-      const seen = byVersion.get(entry.version) ?? { complete: false, partial: false };
-      if (entry.status === 'complete') seen.complete = true;
-      if (entry.status === 'partial') seen.partial = true;
-      byVersion.set(entry.version, seen);
-    }
-    const completedVersions = Array.from(byVersion.entries())
-      .filter(([, s]) => s.complete)
-      .map(([v]) => v);
-    const stuck = Array.from(byVersion.entries())
-      .filter(([v, s]) => {
-        if (!s.partial || s.complete) return false;
-        // Forward-progress override: if any version >= v has completed, the
-        // partial is stale. compareVersions returns 1 when first arg is newer.
-        const supersededBy = completedVersions.find(cv => compareVersions(cv, v) >= 0);
-        return supersededBy === undefined;
-      })
-      .map(([v]) => v);
-
-    // v0.31.8 (D19): detect 3-consecutive-partials shape (the apply-migrations
-    // wedge condition). The `stuck` filter above already excludes
-    // forward-progress-superseded versions, so we only count actual unresolved
-    // partials per version. A version with >=3 trailing partials needs
-    // `gbrain apply-migrations --force-retry <v>` once before plain --yes
-    // will succeed (the 3-consecutive-partials guard in apply-migrations.ts
-    // is still active). Without this hint, operators wedged on v0.29.1 (and
-    // any future migration that hits the same guard) get "run --yes" advice
-    // that won't unstick them.
-    const wedged: string[] = [];
-    for (const v of stuck) {
-      const partialCount = completed.filter(
-        e => e.version === v && e.status === 'partial',
-      ).length;
-      if (partialCount >= 3) wedged.push(v);
-    }
-
-    if (wedged.length > 0) {
-      // The wedged set is a STRICT subset of the stuck set, so a wedged
-      // version is also stuck. Surface the force-retry hint instead of the
-      // generic --yes hint; chained with `&&` when multiple versions are
-      // wedged so the operator can copy-paste a single line.
-      const cmd = wedged.map(v => `gbrain apply-migrations --force-retry ${v}`).join(' && ');
-      checks.push({
-        name: 'minions_migration',
-        status: 'fail',
-        message: `WEDGED MIGRATION(s): ${wedged.join(', ')} (>=3 consecutive partials). Run: ${cmd}`,
-      });
-    } else if (stuck.length > 0) {
-      checks.push({
-        name: 'minions_migration',
-        status: 'fail',
-        message: `MINIONS HALF-INSTALLED (partial migration: ${stuck.join(', ')}). Run: gbrain apply-migrations --yes`,
-      });
-    }
+    const migrationCheck = buildMigrationLedgerCheck(
+      completed,
+      migrationBrainId ?? undefined,
+    );
+    if (migrationCheck) checks.push(migrationCheck);
     // Note: the "no preferences.json but schema is v7+" case is detected
     // in the DB section below (needs schema version).
-  } catch (e) {
-    // completed.jsonl read/parse failure is non-fatal — probably a fresh
-    // install with no record yet. Don't warn here; the DB check below
-    // handles the "schema v7+ but no prefs" case.
+  } catch {
+    checks.push({
+      name: 'minions_migration',
+      status: 'fail',
+      message:
+        'Migration ledger is unreadable or corrupt. ' +
+        'Stop upgrades and repair ~/.gbrain/migrations/completed.jsonl before retrying.',
+    });
   }
 
-  // 3b. Upgrade-error trail (v0.13+). `gbrain upgrade` silently swallows
-  // best-effort failures in `gbrain post-upgrade`; the failure record is
+  // 3b. Upgrade-error trail (v0.13+). `gbrain upgrade` records failures in
+  // `gbrain post-upgrade`; the failure record is
   // appended to ~/.gbrain/upgrade-errors.jsonl so we can surface it here
   // with a paste-ready recovery hint. Without this, users end up with
   // half-upgraded brains and no signal.
-  try {
-    const home = process.env.HOME || '';
-    const errPath = join(home, '.gbrain', 'upgrade-errors.jsonl');
-    if (existsSync(errPath)) {
-      const lines = readFileSync(errPath, 'utf-8').split('\n').filter(l => l.trim());
-      if (lines.length > 0) {
-        const latest = JSON.parse(lines[lines.length - 1]) as {
-          ts: string; phase: string; from_version: string; to_version: string; hint: string;
-        };
-        const date = latest.ts.slice(0, 10);
-        checks.push({
-          name: 'upgrade_errors',
-          status: 'warn',
-          message: `Post-upgrade failure on ${date} (${latest.from_version} → ${latest.to_version}, phase: ${latest.phase}). Recovery: ${latest.hint}`,
-        });
-      }
-    }
-  } catch {
-    // Read/parse failure is itself best-effort; skip silently.
-  }
+  const upgradeStateCheck = buildUpgradeStateCheck();
+  if (upgradeStateCheck) checks.push(upgradeStateCheck);
+  const upgradeErrorCheck = buildUpgradeErrorEvidenceCheck();
+  if (upgradeErrorCheck) checks.push(upgradeErrorCheck);
 
   // 3b-bis. Supervisor health (filesystem-only: PID liveness + audit log).
   // Reads the default PID file (`~/.gbrain/supervisor.pid` unless the user
@@ -5357,6 +5892,9 @@ export async function buildChecks(
   } catch {
     checks.push({ name: 'schema_version', status: 'warn', message: 'Could not check schema version' });
   }
+
+  const ownershipIndexCheck = await buildCriticalOwnershipIndexCheck(engine, schemaVersion);
+  if (ownershipIndexCheck) checks.push(ownershipIndexCheck);
 
   // Note: we intentionally DO NOT fail on "schema v7+ but no preferences.json".
   // That's a valid fresh-install state after `gbrain init` — the migration
@@ -7152,36 +7690,8 @@ export async function buildChecks(
   // sibling SQL via raw query for cross-engine compatibility.
   if (engine) {
     progress.heartbeat('image_assets');
-    try {
-      const rows = await engine.executeRaw<{ storage_path: string }>(
-        `SELECT storage_path FROM files WHERE mime_type LIKE 'image/%' LIMIT 1000`
-      );
-      let vanished = 0;
-      const vanishedPaths: string[] = [];
-      const fs = await import('node:fs');
-      for (const r of rows) {
-        try {
-          fs.statSync(r.storage_path);
-        } catch {
-          vanished++;
-          if (vanishedPaths.length < 5) vanishedPaths.push(r.storage_path);
-        }
-      }
-      if (rows.length === 0) {
-        checks.push({ name: 'image_assets', status: 'ok', message: 'No image assets indexed yet' });
-      } else if (vanished === 0) {
-        checks.push({ name: 'image_assets', status: 'ok', message: `${rows.length} image(s) all present on disk` });
-      } else {
-        checks.push({
-          name: 'image_assets',
-          status: 'warn',
-          message: `${vanished} of ${rows.length} image(s) missing from disk (e.g. ${vanishedPaths.join(', ')}). ` +
-                   `Fix: restore from git, or \`gbrain sync --skip-failed\` to acknowledge.`,
-        });
-      }
-    } catch {
-      // Pre-v36 brains may not have the files table on PGLite — quiet skip.
-    }
+    const imageAssets = await imageAssetsHealthCheck(engine);
+    if (imageAssets) checks.push(imageAssets);
 
     // v0.27.1 Eng-1B: ocr_health — counters incremented by importImageFile.
     // Warns when OCR is opted-in (attempted > 0) but never succeeds.

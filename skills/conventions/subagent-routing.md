@@ -19,8 +19,9 @@ Then branch on mode:
 
 ### Mode A: `always`
 
-All background agent work goes through Minions. `submit_job` is the default.
-Never fall back to `sessions_spawn` with `runtime: "subagent"`.
+All background agent work goes through Minions on the trusted host. Use the
+host CLI or a dedicated bounded action; generic remote `submit_job` is not a
+capability. Never widen a remote agent merely to preserve this mode.
 
 Reference: `skills/minion-orchestrator/SKILL.md`
 

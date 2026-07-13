@@ -119,6 +119,27 @@ describe('#3 sentinel never auto-skips', () => {
     expect(isSkippablePath('people/x.md')).toBe(true);
     expect(isSkippablePath('<head>')).toBe(false);
   });
+
+  test('clean early-return helper retires every old integrity sentinel', async () => {
+    const { recordFailures, loadSyncFailures } = await L();
+    const sentinels = [
+      '<head>',
+      '<rename>',
+      '<delete-reconcile>',
+      '<git-snapshot>',
+      '<resume-proof-drift>',
+    ];
+    recordFailures(
+      'source-a',
+      sentinels.map(path => ({ path, error: 'old integrity incident' })),
+      'old-commit',
+    );
+    expect(loadSyncFailures().filter(row => row.source_id === 'source-a')).toHaveLength(sentinels.length);
+
+    const { clearResolvedIntegritySentinels } = await import('../src/commands/sync.ts');
+    expect(clearResolvedIntegritySentinels('source-a').sort()).toEqual([...sentinels].sort());
+    expect(loadSyncFailures().filter(row => row.source_id === 'source-a')).toEqual([]);
+  });
 });
 
 describe('#7 legacy normalization + dup collapse', () => {

@@ -6,7 +6,7 @@
  *   gbrain claw-test --live --agent openclaw      — real agent, friction discovery
  *
  * Phases (scripted mode):
- *   setup → install_brain → import → query → extract → verify → render
+ *   setup → install_brain → configure_source → import → query → extract → verify → render
  *
  * The harness sets GBRAIN_HOME=<tempdir> so the run is hermetic. Each child
  * gbrain invocation runs with --progress-json and the harness captures stderr
@@ -183,6 +183,14 @@ async function runScripted(
   let brainDir: string | undefined;
   if (scenario.brainRelative) {
     brainDir = join(scenario.dir, scenario.brainRelative);
+    // FS extraction now resolves a fail-closed (source_id, local_path) tuple.
+    // Fresh PGLite seeds the `default` source without a local_path, and this
+    // fixture directory is intentionally not its own Git repository, so the
+    // import phase cannot infer/persist sync.repo_path from a Git HEAD. Record
+    // the legacy default-source path explicitly before import. This keeps the
+    // canonical fresh-user flow honest instead of relying on `--dir` to bypass
+    // source ownership validation.
+    phases.push({ name: 'configure_source', argv: ['config', 'set', 'sync.repo_path', brainDir] });
     phases.push({ name: 'import', argv: ['import', brainDir, '--no-embed', '--progress-json'] });
   }
 

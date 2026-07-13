@@ -97,24 +97,32 @@ describe('serve stdio round-trip E2E (local PGLite → real MCP tool calls)', ()
     expect(connected).toBe(true);
     const { tools } = await client!.listTools();
     const names = new Set(tools.map((t) => t.name));
-    // The core MCP tools the connect LEARN_INSTRUCTION promises always work.
-    // `capture` is deliberately NOT here — it's a CLI-only wrapper, not an MCP
-    // tool; the agent writes via put_page (regression guard for the stale
-    // LEARN_INSTRUCTION that named capture as an MCP tool).
-    for (const core of ['search', 'query', 'get_page', 'put_page', 'get_brain_identity', 'think', 'find_experts']) {
-      expect(names.has(core)).toBe(true);
+    expect([...names].sort()).toEqual([
+      'get_backlinks',
+      'get_links',
+      'get_page',
+      'get_source_health',
+      'get_source_stats',
+      'get_tags',
+      'get_timeline',
+      'list_link_sources',
+      'list_pages',
+      'query',
+      'search',
+      'traverse_graph',
+    ]);
+    for (const hidden of ['capture', 'put_page', 'get_brain_identity', 'think', 'find_experts']) {
+      expect(names.has(hidden)).toBe(false);
     }
-    expect(names.has('capture')).toBe(false); // CLI-only, must not be advertised as MCP
   }, 30_000);
 
-  test('tools/call get_brain_identity returns version + engine + a populated counter', async () => {
+  test('tools/call get_source_stats returns source-confined counters', async () => {
     expect(connected).toBe(true);
-    const res = await client!.callTool({ name: 'get_brain_identity', arguments: {} });
+    const res = await client!.callTool({ name: 'get_source_stats', arguments: {} });
     const text = textOf(res);
-    const id = JSON.parse(text) as { version: string; engine: string; page_count: number };
-    expect(typeof id.version).toBe('string');
-    expect(id.engine).toBe('pglite');
-    expect(id.page_count).toBeGreaterThanOrEqual(1); // the seeded page
+    const stats = JSON.parse(text) as { source_id: string; page_count: number };
+    expect(stats.source_id).toBe('default');
+    expect(stats.page_count).toBeGreaterThanOrEqual(1); // the seeded page
   }, 30_000);
 
   test('tools/call search surfaces the seeded page (keyword path, no embeddings)', async () => {

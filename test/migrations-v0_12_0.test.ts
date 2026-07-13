@@ -11,6 +11,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
+import { migrationTestOpts } from './helpers/migration-opts.ts';
 
 describe('v0.12.0 — Knowledge Graph auto-wire migration', () => {
   test('registered in the TS migration registry', async () => {
@@ -46,11 +47,11 @@ describe('v0.12.0 — Knowledge Graph auto-wire migration', () => {
 
   test('dry-run skips all side-effect phases', async () => {
     const { v0_12_0 } = await import('../src/commands/migrations/v0_12_0.ts');
-    const result = await v0_12_0.orchestrator({
+    const result = await v0_12_0.orchestrator(migrationTestOpts({
       yes: true,
       dryRun: true,
       noAutopilotInstall: true,
-    });
+    }));
     expect(result.version).toBe('0.12.0');
     // Schema, backfill_links, backfill_timeline, verify all skipped.
     // Config check still runs (just reads).

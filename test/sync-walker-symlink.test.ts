@@ -15,10 +15,10 @@
  *    (codex C8).
  */
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync, renameSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { collectSyncableFiles } from '../src/commands/import.ts';
+import { collectSyncableFiles, readBoundedFilesystemImportFile } from '../src/commands/import.ts';
 import { withEnv } from './helpers/with-env.ts';
 
 let tmp: string;
@@ -34,7 +34,9 @@ afterEach(() => {
 describe('collectSyncableFiles symlink + cycle hardening', () => {
   test('1. self-referencing symlink does not loop', async () => {
     await withEnv({ GBRAIN_EMBEDDING_MULTIMODAL: undefined }, () => {
-      writeFileSync(join(tmp, 'README.md'), '# top\n');
+      // README.md is a canonical metafile and intentionally excluded from
+      // brain sync; use an ordinary page so this test isolates symlink safety.
+      writeFileSync(join(tmp, 'page.md'), '# top\n');
       // Symlink "loop" inside tempdir pointing back to itself.
       symlinkSync(tmp, join(tmp, 'loop'));
 
@@ -43,7 +45,7 @@ describe('collectSyncableFiles symlink + cycle hardening', () => {
       const ms = Date.now() - t0;
 
       expect(ms).toBeLessThan(1000); // would hang if walker followed the loop
-      expect(files).toContain(join(tmp, 'README.md'));
+      expect(files).toContain(join(tmp, 'page.md'));
       expect(files.every(f => !f.includes('/loop/'))).toBe(true);
     });
   });
@@ -88,7 +90,7 @@ describe('collectSyncableFiles symlink + cycle hardening', () => {
 
   test('4. strategy filter admits the right files', async () => {
     await withEnv({ GBRAIN_EMBEDDING_MULTIMODAL: undefined }, () => {
-      writeFileSync(join(tmp, 'README.md'), '# r\n');
+      writeFileSync(join(tmp, 'page.md'), '# r\n');
       writeFileSync(join(tmp, 'foo.ts'), '// f\n');
       writeFileSync(join(tmp, 'bar.py'), '# b\n');
 
@@ -97,8 +99,8 @@ describe('collectSyncableFiles symlink + cycle hardening', () => {
       const auto = collectSyncableFiles(tmp, { strategy: 'auto' });
 
       expect(code.map(f => f.split('/').pop()).sort()).toEqual(['bar.py', 'foo.ts']);
-      expect(markdown.map(f => f.split('/').pop())).toEqual(['README.md']);
-      expect(auto.map(f => f.split('/').pop()).sort()).toEqual(['README.md', 'bar.py', 'foo.ts']);
+      expect(markdown.map(f => f.split('/').pop())).toEqual(['page.md']);
+      expect(auto.map(f => f.split('/').pop()).sort()).toEqual(['bar.py', 'foo.ts', 'page.md']);
     });
   });
 
@@ -160,5 +162,105 @@ describe('collectSyncableFiles symlink + cycle hardening', () => {
         '/a.md', '/b.md', '/sub/c.md',
       ]);
     });
+  });
+
+  test('8. bounded import rejects an existing ancestor symlink outside the root', () => {
+    const outside = mkdtempSync(join(tmpdir(), 'gbrain-import-outside-'));
+    try {
+      writeFileSync(join(outside, 'secret.md'), 'outside secret\n');
+      symlinkSync(outside, join(tmp, 'sub'));
+
+      expect(() => readBoundedFilesystemImportFile(
+        join(tmp, 'sub', 'secret.md'),
+        'sub/secret.md',
+        tmp,
+      )).toThrow(/symlink ancestor|escapes root through an ancestor symlink/);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test('9. bounded import detects an ancestor swap after opening', () => {
+    const outside = mkdtempSync(join(tmpdir(), 'gbrain-import-swap-outside-'));
+    const sub = join(tmp, 'sub');
+    const movedSub = join(tmp, 'sub-original');
+    try {
+      mkdirSync(sub);
+      writeFileSync(join(sub, 'page.md'), 'safe in-root bytes\n');
+      writeFileSync(join(outside, 'page.md'), 'outside secret\n');
+
+      expect(() => readBoundedFilesystemImportFile(
+        join(sub, 'page.md'),
+        'sub/page.md',
+        tmp,
+        () => {
+          renameSync(sub, movedSub);
+          symlinkSync(outside, sub);
+        },
+      )).toThrow(/symlink ancestor|ancestor changed|changed while reading/);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  test('10. bounded import never follows an in-root leaf symlink', () => {
+    writeFileSync(join(tmp, 'private.md'), 'excluded private bytes\n');
+    symlinkSync(join(tmp, 'private.md'), join(tmp, 'selected.md'));
+
+    expect(() => readBoundedFilesystemImportFile(
+      join(tmp, 'selected.md'),
+      'selected.md',
+      tmp,
+    )).toThrow(/Skipping symlink/);
+  });
+
+  test('11. bounded import rejects a regular leaf swapped to an in-root symlink', () => {
+    const selected = join(tmp, 'selected.md');
+    const privateFile = join(tmp, 'private.md');
+    writeFileSync(selected, 'safe selected bytes\n');
+    writeFileSync(privateFile, 'excluded private bytes\n');
+
+    expect(() => readBoundedFilesystemImportFile(
+      selected,
+      'selected.md',
+      tmp,
+      () => {
+        unlinkSync(selected);
+        symlinkSync(privateFile, selected);
+      },
+    )).toThrow(/changed while reading|ancestor changed/);
+  });
+
+  test('12. bounded import rejects an in-root symlink ancestor into a pruned directory', () => {
+    const privateDir = join(tmp, '.private');
+    mkdirSync(privateDir);
+    writeFileSync(join(privateDir, 'page.md'), 'excluded private bytes\n');
+    symlinkSync(privateDir, join(tmp, 'sub'));
+
+    expect(() => readBoundedFilesystemImportFile(
+      join(tmp, 'sub', 'page.md'),
+      'sub/page.md',
+      tmp,
+    )).toThrow(/symlink ancestor/);
+  });
+
+  test('13. bounded import rejects an ancestor swapped into an in-root pruned directory', () => {
+    const sub = join(tmp, 'sub');
+    const movedSub = join(tmp, 'sub-original');
+    const privateDir = join(tmp, '.private');
+    mkdirSync(sub);
+    mkdirSync(privateDir);
+    writeFileSync(join(sub, 'page.md'), 'safe selected bytes\n');
+    writeFileSync(join(privateDir, 'page.md'), 'excluded private bytes\n');
+
+    expect(() => readBoundedFilesystemImportFile(
+      join(sub, 'page.md'),
+      'sub/page.md',
+      tmp,
+      () => {
+        renameSync(sub, movedSub);
+        symlinkSync(privateDir, sub);
+      },
+    )).toThrow(/symlink ancestor|ancestor changed|changed while reading/);
   });
 });

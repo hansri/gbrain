@@ -20,8 +20,9 @@ import {
   readRecentDbDisconnects,
   logDbDisconnect,
 } from '../../src/core/audit/db-disconnect-audit.ts';
+import { getPostgresTestUrl } from '../helpers/postgres-test-authority.ts';
 
-const DATABASE_URL = process.env.DATABASE_URL;
+const DATABASE_URL = getPostgresTestUrl();
 const skip = !DATABASE_URL;
 
 if (skip) {

@@ -1,10 +1,12 @@
 import { PGlite } from '@electric-sql/pglite';
+import { randomUUID } from 'node:crypto';
 import { vector } from '@electric-sql/pglite/vector';
 import { pg_trgm } from '@electric-sql/pglite/contrib/pg_trgm';
 import type { Transaction } from '@electric-sql/pglite';
 import type {
   BrainEngine,
   BatchOpts,
+  TransactionOpts,
   LinkBatchInput, TimelineBatchInput,
   ReservedConnection,
   DreamVerdict, DreamVerdictInput,
@@ -20,10 +22,19 @@ import { MAX_SEARCH_LIMIT, clampSearchLimit } from './engine.ts';
 import { withRetry, BULK_RETRY_OPTS, resolveBulkRetryOpts, computeNextDelay, type BatchAuditSite } from './retry.ts';
 import { logBatchRetry as auditLogBatchRetry, logBatchExhausted as auditLogBatchExhausted } from './audit/batch-retry-audit.ts';
 import { runMigrations } from './migrate.ts';
+import { assertCriticalOwnershipIndexes } from './source-path-owner-index.ts';
 import { PGLITE_SCHEMA_SQL, getPGLiteSchema } from './pglite-schema.ts';
 import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
 import { DELETE_BATCH_SIZE } from './engine-constants.ts';
-import { acquireLock, releaseLock, type LockHandle } from './pglite-lock.ts';
+import {
+  acquireLock,
+  assertExistingPgliteDataDirAuthority,
+  closeExistingPgliteDataDirAuthority,
+  PgliteDataDirAuthorityError,
+  releaseLock,
+  type ExistingPgliteDataDirAuthority,
+  type LockHandle,
+} from './pglite-lock.ts';
 import type {
   Page, PageInput, PageFilters, PageType,
   Chunk, ChunkInput, StaleChunkRow, StalePageRow,
@@ -49,6 +60,7 @@ import { validateSlug, contentHash, rowToPage, rowToStalePage, rowToChunk, rowTo
 import { deriveResolutionTuple, finalizeScorecard } from './takes-resolution.ts';
 import { normalizeWeightForStorage } from './takes-fence.ts';
 import { executeRawJsonb } from './sql-query.ts';
+import { databaseIdentity } from './database-identity.ts';
 import { sanitizeForJsonb, buildLinkRows, buildTimelineRows, buildTakeRows } from './batch-rows.ts';
 import { GBrainError, PAGE_SORT_SQL, ENRICH_ORDER_SQL } from './types.ts';
 import { finalizeLastSeen } from './chronicle/last-seen.ts';
@@ -249,6 +261,8 @@ async function preservingProcessExitCode<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+const TRANSACTION_SCOPED_ENGINE = Symbol('gbrain.transaction-scoped-engine');
+
 export class PGLiteEngine implements BrainEngine {
   readonly kind = 'pglite' as const;
   private _db: PGLiteDB | null = null;
@@ -256,6 +270,20 @@ export class PGLiteEngine implements BrainEngine {
   // #2034: captured at connect() so reconnect() can restore the same data dir
   // after a drop, matching PostgresEngine's _savedConfig contract.
   private _savedConfig: EngineConfig | null = null;
+  private _databaseIdentity: string | null = null;
+  private readonly _inMemoryIdentity = randomUUID();
+  private _existingDataDirAuthority: ExistingPgliteDataDirAuthority | undefined;
+
+  constructor(options: { existingDataDirAuthority?: ExistingPgliteDataDirAuthority } = {}) {
+    this._existingDataDirAuthority = options.existingDataDirAuthority;
+  }
+
+  getDatabaseIdentity(): string {
+    if (!this._databaseIdentity) {
+      throw new Error('PGLite database identity is unavailable before connect() succeeds');
+    }
+    return this._databaseIdentity;
+  }
   // Tier 3: when GBRAIN_PGLITE_SNAPSHOT loaded a post-initSchema state into
   // PGlite.create(loadDataDir), initSchema is a no-op (schema is already
   // present + migrations already applied). Saves ~1-3s per fresh test PGLite.
@@ -272,7 +300,18 @@ export class PGLiteEngine implements BrainEngine {
     const dataDir = config.database_path || undefined; // undefined = in-memory
 
     // Acquire file lock to prevent concurrent PGLite access (crashes with Aborted())
-    this._lock = await acquireLock(dataDir);
+    try {
+      this._lock = await acquireLock(dataDir, this._existingDataDirAuthority
+        ? {
+            createDataDir: false,
+            dataDirAuthority: this._existingDataDirAuthority,
+          }
+        : undefined);
+    } catch (error) {
+      closeExistingPgliteDataDirAuthority(this._existingDataDirAuthority);
+      this._existingDataDirAuthority = undefined;
+      throw error;
+    }
 
     if (!this._lock.acquired) {
       throw new Error('Could not acquire PGLite lock. Another gbrain process is using the database.');
@@ -298,14 +337,25 @@ export class PGLiteEngine implements BrainEngine {
     // a snapshot/restore around these awaits does NOT contain them. That is
     // why the CLI's exit paths read gbrain's own verdict
     // (cli-force-exit.ts currentExitCode), never ambient process.exitCode.
+    let createdDb: PGLiteDB | null = null;
     try {
-      this._db = await preservingProcessExitCode(() =>
+      if (this._existingDataDirAuthority) {
+        assertExistingPgliteDataDirAuthority(this._existingDataDirAuthority);
+      }
+      createdDb = await preservingProcessExitCode(() =>
         PGlite.create({
           dataDir,
           loadDataDir,
           extensions: { vector, pg_trgm },
         }),
       );
+      if (this._existingDataDirAuthority) {
+        assertExistingPgliteDataDirAuthority(this._existingDataDirAuthority);
+      }
+      this._db = createdDb;
+      this._databaseIdentity = dataDir
+        ? databaseIdentity({ database_path: dataDir })
+        : databaseIdentity({ database_path: `memory:${this._inMemoryIdentity}` });
     } catch (err) {
       // v0.13.1: any PGLite.create() failure becomes actionable. v0.41.8.0
       // (#1340): the previous error hint hardcoded the macOS 26.3 link, but
@@ -313,16 +363,22 @@ export class PGLiteEngine implements BrainEngine {
       // read-only on older macOS + Bun 1.3.x, so PGLite can't extract its
       // pglite.data WASM payload). Route the hint by failure shape so
       // users get the right next step.
-      const original = err instanceof Error ? err.message : String(err);
-      const verdict = classifyPgliteInitError(original);
-      const wrapped = new Error(buildPgliteInitErrorMessage(verdict, original));
+      if (createdDb) {
+        try { await createdDb.close(); } catch { /* best-effort authority failure cleanup */ }
+        createdDb = null;
+      }
       // Release the lock so a fresh process can try again; leaking the lock
       // here turns a recoverable init error into a stuck-brain state.
       if (this._lock?.acquired) {
         try { await releaseLock(this._lock); } catch { /* ignore cleanup error */ }
         this._lock = null;
       }
-      throw wrapped;
+      closeExistingPgliteDataDirAuthority(this._existingDataDirAuthority);
+      this._existingDataDirAuthority = undefined;
+      if (err instanceof PgliteDataDirAuthorityError) throw err;
+      const original = err instanceof Error ? err.message : String(err);
+      const verdict = classifyPgliteInitError(original);
+      throw new Error(buildPgliteInitErrorMessage(verdict, original));
     }
   }
 
@@ -357,6 +413,8 @@ export class PGLiteEngine implements BrainEngine {
       if (lock?.acquired) {
         await releaseLock(lock);
       }
+      closeExistingPgliteDataDirAuthority(this._existingDataDirAuthority);
+      this._existingDataDirAuthority = undefined;
     }
   }
 
@@ -385,6 +443,9 @@ export class PGLiteEngine implements BrainEngine {
     // Tier 3: snapshot was loaded into PGlite — schema + migrations already
     // applied. Nothing to do. Returns immediately.
     if (this._snapshotLoaded) {
+      // Snapshot version metadata proves build compatibility, not that a
+      // critical index inside the artifact is present and canonical.
+      await assertCriticalOwnershipIndexes(this);
       return;
     }
     // Pre-schema bootstrap: add forward-referenced state the embedded schema
@@ -522,7 +583,11 @@ export class PGLiteEngine implements BrainEngine {
         EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='pages' AND column_name='embedding_signature') AS pages_embedding_signature_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_schema='public' AND table_name='pages' AND column_name='links_extracted_at') AS pages_links_extracted_at_exists
+                WHERE table_schema='public' AND table_name='pages' AND column_name='links_extracted_at') AS pages_links_extracted_at_exists,
+        EXISTS (SELECT 1 FROM information_schema.tables
+                WHERE table_schema='public' AND table_name='timeline_entries') AS timeline_entries_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='timeline_entries' AND column_name='managed_by') AS timeline_managed_by_exists
     `);
     const probe = rows[0] as {
       pages_exists: boolean;
@@ -565,6 +630,8 @@ export class PGLiteEngine implements BrainEngine {
       pages_generation_exists: boolean;
       pages_embedding_signature_exists: boolean;
       pages_links_extracted_at_exists: boolean;
+      timeline_entries_exists: boolean;
+      timeline_managed_by_exists: boolean;
     };
 
     const needsPagesBootstrap = probe.pages_exists && !probe.source_id_exists;
@@ -641,6 +708,10 @@ export class PGLiteEngine implements BrainEngine {
     // it; pre-v112 brains crash without the column, so bootstrap adds it before
     // the CREATE INDEX runs. v112 runs later via runMigrations and is idempotent.
     const needsPagesLinksExtractedAt = probe.pages_exists && !probe.pages_links_extracted_at_exists;
+    // v126: the schema blob creates idx_timeline_managed_page before the
+    // numbered migration can add managed_by to an existing table.
+    const needsTimelineManagedBy = probe.timeline_entries_exists
+      && !probe.timeline_managed_by_exists;
 
     // Fresh installs (no tables yet) and modern brains both no-op.
     if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap
@@ -652,7 +723,8 @@ export class PGLiteEngine implements BrainEngine {
         && !needsPagesProvenance
         && !needsContextualRetrievalColumns && !needsPagesGeneration
         && !needsPagesEmbeddingSignature
-        && !needsPagesLinksExtractedAt) return;
+        && !needsPagesLinksExtractedAt
+        && !needsTimelineManagedBy) return;
 
     process.stderr.write('  Pre-v0.21 brain detected, applying forward-reference bootstrap\n');
 
@@ -899,6 +971,14 @@ export class PGLiteEngine implements BrainEngine {
         ALTER TABLE pages ADD COLUMN IF NOT EXISTS links_extracted_at TIMESTAMPTZ;
       `);
     }
+
+    if (needsTimelineManagedBy) {
+      // The v126 migration remains the sole owner of dedup/index semantics;
+      // bootstrap only makes replay ordering safe for legacy tables.
+      await this.db.exec(`
+        ALTER TABLE timeline_entries ADD COLUMN IF NOT EXISTS managed_by TEXT;
+      `);
+    }
   }
 
   async withReservedConnection<T>(fn: (conn: ReservedConnection) => Promise<T>): Promise<T> {
@@ -914,11 +994,32 @@ export class PGLiteEngine implements BrainEngine {
     return fn(conn);
   }
 
-  async transaction<T>(fn: (engine: BrainEngine) => Promise<T>): Promise<T> {
-    return this.db.transaction(async (tx) => {
+  async transaction<T>(
+    fn: (engine: BrainEngine) => Promise<T>,
+    opts: TransactionOpts = {},
+  ): Promise<T> {
+    // Join an already-active transaction. This is deliberately NOT a nested
+    // savepoint: a failure from either callback aborts the one outer unit.
+    // PGLite serializes transactions, so attempting a second transaction here
+    // would deadlock on the transaction currently running this callback.
+    if ((this as unknown as Record<symbol, boolean>)[TRANSACTION_SCOPED_ENGINE]) {
+      return fn(this);
+    }
+    const runAttempt = () => this.db.transaction(async (tx) => {
       const txEngine = Object.create(this) as PGLiteEngine;
       Object.defineProperty(txEngine, 'db', { get: () => tx });
+      Object.defineProperty(txEngine, TRANSACTION_SCOPED_ENGINE, { value: true });
       return fn(txEngine);
+    });
+    if (!opts.retryOnConnectionError) return runAttempt();
+    const retry = this.getBulkRetryOpts();
+    return withRetry(runAttempt, {
+      maxRetries: retry.maxRetries,
+      delayMs: retry.delayMs,
+      delayMaxMs: retry.delayMaxMs,
+      jitter: BULK_RETRY_OPTS.jitter,
+      signal: opts.signal,
+      reconnect: (ctx) => this.reconnect(ctx),
     });
   }
 
@@ -1078,7 +1179,16 @@ export class PGLiteEngine implements BrainEngine {
       [paths, opts.sourceId],
     );
     const m = new Map<string, string>();
-    for (const r of rows) m.set(r.source_path, r.slug);
+    for (const r of rows) {
+      const prior = m.get(r.source_path);
+      if (prior && prior !== r.slug) {
+        throw new Error(
+          `Ambiguous source_path ownership for ${opts.sourceId}:${r.source_path} ` +
+          `(owners: ${prior}, ${r.slug}). Run the v124 duplicate preflight and repair the data before syncing.`,
+        );
+      }
+      m.set(r.source_path, r.slug);
+    }
     return m;
   }
 
@@ -2042,6 +2152,12 @@ export class PGLiteEngine implements BrainEngine {
     fn: () => Promise<T>,
     batchSize: number,
   ): Promise<T> {
+    // Match Postgres transaction semantics: after a statement error, retrying
+    // inside the same transaction is invalid. The outer transaction owns any
+    // opted-in whole-callback retry.
+    if ((this as unknown as Record<symbol, boolean>)[TRANSACTION_SCOPED_ENGINE]) {
+      return fn();
+    }
     const opts = this.getBulkRetryOpts();
     let prevDelay = 0;
     try {
@@ -2747,6 +2863,7 @@ export class PGLiteEngine implements BrainEngine {
     name: string,
     dirPrefix?: string,
     minSimilarity: number = 0.55,
+    opts?: { sourceId?: string },
   ): Promise<{ slug: string; similarity: number } | null> {
     // Inline threshold comparison instead of `SET LOCAL pg_trgm.similarity_threshold`.
     // The GUC only scopes to the current transaction and pglite auto-commits each
@@ -2754,14 +2871,19 @@ export class PGLiteEngine implements BrainEngine {
     // directly gives predictable behavior. Tie-breaker: sort by slug so re-runs
     // pick the same winner.
     const prefixPattern = dirPrefix ? `${dirPrefix}/%` : '%';
+    const params: unknown[] = [name, prefixPattern, minSimilarity];
+    const sourceClause = opts?.sourceId
+      ? ` AND source_id = $${params.push(opts.sourceId)}`
+      : '';
     const { rows } = await this.db.query(
       `SELECT slug, similarity(title, $1) AS sim
        FROM pages
        WHERE similarity(title, $1) >= $3
          AND slug LIKE $2
+         ${sourceClause}
        ORDER BY sim DESC, slug ASC
        LIMIT 1`,
-      [name, prefixPattern, minSimilarity]
+      params,
     );
     if (rows.length === 0) return null;
     const row = rows[0] as { slug: string; sim: number };
@@ -3363,10 +3485,10 @@ export class PGLiteEngine implements BrainEngine {
     const rows = buildTimelineRows(entries);
     const result = await executeRawJsonb(
       this,
-      `INSERT INTO timeline_entries (page_id, date, source, summary, detail)
-       SELECT p.id, v.date::date, v.source, v.summary, v.detail
+      `INSERT INTO timeline_entries (page_id, date, source, summary, detail, managed_by)
+       SELECT p.id, v.date::date, v.source, v.summary, v.detail, v.managed_by
        FROM jsonb_to_recordset(($1::jsonb)->'rows')
-         AS v(slug text, date text, source text, summary text, detail text, source_id text)
+         AS v(slug text, date text, source text, summary text, detail text, source_id text, managed_by text)
        JOIN pages p ON p.slug = v.slug AND p.source_id = v.source_id
        ON CONFLICT (page_id, date, summary, source) DO NOTHING
        RETURNING 1`,
@@ -3743,7 +3865,7 @@ export class PGLiteEngine implements BrainEngine {
     const result = await this.db.query<{ id: number; created: boolean }>(
       `INSERT INTO files (source_id, page_slug, page_id, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
-       ON CONFLICT (storage_path) DO UPDATE SET
+       ON CONFLICT (source_id, storage_path) DO UPDATE SET
          page_slug = EXCLUDED.page_slug,
          page_id = EXCLUDED.page_id,
          filename = EXCLUDED.filename,
@@ -5120,14 +5242,124 @@ export class PGLiteEngine implements BrainEngine {
 
   // Sync
   async updateSlug(oldSlug: string, newSlug: string, opts?: { sourceId?: string }): Promise<void> {
+    oldSlug = validateSlug(oldSlug);
     newSlug = validateSlug(newSlug);
     const sourceId = opts?.sourceId ?? 'default';
-    // Source-qualify so a rename in source A doesn't sweep up same-slug rows
-    // in sources B/C/D (mirrors postgres-engine.ts).
-    await this.db.query(
-      `UPDATE pages SET slug = $1, updated_at = now() WHERE slug = $2 AND source_id = $3`,
-      [newSlug, oldSlug, sourceId]
-    );
+    // A same-slug request is already converged. Entering the rename
+    // transaction would copy aliases onto themselves and then delete them,
+    // while also needlessly touching every dependent table. It is still an
+    // identity assertion, though: resolve the selected source and require the
+    // origin row exactly as the mutating path does. A missing origin must not
+    // be reported as a successful rename merely because both inputs normalize
+    // to the same slug.
+    if (newSlug === oldSlug) {
+      await this.transaction(async (tx) => {
+        const origin = await tx.executeRaw<{ id: number }>(
+          `SELECT id FROM pages
+            WHERE slug = $1 AND source_id = $2
+            FOR UPDATE`,
+          [oldSlug, sourceId],
+        );
+        if (origin.length !== 1) {
+          throw new Error(
+            `updateSlug expected exactly one row for ${sourceId}:${oldSlug}; found ${origin.length}`,
+          );
+        }
+      });
+      return;
+    }
+    await this.transaction(async (tx) => {
+      if (newSlug !== oldSlug) {
+        // Reserve the destination in the alias namespace before moving the
+        // page. The unique key serializes concurrent claims; an existing
+        // redirect to this origin is safe and is retired as a self-alias at
+        // the end of the transaction.
+        await tx.executeRaw(
+          `INSERT INTO slug_aliases (source_id, alias_slug, canonical_slug)
+           VALUES ($1, $2, $3)
+           ON CONFLICT (source_id, alias_slug) DO NOTHING`,
+          [sourceId, newSlug, oldSlug],
+        );
+        const destinationAliases = await tx.executeRaw<{ canonical_slug: string }>(
+          `SELECT canonical_slug FROM slug_aliases
+            WHERE source_id = $1 AND alias_slug = $2
+            FOR UPDATE`,
+          [sourceId, newSlug],
+        );
+        const conflictingAlias = destinationAliases.find(
+          row => row.canonical_slug !== oldSlug,
+        );
+        if (conflictingAlias) {
+          throw new Error(
+            `updateSlug destination alias collision: ${sourceId}:${newSlug} ` +
+            `already redirects to ${conflictingAlias.canonical_slug}`,
+          );
+        }
+      }
+      const moved = await tx.executeRaw<{ id: number }>(
+        `UPDATE pages SET slug = $1, updated_at = now()
+          WHERE slug = $2 AND source_id = $3
+          RETURNING id`,
+        [newSlug, oldSlug, sourceId],
+      );
+      if (moved.length !== 1) {
+        throw new Error(
+          `updateSlug expected exactly one row for ${sourceId}:${oldSlug}; moved ${moved.length}`,
+        );
+      }
+      await tx.executeRaw(
+        `INSERT INTO page_aliases (source_id, alias_norm, slug, created_at)
+         SELECT source_id, alias_norm, $1, created_at
+           FROM page_aliases WHERE source_id = $2 AND slug = $3
+         ON CONFLICT (source_id, alias_norm, slug) DO NOTHING`,
+        [newSlug, sourceId, oldSlug],
+      );
+      await tx.executeRaw(
+        `DELETE FROM page_aliases WHERE source_id = $1 AND slug = $2`,
+        [sourceId, oldSlug],
+      );
+      await tx.executeRaw(
+        `UPDATE files SET page_slug = $1
+          WHERE source_id = $2 AND page_slug = $3`,
+        [newSlug, sourceId, oldSlug],
+      );
+      const factsTable = await tx.executeRaw<{ present: boolean }>(
+        `SELECT to_regclass('public.facts') IS NOT NULL AS present`,
+      );
+      if (factsTable[0]?.present) {
+        await tx.executeRaw(
+          `UPDATE facts
+              SET entity_slug = CASE WHEN entity_slug = $1 THEN $2 ELSE entity_slug END,
+                  source_markdown_slug = CASE
+                    WHEN source_markdown_slug = $1 THEN $2
+                    ELSE source_markdown_slug
+                  END
+            WHERE source_id = $3
+              AND (entity_slug = $1 OR source_markdown_slug = $1)`,
+          [oldSlug, newSlug, sourceId],
+        );
+      }
+      await tx.executeRaw(
+        `UPDATE take_proposals SET page_slug = $1
+          WHERE source_id = $2 AND page_slug = $3`,
+        [newSlug, sourceId, oldSlug],
+      );
+      await tx.executeRaw(
+        `UPDATE context_volunteer_events SET slug = $1
+          WHERE source_id = $2 AND slug = $3`,
+        [newSlug, sourceId, oldSlug],
+      );
+      await tx.executeRaw(
+        `DELETE FROM slug_aliases
+          WHERE source_id = $1 AND alias_slug = $2 AND canonical_slug = $3`,
+        [sourceId, newSlug, oldSlug],
+      );
+      await tx.executeRaw(
+        `UPDATE slug_aliases SET canonical_slug = $1
+          WHERE source_id = $2 AND canonical_slug = $3`,
+        [newSlug, sourceId, oldSlug],
+      );
+    });
   }
 
   async rewriteLinks(_oldSlug: string, _newSlug: string): Promise<void> {
@@ -5207,14 +5439,27 @@ export class PGLiteEngine implements BrainEngine {
 
   async setPageAliases(slug: string, sourceId: string, aliasNorms: string[]): Promise<void> {
     const uniq = Array.from(new Set(aliasNorms.filter(a => a.length > 0)));
-    await this.db.query(`DELETE FROM page_aliases WHERE source_id = $1 AND slug = $2`, [sourceId, slug]);
-    if (uniq.length === 0) return;
-    await this.db.query(
-      `INSERT INTO page_aliases (source_id, alias_norm, slug)
-       SELECT $1, a, $2 FROM unnest($3::text[]) AS a
-       ON CONFLICT (source_id, alias_norm, slug) DO NOTHING`,
-      [sourceId, slug, uniq],
-    );
+    await this.transaction(async tx => {
+      // Imports are intentionally compatible with brains that have not yet
+      // reached migration v110. Probe before referencing the table: catching
+      // 42P01 after DELETE would be too late because PostgreSQL/PGLite has
+      // already aborted the importer's surrounding transaction.
+      const table = await tx.executeRaw<{ present: boolean }>(
+        `SELECT to_regclass('public.page_aliases') IS NOT NULL AS present`,
+      );
+      if (!table[0]?.present) return;
+      await tx.executeRaw(
+        `DELETE FROM page_aliases WHERE source_id = $1 AND slug = $2`,
+        [sourceId, slug],
+      );
+      if (uniq.length === 0) return;
+      await tx.executeRaw(
+        `INSERT INTO page_aliases (source_id, alias_norm, slug)
+         SELECT $1, a, $2 FROM unnest($3::text[]) AS a
+         ON CONFLICT (source_id, alias_norm, slug) DO NOTHING`,
+        [sourceId, slug, uniq],
+      );
+    });
   }
 
   // Config

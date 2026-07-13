@@ -18,7 +18,7 @@
 
 import { describe, it, expect } from 'bun:test';
 import { execFileSync } from 'child_process';
-import { readFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { resolve } from 'path';
 
 const REPO_ROOT = resolve(import.meta.dir, '..', '..');
@@ -41,16 +41,20 @@ describe('run-serial-tests.sh contract', () => {
     const offenders = serialFiles.filter(f => !/\.serial\.test\.ts$/.test(f));
     expect(offenders).toEqual([]);
 
-    // Every checked-in *.serial.test.ts must be listed by the script.
-    // We cross-check by globbing through git ls-files (deterministic; doesn't
-    // depend on filesystem state during the test run).
+    // Every checked-in, currently present *.serial.test.ts must be listed by
+    // the script. Exclude intentionally deleted-but-not-yet-staged files so
+    // the pre-commit CI gate remains usable during a test replacement.
     const tracked = execFileSync('git', ['ls-files', 'test'], {
       cwd: REPO_ROOT,
       encoding: 'utf-8',
     })
       .split('\n')
       .map(s => s.trim())
-      .filter(f => /\.serial\.test\.ts$/.test(f) && !f.startsWith('test/e2e/'));
+      .filter(f =>
+        /\.serial\.test\.ts$/.test(f) &&
+        !f.startsWith('test/e2e/') &&
+        existsSync(resolve(REPO_ROOT, f)),
+      );
     for (const f of tracked) {
       expect(serialFiles).toContain(f);
     }

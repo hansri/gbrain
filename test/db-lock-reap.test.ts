@@ -142,12 +142,16 @@ describe('deleteLockRowExact (snapshot-matched, TOCTOU defense)', () => {
     // Simulate a reused-PID takeover: same id + pid, but a different (newer)
     // acquired_at than the one the reaper snapshotted → must NOT delete.
     const wrong = new Date(snap!.acquired_at.getTime() + 3_600_000);
-    const miss = await deleteLockRowExact(engine, 'gbrain-sync:exact', 900040, wrong);
+    const miss = await deleteLockRowExact(
+      engine, 'gbrain-sync:exact', 900040, snap!.holder_token, wrong,
+    );
     expect(miss.deleted).toBe(false);
     expect(await lockIds()).toEqual(['gbrain-sync:exact']);
 
     // The matching snapshot deletes.
-    const hit = await deleteLockRowExact(engine, 'gbrain-sync:exact', 900040, snap!.acquired_at);
+    const hit = await deleteLockRowExact(
+      engine, 'gbrain-sync:exact', 900040, snap!.holder_token, snap!.acquired_at,
+    );
     expect(hit.deleted).toBe(true);
     expect(await lockIds()).toEqual([]);
   });
@@ -155,8 +159,29 @@ describe('deleteLockRowExact (snapshot-matched, TOCTOU defense)', () => {
   test('no-op when holder_pid does not match', async () => {
     await seedLock('gbrain-sync:pidguard', 900050, LOCAL, OLD_S);
     const snap = await inspectLock(engine, 'gbrain-sync:pidguard');
-    const res = await deleteLockRowExact(engine, 'gbrain-sync:pidguard', 111111, snap!.acquired_at);
+    const res = await deleteLockRowExact(
+      engine, 'gbrain-sync:pidguard', 111111, snap!.holder_token, snap!.acquired_at,
+    );
     expect(res.deleted).toBe(false);
     expect(await lockIds()).toEqual(['gbrain-sync:pidguard']);
+  });
+
+  test('no-op when a successor reused the same pid and timestamp with a new token', async () => {
+    await seedLock('gbrain-sync:tokenguard', 900060, LOCAL, OLD_S);
+    const snap = await inspectLock(engine, 'gbrain-sync:tokenguard');
+    await engine.executeRaw(
+      `UPDATE gbrain_cycle_locks SET holder_token = 'successor-token'
+        WHERE id = 'gbrain-sync:tokenguard'`,
+    );
+
+    const res = await deleteLockRowExact(
+      engine,
+      'gbrain-sync:tokenguard',
+      900060,
+      snap!.holder_token,
+      snap!.acquired_at,
+    );
+    expect(res.deleted).toBe(false);
+    expect(await lockIds()).toEqual(['gbrain-sync:tokenguard']);
   });
 });

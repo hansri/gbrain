@@ -25,7 +25,7 @@
  * Serial because it spawns subprocesses + writes a tmpdir.
  */
 import { describe, test, expect } from 'bun:test';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, chmodSync } from 'fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, chmodSync, realpathSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -98,7 +98,9 @@ describe('apply-migrations on fresh PGLite (v0.36.1.x #1100)', () => {
         join(home, '.gbrain', 'config.json'),
         JSON.stringify({
           engine: 'pglite',
-          database_path: join(home, '.gbrain', 'brain.pglite'),
+          // PGLite's read-only authority rejects symlinked path components;
+          // macOS exposes the temp root through /var -> /private/var.
+          database_path: realpathSync(join(home, '.gbrain')) + '/brain.pglite',
           embedding_dimensions: 1536,
         }) + '\n',
       );
@@ -121,7 +123,7 @@ describe('apply-migrations on fresh PGLite (v0.36.1.x #1100)', () => {
       // Step 2: apply-migrations --yes runs the orchestrator chain. Pre-fix
       // this wedged on v0.11.0 phase A with the PGLite lock timeout.
       const apply = await runCli(
-        ['apply-migrations', '--yes', '--non-interactive'],
+        ['apply-migrations', '--yes', '--non-interactive', '--no-autopilot-install'],
         env,
         180_000,
       );
@@ -142,7 +144,7 @@ describe('apply-migrations on fresh PGLite (v0.36.1.x #1100)', () => {
 
       // Step 3: re-run is idempotent — "All migrations up to date" must exit
       // 0, not fall through to implicit non-zero (the #1062 fix path).
-      const second = await runCli(['apply-migrations', '--yes', '--non-interactive'], env, 90_000);
+      const second = await runCli(['apply-migrations', '--yes', '--non-interactive', '--no-autopilot-install'], env, 90_000);
       expect(second.exitCode).toBe(0);
       expect(second.stdout + second.stderr).toMatch(/All migrations up to date|up to date/);
 

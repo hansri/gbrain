@@ -139,15 +139,15 @@ job) and sync. See CLAUDE.md "Pace Mode".
   paced sleep (short-TTL). Unit coverage (`db-pacer`/`pace-mode`) already ships.
 ## brain-repo durability follow-ups (filed v0.42.48.0)
 
-- [ ] **P3 — gbrain write-path calls commit-push synchronously when durability is on.**
-  v0.42.48.0 ships the synchronous `brain-commit-push.sh` as the guarantee and a local
-  post-commit hook as a best-effort fallback. The strongest durability (codex outside-voice
-  D13-C) is to have gbrain's own write-through path call the commit-push helper synchronously
-  when a source is hardened — that also covers writes that never get committed by an agent.
-  Deferred because it touches the write path; the hook + mandated helper cover the
-  agent-driven case today.
-  - **Where to start:** `src/core/write-through.ts:writePageThrough` + a per-source "hardened"
-    flag to gate the synchronous push.
+- [ ] **P3 — route hardened write-through through the trusted durability boundary.**
+  Hardened repositories now use the installed `gbrain sources commit-push` command; repo-owned
+  executable helpers are retired and removed without execution. The strongest durability is
+  to let gbrain's own write-through path invoke the same path-scoped library operation
+  synchronously after a successful write. That also covers writes that no agent later commits,
+  without ever executing content pulled into the evidence repository.
+  - **Where to start:** `src/core/write-through.ts:writePageThrough` plus the trusted operation
+    behind `src/core/brain-repo-durability.ts:commitAndPushPaths`, gated by a per-source
+    `hardened` flag.
 
 - [ ] **P3 — Unify the durability pull cron with autopilot's OS-scheduler.**
   v0.42.48.0 ships a minimal launchd/crontab installer inside `brain-repo-durability.ts`

@@ -11,8 +11,8 @@
  *   - `gbrain sync` is refused with the canonical thin-client error
  *   - re-running `gbrain init` refuses without --force
  *
- * Tier B flows (`gbrain remote ping` / `remote doctor`) are stubbed for now
- * and will be exercised when the Tier B commands ship.
+ * Tier B health inspection uses `remote doctor`. Generic remote job
+ * submission and the old `remote ping` shortcut fail closed.
  *
  * Skips when DATABASE_URL is unset (matches the e2e gate convention used
  * across the suite).
@@ -22,13 +22,14 @@ import { describe, test as testRaw, expect, beforeAll, afterAll } from 'bun:test
 import { mkdtempSync, rmSync, readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import { getPostgresTestUrl } from '../helpers/postgres-test-authority.ts';
 
 function test(name: string, fn: () => void | Promise<unknown>): void {
   testRaw(name, fn, 120000);
 }
 
 const CLI = join(__dirname, '..', '..', 'src', 'cli.ts');
-const DATABASE_URL = process.env.DATABASE_URL;
+const DATABASE_URL = getPostgresTestUrl();
 
 interface RunResult { exitCode: number; stdout: string; stderr: string; }
 
@@ -193,7 +194,7 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
     expect(parsed.reason).toBe('thin_client_config_present');
   });
 
-  // ─── Tier B: gbrain remote ping + remote doctor ───
+  // ─── Tier B: bounded remote doctor; generic remote jobs stay local ───
 
   test('gbrain remote doctor returns the host DoctorReport', async () => {
     const r = await spawn(['remote', 'doctor', '--json'], clientHome);
@@ -217,39 +218,13 @@ describeWhen('thin-client end-to-end (requires DATABASE_URL)', () => {
     expect(sv.status).toBe('ok');
   });
 
-  // Skipped: the test fixture is structurally incompatible with what this
-  // assertion needs. `gbrain serve --http` does NOT start a job worker
-  // (workers run via the separate `gbrain jobs work` process). So a
-  // submit_job(autopilot-cycle) call from this fixture leaves the job in
-  // `waiting` forever — no worker to advance it. The test was supposed to
-  // fall back to the self-imposed `--timeout` firing, but `gbrain remote
-  // ping --timeout` doesn't actually honor the cap when callRemoteTool
-  // hangs (the polling loop only checks elapsed time between iterations;
-  // a single in-flight callTool with no AbortSignal blocks forever).
-  //
-  // Two real follow-ups would unblock this:
-  //   1. Thread an AbortSignal through callRemoteTool's MCP `callTool`
-  //      path so `--timeout` actually caps individual calls (not just
-  //      the loop overhead).
-  //   2. OR start a `gbrain jobs work` subprocess in this test's beforeAll
-  //      so the autopilot-cycle job actually fails-fast on a no-repo
-  //      fixture and reaches a real terminal state.
-  //
-  // Either fix is its own PR. The wire path (callRemoteTool, OAuth, MCP
-  // dispatch) is exercised by the doctor + low-scope tests in this file
-  // and by the entire serve-http-oauth.test.ts suite, so coverage of the
-  // protocol is not lost while this test sits skipped.
-  testRaw.skip('gbrain remote ping triggers autopilot-cycle and returns terminal state', async () => {
-    const r = await spawn(['remote', 'ping', '--json', '--timeout', '5s'], clientHome);
-    expect(r.stdout.length).toBeGreaterThan(0);
+  test('gbrain remote ping fails closed without submitting a job', async () => {
+    const r = await spawn(['remote', 'ping', '--json'], clientHome);
+    expect(r.exitCode).toBe(1);
     const parsed = JSON.parse(r.stdout.trim());
-    expect(parsed).toHaveProperty('job_id');
-    expect(parsed.job_id).toBeGreaterThan(0);
-    if (parsed.status === 'success') {
-      expect(parsed.state).toBe('completed');
-    } else {
-      expect(['failed', 'dead', 'cancelled', 'timeout']).toContain(parsed.reason ?? parsed.state);
-    }
+    expect(parsed.status).toBe('error');
+    expect(parsed.reason).toBe('host_local_only');
+    expect(parsed).not.toHaveProperty('job_id');
   });
 
   test('client without admin scope cannot call run_doctor', async () => {

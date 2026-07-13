@@ -13,6 +13,10 @@ import { PostgresEngine } from '../../src/core/postgres-engine.ts';
 import * as db from '../../src/core/db.ts';
 import { importFromContent } from '../../src/core/import-file.ts';
 import { parseMarkdown } from '../../src/core/markdown.ts';
+import {
+  getPostgresTestUrl,
+  requirePostgresTestUrl,
+} from '../helpers/postgres-test-authority.ts';
 
 // Load .env.testing if present
 const envPath = resolve(import.meta.dir, '../../.env.testing');
@@ -29,7 +33,6 @@ if (existsSync(envPath)) {
   }
 }
 
-const DATABASE_URL = process.env.DATABASE_URL;
 const FIXTURES_DIR = resolve(import.meta.dir, 'fixtures');
 
 let engine: PostgresEngine | null = null;
@@ -63,7 +66,7 @@ const ALL_TABLES = [
  * Check if a real database is available for E2E tests.
  */
 export function hasDatabase(): boolean {
-  return !!DATABASE_URL;
+  return getPostgresTestUrl() !== undefined;
 }
 
 /**
@@ -71,15 +74,13 @@ export function hasDatabase(): boolean {
  * Call in beforeAll() of each test file.
  */
 export async function setupDB(): Promise<PostgresEngine> {
-  if (!DATABASE_URL) {
-    throw new Error('DATABASE_URL not set. Copy .env.testing.example to .env.testing and configure it.');
-  }
+  const databaseUrl = requirePostgresTestUrl();
 
   // Disconnect any prior connection (clean slate)
   await db.disconnect();
 
   // Connect fresh
-  await db.connect({ database_url: DATABASE_URL });
+  await db.connect({ database_url: databaseUrl });
   await db.initSchema();
 
   // Truncate all data tables (preserves schema + extensions).
@@ -95,6 +96,17 @@ export async function setupDB(): Promise<PostgresEngine> {
     }
   }
 
+  // Reset the source authority after dependent rows are gone. The old helper
+  // left non-default `sources` behind, so cwd/local_path resolution in a later
+  // file could silently query a stale source even though its pages were gone.
+  // TRUNCATE ... CASCADE also clears source-owned tables not yet represented in
+  // ALL_TABLES (including restricted auth bindings) without FK-order races.
+  await conn.unsafe(`TRUNCATE sources CASCADE`);
+  await conn.unsafe(`
+    INSERT INTO sources (id, name, config)
+    VALUES ('default', 'default', '{"federated": true}'::jsonb)
+  `);
+
   // Re-seed config (initSchema inserts default config rows)
   await conn.unsafe(`
     INSERT INTO config (key, value) VALUES ('schema_version', '1')
@@ -102,7 +114,7 @@ export async function setupDB(): Promise<PostgresEngine> {
   `);
 
   engine = new PostgresEngine();
-  await engine.connect({ database_url: DATABASE_URL });
+  await engine.connect({ database_url: databaseUrl });
   // Apply MIGRATIONS via the engine path. db.initSchema above only runs the
   // embedded SCHEMA_SQL baseline; migrations like v31 (takes) live in the
   // MIGRATIONS array and only run when engine.initSchema() executes them.

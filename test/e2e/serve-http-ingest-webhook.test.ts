@@ -19,8 +19,8 @@
  *   3. Content-type allowlist: image/png → 415 with paste-ready
  *      processor-skillpack hint
  *   4. Happy path: text/markdown → 200/202 with job_id in response
- *   5. Header overrides: X-Gbrain-Slug is forwarded; X-Gbrain-Source-Id
- *      tags the event
+ *   5. Header hints: X-Gbrain-Slug is forwarded; X-Gbrain-Source-Id may only
+ *      repeat the authenticated client's source and cannot redirect writes
  *   6. Idempotency: same content + same client → job_id returned twice
  *      should match (queue dedup on (client_id, content_hash))
  *
@@ -31,7 +31,8 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { hasDatabase } from './helpers.ts';
+import { hasDatabase, setupDB, teardownDB } from './helpers.ts';
+import { buildIngestBackpressureKey } from '../../src/commands/serve-http.ts';
 
 const skip = !hasDatabase();
 const describeE2E = skip ? describe.skip : describe;
@@ -47,9 +48,33 @@ describeE2E('serve-http POST /ingest webhook (v0.38)', () => {
   let serverProcess: ReturnType<typeof import('child_process').spawn> | null = null;
   let clientId: string | undefined;
   let clientSecret: string | undefined;
+  let isolatedClientId: string | undefined;
+  let isolatedClientSecret: string | undefined;
+  const isolatedSourceId = 'e2e-webhook-isolated';
 
   beforeAll(async () => {
     const { execSync, spawn } = await import('child_process');
+
+    // This file may run first against a deliberately empty per-file schema.
+    // Establish the canonical baseline before inserting the source authority
+    // row or invoking auth commands. Relying on another E2E file to have
+    // initialized shared Postgres state makes the suite order-dependent.
+    await setupDB();
+
+    // A second write principal bound to a different source is required for
+    // the cross-source backpressure regression below. Register the source
+    // before the OAuth client because oauth_clients.source_id is an FK.
+    const postgres = (await import('postgres')).default;
+    const sql = postgres(process.env.GBRAIN_DATABASE_URL || process.env.DATABASE_URL || '', { prepare: false });
+    try {
+      await sql`
+        INSERT INTO sources (id, name, config)
+        VALUES (${isolatedSourceId}, ${isolatedSourceId}, '{}'::jsonb)
+        ON CONFLICT (id) DO NOTHING
+      `;
+    } finally {
+      await sql.end();
+    }
 
     // Register a confidential client with both read and write scopes.
     // The write scope is what POST /ingest gates on.
@@ -64,6 +89,18 @@ describeE2E('serve-http POST /ingest webhook (v0.38)', () => {
     }
     clientId = idMatch[1];
     clientSecret = secretMatch[1];
+
+    const isolatedRegOutput = execSync(
+      `bun run src/cli.ts auth register-client e2e-webhook-isolated --grant-types client_credentials --scopes "read write" --source ${isolatedSourceId}`,
+      { cwd: process.cwd(), encoding: 'utf8', env: { ...process.env } },
+    );
+    const isolatedIdMatch = isolatedRegOutput.match(/Client ID:\s+(gbrain_cl_\S+)/);
+    const isolatedSecretMatch = isolatedRegOutput.match(/Client Secret:\s+(gbrain_cs_\S+)/);
+    if (!isolatedIdMatch || !isolatedSecretMatch) {
+      throw new Error('Failed to register isolated webhook test client:\n' + isolatedRegOutput);
+    }
+    isolatedClientId = isolatedIdMatch[1];
+    isolatedClientSecret = isolatedSecretMatch[1];
 
     serverProcess = spawn(
       'bun',
@@ -127,18 +164,52 @@ describeE2E('serve-http POST /ingest webhook (v0.38)', () => {
         console.error(`[afterAll] revoke-client cleanup failed: ${(e as Error).message}`);
       }
     }
+    if (isolatedClientId) {
+      try {
+        const { execSync } = await import('child_process');
+        execSync(`bun run src/cli.ts auth revoke-client "${isolatedClientId}"`, {
+          cwd: process.cwd(),
+          encoding: 'utf8',
+          env: { ...process.env },
+        });
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.error(`[afterAll] isolated revoke-client cleanup failed: ${(e as Error).message}`);
+      }
+    }
+    try {
+      const postgres = (await import('postgres')).default;
+      const sql = postgres(process.env.GBRAIN_DATABASE_URL || process.env.DATABASE_URL || '', { prepare: false });
+      try {
+        await sql`DELETE FROM sources WHERE id = ${isolatedSourceId}`;
+      } finally {
+        await sql.end();
+      }
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.error(`[afterAll] isolated source cleanup failed: ${(e as Error).message}`);
+    }
+    await teardownDB();
   }, 30_000);
 
   // Helper — mint a token with a specific scope subset.
-  async function mintToken(scope = 'read write'): Promise<string> {
+  async function mintClientToken(
+    id: string | undefined,
+    secret: string | undefined,
+    scope = 'read write',
+  ): Promise<string> {
     const res = await fetch(`${BASE}/token`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: `grant_type=client_credentials&client_id=${clientId}&client_secret=${clientSecret}&scope=${encodeURIComponent(scope)}`,
+      body: `grant_type=client_credentials&client_id=${id}&client_secret=${secret}&scope=${encodeURIComponent(scope)}`,
     });
     expect(res.ok).toBe(true);
     const data = (await res.json()) as { access_token: string };
     return data.access_token;
+  }
+
+  async function mintToken(scope = 'read write'): Promise<string> {
+    return mintClientToken(clientId, clientSecret, scope);
   }
 
   // Helper — POST to /ingest with the given Authorization + Content-Type.
@@ -332,15 +403,55 @@ describeE2E('serve-http POST /ingest webhook (v0.38)', () => {
     // test/ingestion/ingest-capture.test.ts).
   });
 
-  test('X-Gbrain-Source-Id header is accepted', async () => {
+  test('matching X-Gbrain-Source-Id header is accepted', async () => {
     const token = await mintToken('read write');
     const res = await postIngest(
       token,
       'text/markdown',
       '# source-id header test',
-      { 'X-Gbrain-Source-Id': 'zapier-webhook' },
+      { 'X-Gbrain-Source-Id': 'default' },
     );
     expect([200, 202]).toContain(res.status);
+    const body = (await res.json()) as { source_id?: string; job_id?: number };
+    expect(body.source_id).toBe('default');
+    expect(body.job_id).toBeDefined();
+
+    const postgres = (await import('postgres')).default;
+    const sql = postgres(process.env.GBRAIN_DATABASE_URL || process.env.DATABASE_URL || '', { prepare: false });
+    try {
+      const [row] = await sql`SELECT data FROM minion_jobs WHERE id = ${body.job_id!}`;
+      const data = row?.data as {
+        remote?: boolean;
+        sourceId?: string;
+        event?: {
+          source_id?: string;
+          source_kind?: string;
+          untrusted_payload?: boolean;
+          metadata?: { client_id?: string };
+        };
+      };
+      expect(data.remote).toBe(true);
+      expect(data.sourceId).toBe('default');
+      expect(data.event?.source_id).toBe('default');
+      expect(data.event?.source_kind).toBe('webhook');
+      expect(data.event?.untrusted_payload).toBe(true);
+      expect(data.event?.metadata?.client_id).toBe(clientId);
+    } finally {
+      await sql.end();
+    }
+  });
+
+  test('forged X-Gbrain-Source-Id cannot redirect the authenticated write', async () => {
+    const token = await mintToken('read write');
+    const res = await postIngest(
+      token,
+      'text/markdown',
+      '# source-id forgery test',
+      { 'X-Gbrain-Source-Id': 'zapier-webhook' },
+    );
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error?: string };
+    expect(body.error).toBe('source_scope_denied');
   });
 
   test('X-Gbrain-Source-Uri header is accepted', async () => {
@@ -369,8 +480,8 @@ describeE2E('serve-http POST /ingest webhook (v0.38)', () => {
     expect([200, 202]).toContain(second.status);
     const secondBody = (await second.json()) as { job_id?: number | string };
 
-    // Queue idempotency_key: `ingest:webhook:${clientId}:${contentHash}` —
-    // same input, same key, MinionQueue.add returns the existing job.
+    // Queue idempotency key combines the opaque principal/source partition
+    // with contentHash, so the same input returns the existing job.
     expect(secondBody.job_id).toBe(firstBody.job_id!);
   });
 
@@ -391,5 +502,150 @@ describeE2E('serve-http POST /ingest webhook (v0.38)', () => {
     expect(firstBody.job_id).toBeDefined();
     expect(secondBody.job_id).toBeDefined();
     expect(secondBody.job_id).not.toBe(firstBody.job_id);
+  });
+
+  test('full source A partition never consumes source B event; saturated B returns opaque 429', async () => {
+    expect(clientId).toBeDefined();
+    expect(isolatedClientId).toBeDefined();
+    const postgres = (await import('postgres')).default;
+    const sql = postgres(process.env.GBRAIN_DATABASE_URL || process.env.DATABASE_URL || '', { prepare: false });
+    const sourceAKey = buildIngestBackpressureKey(clientId!, 'default');
+    const sourceBKey = buildIngestBackpressureKey(isolatedClientId!, isolatedSourceId);
+    try {
+      // Make source A exactly full without spending the HTTP rate-limit
+      // budget. The pre-fix (name, queue)-global maxWaiting logic returned one
+      // of these IDs for source B and silently discarded B's event.
+      await sql`
+        DELETE FROM minion_jobs
+        WHERE left(idempotency_key, length(${sourceAKey}::text)) = ${sourceAKey}
+           OR left(idempotency_key, length(${sourceBKey}::text)) = ${sourceBKey}
+      `;
+      await sql`
+        INSERT INTO minion_jobs (name, data, idempotency_key)
+        SELECT
+          'ingest_capture',
+          jsonb_build_object('sourceId', 'default'),
+          ${sourceAKey}::text || 'seed-' || n::text
+        FROM generate_series(1, 50) AS n
+      `;
+      const sourceAIds = await sql<{ id: number }[]>`
+        SELECT id FROM minion_jobs
+        WHERE left(idempotency_key, length(${sourceAKey}::text)) = ${sourceAKey}
+      `;
+
+      const sourceBToken = await mintClientToken(isolatedClientId, isolatedClientSecret);
+      const accepted = await postIngest(
+        sourceBToken,
+        'text/markdown',
+        `# isolated source B ${Date.now()}`,
+      );
+      expect(accepted.status).toBe(202);
+      const acceptedBody = (await accepted.json()) as { job_id?: number; source_id?: string };
+      expect(acceptedBody.source_id).toBe(isolatedSourceId);
+      expect(acceptedBody.job_id).toBeDefined();
+      expect(sourceAIds.map(row => Number(row.id))).not.toContain(Number(acceptedBody.job_id));
+
+      const [persisted] = await sql<{ data: { sourceId?: string; event?: { source_id?: string } } }[]>`
+        SELECT data FROM minion_jobs WHERE id = ${acceptedBody.job_id!}
+      `;
+      expect(persisted?.data.sourceId).toBe(isolatedSourceId);
+      expect(persisted?.data.event?.source_id).toBe(isolatedSourceId);
+
+      // Fill the remaining slots in B's own partition. Its next distinct
+      // event must be rejected for retry, never acknowledged with another
+      // event's job ID.
+      await sql`
+        INSERT INTO minion_jobs (name, data, idempotency_key)
+        SELECT
+          'ingest_capture',
+          jsonb_build_object('sourceId', ${isolatedSourceId}::text),
+          ${sourceBKey}::text || 'seed-' || n::text
+        FROM generate_series(1, 49) AS n
+      `;
+      const saturated = await postIngest(
+        sourceBToken,
+        'text/markdown',
+        `# isolated source B saturated ${Date.now()}`,
+      );
+      expect(saturated.status).toBe(429);
+      expect(saturated.headers.get('retry-after')).toBe('10');
+      const saturatedBody = (await saturated.json()) as Record<string, unknown>;
+      expect(saturatedBody).toEqual({
+        error: 'queue_backpressure',
+        message: 'Ingestion queue is full for this client and source; retry later.',
+      });
+      expect(saturatedBody.job_id).toBeUndefined();
+    } finally {
+      await sql`
+        DELETE FROM minion_jobs
+        WHERE left(idempotency_key, length(${sourceAKey}::text)) = ${sourceAKey}
+           OR left(idempotency_key, length(${sourceBKey}::text)) = ${sourceBKey}
+      `;
+      await sql.end();
+    }
+  });
+
+  test('legacy names containing delimiters cannot prefix-collide across backpressure partitions', async () => {
+    const victimName = 'victim';
+    const longerLegacyName = 'victim:default:worker';
+    const victimToken = 'e2e_legacy_victim_token_0000000000000001';
+    const longerLegacyToken = 'e2e_legacy_longer_token_0000000000000001';
+    const victimKey = buildIngestBackpressureKey(victimName, 'default');
+    const longerKey = buildIngestBackpressureKey(longerLegacyName, 'default');
+    expect(victimKey).not.toBe(longerKey);
+    expect(victimKey.startsWith(longerKey)).toBe(false);
+    expect(longerKey.startsWith(victimKey)).toBe(false);
+
+    const { createHash } = await import('node:crypto');
+    const postgres = (await import('postgres')).default;
+    const sql = postgres(process.env.GBRAIN_DATABASE_URL || process.env.DATABASE_URL || '', { prepare: false });
+    const victimHash = createHash('sha256').update(victimToken).digest('hex');
+    const longerHash = createHash('sha256').update(longerLegacyToken).digest('hex');
+    try {
+      await sql`
+        INSERT INTO access_tokens (name, token_hash, permissions)
+        VALUES
+          (${victimName}, ${victimHash}, ${sql.json({ scopes: ['read', 'write'], source_id: 'default' })}),
+          (${longerLegacyName}, ${longerHash}, ${sql.json({ scopes: ['read', 'write'], source_id: 'default' })})
+      `;
+      await sql`
+        INSERT INTO minion_jobs (name, data, idempotency_key)
+        SELECT
+          'ingest_capture',
+          jsonb_build_object('sourceId', 'default', 'legacyName', ${longerLegacyName}::text),
+          ${longerKey}::text || 'seed-' || n::text
+        FROM generate_series(1, 50) AS n
+      `;
+      const longerIds = await sql<{ id: number }[]>`
+        SELECT id FROM minion_jobs
+        WHERE left(idempotency_key, length(${longerKey}::text)) = ${longerKey}
+      `;
+
+      // With the old delimiter prefix, victim's shorter key matched every
+      // longer-name row above and the route discarded/rejected this event.
+      const accepted = await postIngest(
+        victimToken,
+        'text/markdown',
+        `# legacy delimiter isolation ${Date.now()}`,
+      );
+      expect(accepted.status).toBe(202);
+      const body = (await accepted.json()) as { job_id?: number; source_id?: string };
+      expect(body.source_id).toBe('default');
+      expect(body.job_id).toBeDefined();
+      expect(longerIds.map(row => Number(row.id))).not.toContain(Number(body.job_id));
+
+      const [persisted] = await sql<{ data: { event?: { metadata?: { client_id?: string } } } }[]>`
+        SELECT data FROM minion_jobs WHERE id = ${body.job_id!}
+      `;
+      expect(persisted?.data.event?.metadata?.client_id).toBe(victimName);
+    } finally {
+      await sql`
+        DELETE FROM minion_jobs
+        WHERE left(idempotency_key, length(${victimKey}::text)) = ${victimKey}
+           OR left(idempotency_key, length(${longerKey}::text)) = ${longerKey}
+      `;
+      await sql`DELETE FROM access_tokens WHERE token_hash IN (${victimHash}, ${longerHash})`;
+      await sql.end();
+    }
   });
 });

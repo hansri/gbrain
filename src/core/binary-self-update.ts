@@ -36,6 +36,7 @@ export interface ReleaseAsset {
 export type BinarySelfUpdateReason =
   | 'unsupported_platform'
   | 'fetch_failed'
+  | 'version_mismatch'
   | 'no_asset'
   | 'download_failed'
   | 'smoke_failed'
@@ -70,19 +71,26 @@ export function resolvePlatformAsset(
 }
 
 export interface BinarySelfUpdateDeps {
-  /** Fetch the latest release's tag + asset list. Default hits the GitHub API. */
-  fetchRelease?: () => Promise<{ tag: string; assets: ReleaseAsset[] } | null>;
+  /** Exact approved version. The default fetcher resolves its tag, never latest. */
+  expectedVersion?: string;
+  /** Fetch a release's tag + asset list. Default hits the exact GitHub tag API. */
+  fetchRelease?: (expectedVersion?: string) => Promise<{ tag: string; assets: ReleaseAsset[] } | null>;
   /** Download `url` to `destPath`. Default streams the HTTP body to disk. */
   download?: (url: string, destPath: string) => Promise<void>;
   /** Smoke-test the staged binary; returns true if `<path> --version` looks like gbrain. */
-  smoke?: (stagedPath: string) => boolean;
+  smoke?: (stagedPath: string, expectedVersion?: string) => boolean;
   platform?: NodeJS.Platform;
   arch?: NodeJS.Architecture;
 }
 
-async function defaultFetchRelease(): Promise<{ tag: string; assets: ReleaseAsset[] } | null> {
+async function defaultFetchRelease(
+  expectedVersion?: string,
+): Promise<{ tag: string; assets: ReleaseAsset[] } | null> {
   try {
-    const res = await fetch('https://api.github.com/repos/garrytan/gbrain/releases/latest', {
+    const endpoint = expectedVersion
+      ? `https://api.github.com/repos/garrytan/gbrain/releases/tags/${encodeURIComponent(`v${expectedVersion}`)}`
+      : 'https://api.github.com/repos/garrytan/gbrain/releases/latest';
+    const res = await fetch(endpoint, {
       headers: { 'User-Agent': 'gbrain-self-upgrade' },
       signal: AbortSignal.timeout(5_000),
     });
@@ -116,10 +124,12 @@ async function defaultDownload(url: string, destPath: string): Promise<void> {
   }
 }
 
-function defaultSmoke(stagedPath: string): boolean {
+function defaultSmoke(stagedPath: string, expectedVersion?: string): boolean {
   try {
     const out = execFileSync(stagedPath, ['--version'], { encoding: 'utf-8', timeout: 10_000 });
-    return /gbrain\s/i.test(out);
+    const match = out.trim().match(/^gbrain\s+(\d+\.\d+\.\d+(?:\.\d+)?)$/i);
+    if (!match) return false;
+    return expectedVersion === undefined || match[1] === expectedVersion;
   } catch {
     return false;
   }
@@ -141,15 +151,22 @@ export async function runBinarySelfUpdate(
   const fetchRelease = deps.fetchRelease ?? defaultFetchRelease;
   const download = deps.download ?? defaultDownload;
   const smoke = deps.smoke ?? defaultSmoke;
+  const expectedVersion = deps.expectedVersion;
 
   const assetName = expectedAssetName(platform, arch);
   if (!assetName) {
     return { ok: false, reason: 'unsupported_platform' };
   }
 
-  const release = await fetchRelease();
+  const release = await fetchRelease(expectedVersion);
   if (!release) {
     return { ok: false, reason: 'fetch_failed', asset: assetName };
+  }
+  if (
+    expectedVersion !== undefined &&
+    release.tag.replace(/^v/i, '') !== expectedVersion
+  ) {
+    return { ok: false, reason: 'version_mismatch', asset: assetName };
   }
 
   const url = resolvePlatformAsset(release.assets, platform, arch);
@@ -173,7 +190,7 @@ export async function runBinarySelfUpdate(
     return { ok: false, reason: 'download_failed', error: errMsg(e), asset: assetName };
   }
 
-  if (!smoke(staged)) {
+  if (!smoke(staged, expectedVersion)) {
     safeUnlink(staged);
     return { ok: false, reason: 'smoke_failed', asset: assetName };
   }

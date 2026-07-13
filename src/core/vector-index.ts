@@ -108,7 +108,9 @@ export async function dropZombieIndexes(
        FROM pg_index ix
        JOIN pg_class i ON i.oid = ix.indexrelid
        JOIN pg_class t ON t.oid = ix.indrelid
+       JOIN pg_namespace n ON n.oid = t.relnamespace
        WHERE ix.indisvalid = false
+         AND n.nspname = 'public'
          AND t.relname = ANY($1)`,
       [tableNames],
     );
@@ -120,7 +122,8 @@ export async function dropZombieIndexes(
         continue;
       }
       try {
-        await engine.executeRaw(`DROP INDEX IF EXISTS ${r.indexname}`);
+        const quotedIndex = `"${r.indexname.replace(/"/g, '""')}"`;
+        await engine.executeRaw(`DROP INDEX IF EXISTS public.${quotedIndex}`);
         dropped.push(r.indexname);
         process.stderr.write(`[hnsw] dropped zombie index ${r.indexname} on ${r.tablename}\n`);
       } catch (err) {

@@ -45,9 +45,21 @@ mock.module('../../src/core/embedding.ts', () => ({
   EMBEDDING_MODEL: 'text-embedding-3-large',
   EMBEDDING_DIMENSIONS: 1536,
   EMBEDDING_COST_PER_1K_TOKENS: 0.00013,
+  currentEmbeddingPricePerMTok: () => 0.13,
   estimateEmbeddingCostUsd: (tokens: number) => (tokens / 1000) * 0.00013,
   // v0.41.31: embed phase reads the current signature to stamp provenance.
   currentEmbeddingSignature: () => 'text-embedding-3-large:1536',
+  willEmbedSynchronously: (opts: {
+    v2Enabled: boolean;
+    serialFlag: boolean;
+    noEmbed: boolean;
+  }) => (opts.v2Enabled && !opts.serialFlag && !opts.noEmbed ? 'deferred' : opts.noEmbed ? 'deferred' : 'inline'),
+  shouldBlockSync: (
+    costUsd: number,
+    floorUsd: number,
+    mode: 'deferred' | 'inline',
+    posture: 'gated' | 'tokenmax' = 'gated',
+  ) => posture !== 'tokenmax' && mode === 'inline' && costUsd > floorUsd,
 }));
 
 const { runCycle, ALL_PHASES } = await import('../../src/core/cycle.ts');

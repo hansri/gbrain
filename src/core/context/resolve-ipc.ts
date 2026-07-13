@@ -14,7 +14,9 @@
  *   resp: { ok: true, block: PointerBlock | null } | { ok: false, error }
  *
  * Local-only (unix socket on the brain's data dir, mode 0600) — no network
- * surface.
+ * surface. Mode 0600 authenticates only the OS user, not a GBrain source, so
+ * the server is also bound to one launcher-selected source. A request may omit
+ * sourceId or repeat that source; it can never select a neighboring source.
  */
 
 import net from 'node:net';
@@ -40,6 +42,11 @@ export interface ResolveRequest {
 }
 
 export type ResolveHandler = (req: ResolveRequest) => Promise<PointerBlock | null>;
+
+export interface ResolveIpcBinding {
+  /** Exact source assigned to the stdio principal when the server launches. */
+  sourceId: string;
+}
 
 /** Canonical socket path for a PGLite data dir. */
 export function resolveSocketPath(dataDir: string): string {
@@ -99,6 +106,7 @@ export async function resolveViaIpc(
  */
 export async function startResolveIpcServer(
   socketPath: string,
+  binding: ResolveIpcBinding,
   handler: ResolveHandler,
   /**
    * v0.43 (#2095, red-team): fired ONLY after the response was successfully
@@ -108,6 +116,10 @@ export async function startResolveIpcServer(
    */
   onDelivered?: (block: PointerBlock, req: ResolveRequest) => void,
 ): Promise<net.Server | null> {
+  // Never unlink or bind a socket without a concrete source authority. An
+  // empty binding would make any request-source fallback ambiguous.
+  if (!binding.sourceId) return null;
+
   // Remove a stale socket file if present (a previous serve that didn't clean up).
   cleanupStaleSocket(socketPath);
 
@@ -124,7 +136,18 @@ export async function startResolveIpcServer(
         let resp: string;
         let delivered: { block: PointerBlock; req: ResolveRequest } | null = null;
         try {
-          const req = JSON.parse(line) as ResolveRequest;
+          const parsed = JSON.parse(line) as unknown;
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            throw new Error('invalid_request');
+          }
+          const request = parsed as ResolveRequest;
+          if (request.sourceId !== undefined && request.sourceId !== binding.sourceId) {
+            throw new Error('source_mismatch');
+          }
+          // The launcher binding is authoritative. Stamp it even when the
+          // legacy client omits sourceId so the handler cannot invent a wider
+          // fallback or trust a future caller-controlled field.
+          const req: ResolveRequest = { ...request, sourceId: binding.sourceId };
           const block = await handler(req);
           resp = JSON.stringify({ ok: true, block });
           if (block) delivered = { block, req };

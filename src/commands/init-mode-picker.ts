@@ -5,10 +5,10 @@
  * config writes work [CDX-7]. Idempotent: if `search.mode` is already set
  * (re-init / second run), the picker is skipped entirely.
  *
- * TTY flow shows the menu. Non-TTY (CI, scripted init, --mcp-only) writes
- * `balanced` and prints the one-line hint pointing at `gbrain config set
- * search.mode`. The mode picker NEVER blocks an init run — readLineSafe
- * caps at 60s and falls back to `balanced` on timeout / EOF.
+ * TTY flow shows the menu. Non-TTY and explicit `--non-interactive` init
+ * auto-apply the recommendation and print the full operator decision matrix.
+ * Interactive reads are bounded to 60s and fall back to the recommendation
+ * on timeout / EOF.
  *
  * Smart auto-suggestion: reads models.tier.subagent / models.default /
  * OPENAI_API_KEY presence + brain size hint to RECOMMEND a mode. The
@@ -181,7 +181,7 @@ export function parseModeInput(raw: string): SearchMode | null {
  */
 export async function runModePicker(
   engine: BrainEngine,
-  opts: { jsonOutput?: boolean; force?: boolean } = {},
+  opts: { jsonOutput?: boolean; force?: boolean; nonInteractive?: boolean } = {},
 ): Promise<SearchMode> {
   // Idempotent: don't re-prompt if already chosen, unless --force.
   if (!opts.force) {
@@ -215,7 +215,7 @@ export async function runModePicker(
   // Now: the agent sees the same matrix the human-TTY picker shows, plus
   // a directive saying "show this to your operator and confirm before
   // moving on." Default-applied mode is tokenmax (preserves v0.31.x shape).
-  if (!process.stdin.isTTY) {
+  if (opts.nonInteractive || !process.stdin.isTTY) {
     try { await engine.setConfig(SEARCH_MODE_KEY, rec.mode); } catch { /* swallow */ }
     console.log('');
     console.log('═══════════════════════════════════════════════════════════════');

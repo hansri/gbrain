@@ -131,7 +131,7 @@ describe('search_by_image op — D23-#6 spend cap', () => {
     expect(spent).toBeGreaterThanOrEqual(5);
 
     const err = await op().handler(
-      { engine, remote: true, auth: { token: 't', clientId: 'client_a', scopes: ['read'] } } as any,
+      { engine, remote: true, sourceId: 'default', auth: { token: 't', clientId: 'client_a', scopes: ['read'] } } as any,
       { image_data: PNG_BYTES.toString('base64') },
     ).catch((e: any) => e as Error);
     expect(err).toBeInstanceOf(Error);
@@ -142,7 +142,7 @@ describe('search_by_image op — D23-#6 spend cap', () => {
     await engine.setConfig('search.image_query.daily_budget_usd_per_client', '5');
     // No prior spend recorded.
     const results = await op().handler(
-      { engine, remote: true, auth: { token: 't', clientId: 'client_b', scopes: ['read'] } } as any,
+      { engine, remote: true, sourceId: 'default', auth: { token: 't', clientId: 'client_b', scopes: ['read'] } } as any,
       { image_data: PNG_BYTES.toString('base64') },
     );
     expect(Array.isArray(results)).toBe(true);

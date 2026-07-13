@@ -132,6 +132,20 @@ function runMigrationsList(): SkillpackReport['migrations'] {
   }
 }
 
+/** Extract one paste-ready internal remediation command from a doctor check. */
+function remediationAction(message: string, allowEmbeddedBacktick = false): string | null {
+  // Preserve the historical noise budget: informational warnings are only
+  // promoted when `Run:` is the final instruction, not when it is one clause
+  // inside a longer diagnostic paragraph.
+  const explicit = message.match(/Run:\s*(.+)$/i);
+  if (explicit?.[1]) return explicit[1].trim().replace(/^`|`$/g, '');
+  // Migration checks use prose so they can explain which brain must be
+  // selected first, but still carry the exact safe command in backticks.
+  if (!allowEmbeddedBacktick) return null;
+  const gbrainCommand = message.match(/`(gbrain\s+[^`\r\n]+)`/i);
+  return gbrainCommand?.[1]?.trim() ?? null;
+}
+
 function buildReport(): SkillpackReport {
   const doctor = runDoctor();
   const migrations = runMigrationsList();
@@ -147,14 +161,14 @@ function buildReport(): SkillpackReport {
         // Extract remediation command from check message if it follows
         // the `... Run: <cmd>` convention. Otherwise include the whole
         // message so the agent has enough to reason.
-        const runMatch = check.message.match(/Run:\s*(.+)$/);
-        if (runMatch) actions.push(runMatch[1].trim());
+        const action = remediationAction(check.message, true);
+        if (action) actions.push(action);
         else actions.push(`[${check.name}] ${check.message}`);
       } else if (check.status === 'warn') {
         // Warnings don't fail the report but surface as informational
         // actions the agent can decide about.
-        const runMatch = check.message.match(/Run:\s*(.+)$/);
-        if (runMatch && !actions.includes(runMatch[1].trim())) actions.push(runMatch[1].trim());
+        const action = remediationAction(check.message);
+        if (action && !actions.includes(action)) actions.push(action);
       }
     }
   } else {
@@ -262,4 +276,4 @@ function isSkillpackCheckSubcommand(): boolean {
 }
 
 /** Exported for unit tests. */
-export const __testing = { buildReport, runDoctor, runMigrationsList };
+export const __testing = { buildReport, runDoctor, runMigrationsList, remediationAction };

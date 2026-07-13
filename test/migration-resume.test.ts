@@ -7,7 +7,7 @@
  *   - 'retry' marker resets the counter; next run treats it as fresh.
  *   - appendCompletedMigration no-ops on double 'complete' (idempotency).
  *
- * Infrastructure: point HOME at a tmpdir so the ledger writes don't
+ * Infrastructure: point GBRAIN_HOME at a tmpdir so the ledger writes don't
  * stomp the real ~/.gbrain/migrations/completed.jsonl.
  */
 
@@ -22,11 +22,9 @@ const originalGbrainHome = process.env.GBRAIN_HOME;
 
 beforeEach(() => {
   tmpHome = mkdtempSync(join(tmpdir(), 'gbrain-migration-resume-'));
-  // preferences.ts's gbrainDir() returns `$HOME/.gbrain` when GBRAIN_HOME
-  // is unset. Set HOME only; clear any inherited GBRAIN_HOME so the test
-  // body matches the migrations dir at `$tmpHome/.gbrain/migrations/`.
+  // configDir() treats GBRAIN_HOME as the parent of `.gbrain`.
   process.env.HOME = tmpHome;
-  delete process.env.GBRAIN_HOME;
+  process.env.GBRAIN_HOME = tmpHome;
 });
 
 afterEach(() => {
@@ -152,7 +150,9 @@ describe('Bug 3 — orchestrator no longer writes the ledger directly', () => {
 
   test('apply-migrations.ts runner writes the ledger', async () => {
     const source = await Bun.file(new URL('../src/commands/apply-migrations.ts', import.meta.url)).text();
-    expect(source).toContain("import { loadCompletedMigrations, appendCompletedMigration");
+    expect(source).toContain('loadCompletedMigrations');
+    expect(source).toContain('appendCompletedMigration');
+    expect(source).toContain('appendAmbiguousMigration');
     expect(source).toContain("appendCompletedMigration({");
     expect(source).toContain("'retry'");
     expect(source).toContain('--force-retry');

@@ -1,21 +1,32 @@
 import { test, expect, describe, beforeAll, afterAll, beforeEach } from 'bun:test';
-import { mkdirSync, writeFileSync, rmSync, readFileSync, existsSync, chmodSync } from 'fs';
+import { mkdirSync, writeFileSync, rmSync, readFileSync, existsSync, chmodSync, mkdtempSync } from 'fs';
+import { execFileSync } from 'child_process';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
   GIT_SSRF_FLAGS,
   GIT_SSRF_SUBCOMMAND_FLAGS,
+  GIT_EXECUTION_FENCE_FLAGS,
   parseRemoteUrl,
+  canonicalRemoteUrl,
   RemoteUrlError,
   cloneRepo,
+  fetchRemote,
   pullRepo,
   GitOperationError,
+  isWorkingTreeDirty,
   validateRepoState,
+  validateOriginRemote,
+  assertRemoteNetworkTarget,
+  gitRemoteAddressBindingFlags,
+  divergenceSafePull,
+  pushProbe,
+  pushBranch,
 } from '../src/core/git-remote.ts';
 import { withEnv } from './helpers/with-env.ts';
 
 // ---------------------------------------------------------------------------
-// Fake-git harness: write a shell script that records its argv to a log file,
+// Serial fake-git harness: write a shell script that records its argv to a log file,
 // then prepend its dir to PATH for the test. Lets us assert exact argv shape
 // without invoking real git.
 // ---------------------------------------------------------------------------
@@ -31,15 +42,25 @@ function writeFakeGit(): void {
   // Per-invocation argv goes into argv.log (one JSON array per line).
   writeFileSync(FAKE_GIT_LOG, '');
   const script = `#!/usr/bin/env bash
-# Fake git for git-remote.test.ts
+# Fake git for git-remote.serial.test.ts
 { printf '['; for arg in "$@"; do printf '%s,' "$(printf '%s' "$arg" | jq -Rs .)"; done; printf 'null]\\n'; } >> "${FAKE_GIT_LOG}"
 mode=$(cat "${FAKE_GIT_MODE}" 2>/dev/null || echo ok)
 case "$mode" in
   fail) exit 1 ;;
-  url-drift) echo "https://github.com/different/url" ;;
-  url-match) echo "https://github.com/expected/url" ;;
-  *) ;;
 esac
+if [[ " $* " == *" remote get-url "* && " $* " == *" origin "* ]]; then
+  case "$mode" in
+    url-drift) echo "https://github.com/different/url" ;;
+    url-match) echo "https://github.com/expected/url" ;;
+    *) echo "https://github.com/example/repo" ;;
+  esac
+fi
+if [[ " $* " == *" check-ref-format --branch "* ]]; then
+  printf '%s\n' "\${!#}"
+fi
+if [[ " $* " == *" rev-parse HEAD "* ]]; then
+  echo "0123456789abcdef0123456789abcdef01234567"
+fi
 exit 0
 `;
   const path = join(FAKE_GIT_DIR, 'git');
@@ -74,6 +95,18 @@ beforeEach(() => {
 });
 
 const fakePath = (): string => `${FAKE_GIT_DIR}:${process.env.PATH ?? ''}`;
+const APPROVED_GIT_IP = '93.184.216.34';
+const approveGitAddress = (): readonly string[] => [APPROVED_GIT_IP];
+
+function expectAddressBound(call: string[], hostname: string, port = '443'): void {
+  const clearAt = call.findIndex((arg, i) => arg === 'http.curloptResolve=' && call[i - 1] === '-c');
+  const binding = `http.curloptResolve=${hostname}:${port}:${APPROVED_GIT_IP}`;
+  const bindAt = call.findIndex((arg, i) => arg === binding && call[i - 1] === '-c');
+  const verbAt = call.findIndex(arg => ['clone', 'fetch', 'push'].includes(arg));
+  expect(clearAt).toBeGreaterThan(-1);
+  expect(bindAt).toBeGreaterThan(clearAt);
+  expect(verbAt).toBeGreaterThan(bindAt);
+}
 
 // ---------------------------------------------------------------------------
 // GIT_SSRF_FLAGS — pinned shape (snapshot test). If a future flag is added,
@@ -84,9 +117,17 @@ const fakePath = (): string => `${FAKE_GIT_DIR}:${process.env.PATH ?? ''}`;
 describe('GIT_SSRF_FLAGS', () => {
   test('exact shape — global -c config flags only (spread BEFORE the verb)', () => {
     expect([...GIT_SSRF_FLAGS]).toEqual([
+      ...GIT_EXECUTION_FENCE_FLAGS,
       '-c', 'http.followRedirects=false',
+      '-c', 'http.sslVerify=true',
+      '-c', 'http.proxy=',
+      '-c', 'https.proxy=',
       '-c', 'protocol.file.allow=never',
       '-c', 'protocol.ext.allow=never',
+      '-c', 'credential.helper=',
+      '-c', 'http.extraHeader=',
+      '-c', 'http.cookieFile=',
+      '-c', 'http.saveCookies=false',
     ]);
   });
 });
@@ -115,12 +156,73 @@ describe('parseRemoteUrl — happy path', () => {
   });
 });
 
+describe('resolved-address network boundary (hermetic)', () => {
+  test('accepts only public resolver answers', () => {
+    const target = assertRemoteNetworkTarget(
+      'https://git.example/repo',
+      () => ['93.184.216.34', '2606:2800:220:1:248:1893:25c8:1946'],
+    );
+    expect(target.hostname).toBe('git.example');
+    expect(target.addresses).toEqual([
+      '93.184.216.34',
+      '2606:2800:220:1:248:1893:25c8:1946',
+    ]);
+  });
+
+  test('rejects non-IP resolver output instead of letting curl resolve it again', () => {
+    expect(() => assertRemoteNetworkTarget(
+      'https://git.example/repo',
+      () => ['attacker-controlled-name.example'],
+    )).toThrow(/non-IP address/);
+  });
+
+  test('binding keeps the TLS hostname and exact custom port while pinning all approved IPs', () => {
+    const target = assertRemoteNetworkTarget(
+      'https://git.example:8443/repo',
+      () => [APPROVED_GIT_IP, '2606:2800:220:1:248:1893:25c8:1946'],
+    );
+    expect(gitRemoteAddressBindingFlags(target)).toEqual([
+      '-c', 'http.curloptResolve=',
+      '-c',
+      `http.curloptResolve=git.example:8443:${APPROVED_GIT_IP},[2606:2800:220:1:248:1893:25c8:1946]`,
+    ]);
+    expect(target.url).toBe('https://git.example:8443/repo');
+  });
+
+  test('rejects private, link-local, and metadata answers before git runs', () => {
+    for (const address of ['10.0.0.7', '169.254.169.254', 'fd00::7', 'fe80::1']) {
+      expect(() => assertRemoteNetworkTarget('https://git.example/repo', () => [address]))
+        .toThrow(/internal\/private/);
+    }
+  });
+
+  test('local file transport requires the explicit escape and stays host-local', async () => {
+    const localPath = join(tmpdir(), 'gbrain-local-origin.git');
+    expect(() => assertRemoteNetworkTarget(localPath)).toThrow(RemoteUrlError);
+    await withEnv({ GBRAIN_GIT_ALLOW_FILE_TRANSPORT: '1' }, async () => {
+      expect(assertRemoteNetworkTarget(localPath).url).toBe(localPath);
+      expect(assertRemoteNetworkTarget(`file://${localPath}`).url).toBe(`file://${localPath}`);
+      expect(() => assertRemoteNetworkTarget('file://remote.example/repo.git'))
+        .toThrow(/https:\/\/ only/);
+    });
+  });
+});
+
 describe('parseRemoteUrl — rejection cases', () => {
   test('rejects empty input', () => {
     expect(() => parseRemoteUrl('')).toThrow(RemoteUrlError);
   });
   test('rejects malformed URL', () => {
     expect(() => parseRemoteUrl('not a url')).toThrow(/malformed|invalid_url/i);
+  });
+  test('rejects query strings and fragments that could carry secrets', () => {
+    for (const remote of [
+      'https://github.com/example/repo.git?access_token=SECRET',
+      'https://github.com/example/repo.git#SECRET',
+    ]) {
+      expect(() => parseRemoteUrl(remote)).toThrow(/query strings or fragments/);
+      expect(() => canonicalRemoteUrl(remote)).toThrow(/query strings or fragments/);
+    }
   });
   test('rejects ssh:// scheme', () => {
     try {
@@ -236,7 +338,7 @@ describe('cloneRepo', () => {
     const dest = join(FAKE_GIT_DIR, 'clone-target');
     rmSync(dest, { recursive: true, force: true });
     await withEnv({ PATH: fakePath() }, async () => {
-      cloneRepo('https://example.com/repo', dest);
+      cloneRepo('https://example.com/repo', dest, { resolveAddresses: approveGitAddress });
     });
     const calls = readArgvLog();
     expect(calls.length).toBe(1);
@@ -247,6 +349,7 @@ describe('cloneRepo', () => {
     expect(argv).toContain('--depth=1');
     expect(argv).toContain('https://example.com/repo');
     expect(argv[argv.length - 1]).toBe(dest);
+    expectAddressBound(argv, 'example.com');
     // v0.34 fix wave: subcommand flags MUST appear after the verb. Real
     // git rejects `git --no-recurse-submodules clone ...` with exit 129.
     // The fake-git harness returned 0 for any argv shape, so this
@@ -312,6 +415,135 @@ describe('cloneRepo', () => {
       }
     });
   });
+
+});
+
+describe('fetchRemote', () => {
+  test('validates origin before the SSRF-hardened fetch', async () => {
+    const repo = join(FAKE_GIT_DIR, 'fetch-target');
+    mkdirSync(repo, { recursive: true });
+    await withEnv({ PATH: fakePath() }, async () => {
+      fetchRemote(repo, 'main', {
+        expectedRemoteUrl: 'https://github.com/example/repo',
+        resolveAddresses: approveGitAddress,
+      });
+    });
+    const calls = readArgvLog();
+    expect(calls.some(call => call.includes('get-url'))).toBe(true);
+    const fetch = calls.find(call => call.includes('fetch'))!;
+    expect(fetch).toContain('https://github.com/example/repo');
+    expect(fetch).toContain('main:refs/remotes/origin/main');
+    expectAddressBound(fetch, 'github.com');
+    rmSync(repo, { recursive: true, force: true });
+  });
+});
+
+describe('validateOriginRemote', () => {
+  test('returns only a policy-valid matching HTTPS origin', async () => {
+    const repo = join(FAKE_GIT_DIR, 'origin-valid');
+    mkdirSync(repo, { recursive: true });
+    await withEnv({ PATH: fakePath() }, async () => {
+      expect(validateOriginRemote(repo, 'https://github.com/example/repo'))
+        .toBe('https://github.com/example/repo');
+    });
+    rmSync(repo, { recursive: true, force: true });
+  });
+
+  test('rejects repo-local URL rewrites and proxies before a network operation', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'gbrain-git-rewrite-'));
+    try {
+      execFileSync('git', ['init', '-q', repo]);
+      execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/example/repo']);
+      execFileSync('git', ['-C', repo, 'config', 'url.https://127.0.0.1/.insteadOf', 'https://github.com/']);
+      expect(() => validateOriginRemote(repo, undefined, {
+        resolveAddresses: () => ['93.184.216.34'],
+      })).toThrow(/unsafe repo-local executable\/network/);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects a repo-local curloptResolve private-address override', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'gbrain-git-curl-resolve-'));
+    try {
+      execFileSync('git', ['init', '-q', repo]);
+      execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/example/repo']);
+      execFileSync('git', [
+        '-C', repo, 'config',
+        'http.curloptResolve',
+        'github.com:443:169.254.169.254',
+      ]);
+      expect(() => validateOriginRemote(repo, undefined, {
+        resolveAddresses: approveGitAddress,
+      })).toThrow(/unsafe repo-local executable\/network/);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects shell credential helpers before any network operation', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'gbrain-git-helper-'));
+    const sentinel = join(repo, 'credential-helper-ran');
+    try {
+      execFileSync('git', ['init', '-q', repo]);
+      execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/example/repo']);
+      execFileSync('git', ['-C', repo, 'config', 'credential.https://github.com.helper', `!touch '${sentinel}'`]);
+      expect(() => validateOriginRemote(repo, undefined, {
+        resolveAddresses: approveGitAddress,
+      })).toThrow(/shell credential helper/);
+      expect(existsSync(sentinel)).toBe(false);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects repo-local TLS/header/cookie and promisor lazy-fetch config', () => {
+    const unsafe: Array<[string, string]> = [
+      ['http.extraHeader', 'Authorization: injected'],
+      ['http.cookieFile', '/tmp/cookies'],
+      ['http.sslCAInfo', '/tmp/attacker-ca.pem'],
+      ['http.sslVersion', 'sslv3'],
+      ['remote.origin.promisor', 'true'],
+      ['remote.origin.partialCloneFilter', 'blob:none'],
+      ['core.hooksPath', '/tmp/attacker-hooks'],
+      ['core.fsmonitor', '!touch /tmp/fsmonitor-ran'],
+      ['filter.evil.process', 'touch /tmp/filter-ran'],
+      ['merge.evil.driver', 'touch /tmp/merge-ran'],
+      ['diff.evil.command', 'touch /tmp/diff-ran'],
+      ['commit.gpgSign', 'true'],
+      ['gpg.program', '/tmp/attacker-gpg'],
+      ['gpg.ssh.program', '/tmp/attacker-ssh-signer'],
+    ];
+    for (const [key, value] of unsafe) {
+      const repo = mkdtempSync(join(tmpdir(), 'gbrain-git-config-'));
+      try {
+        execFileSync('git', ['init', '-q', repo]);
+        execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://github.com/example/repo']);
+        execFileSync('git', ['-C', repo, 'config', key, value]);
+        expect(() => validateOriginRemote(repo, undefined, {
+          resolveAddresses: approveGitAddress,
+        })).toThrow(/unsafe repo-local executable\/network config/);
+      } finally {
+        rmSync(repo, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test('push validates the push URL, not only the fetch URL', async () => {
+    const repo = join(FAKE_GIT_DIR, 'push-url-policy');
+    mkdirSync(repo, { recursive: true });
+    await withEnv({ PATH: fakePath() }, async () => {
+      const result = pushProbe(repo, 'main', { resolveAddresses: approveGitAddress });
+      expect(result.ok).toBe(true);
+    });
+    const getUrl = readArgvLog().find(call => call.includes('get-url'))!;
+    expect(getUrl).toContain('--push');
+    const push = readArgvLog().find(call => call.includes('HEAD:main'))!;
+    expect(push).toContain('https://github.com/example/repo');
+    expect(push).not.toContain('origin');
+    expectAddressBound(push, 'github.com');
+    rmSync(repo, { recursive: true, force: true });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -319,25 +551,33 @@ describe('cloneRepo', () => {
 // ---------------------------------------------------------------------------
 
 describe('pullRepo', () => {
-  test('happy path: invokes git -C path with GIT_SSRF_FLAGS + pull --ff-only', async () => {
+  test('happy path: fetches the validated URL then fast-forwards locally', async () => {
     const repo = join(FAKE_GIT_DIR, 'pull-target');
     mkdirSync(repo, { recursive: true });
     await withEnv({ PATH: fakePath() }, async () => {
-      pullRepo(repo);
+      pullRepo(repo, { resolveAddresses: approveGitAddress });
     });
-    const argv = readArgvLog()[0];
-    expect(argv[0]).toBe('-C');
-    expect(argv[1]).toBe(repo);
-    expect(argv.slice(2, 2 + GIT_SSRF_FLAGS.length)).toEqual([...GIT_SSRF_FLAGS]);
-    expect(argv).toContain('pull');
-    expect(argv).toContain('--ff-only');
+    const calls = readArgvLog();
+    expect(calls.some(call => call.includes('get-url'))).toBe(true);
+    const fetch = calls.find(call => call.includes('fetch'))!;
+    expect(fetch.slice(0, 2)).toEqual(['-C', repo]);
+    expect(fetch.slice(2, 2 + GIT_EXECUTION_FENCE_FLAGS.length)).toEqual([...GIT_EXECUTION_FENCE_FLAGS]);
+    const ssrfStart = 2 + GIT_EXECUTION_FENCE_FLAGS.length;
+    expect(fetch.slice(ssrfStart, ssrfStart + GIT_SSRF_FLAGS.length)).toEqual([...GIT_SSRF_FLAGS]);
+    expect(fetch).toContain('https://github.com/example/repo');
+    expect(fetch).toContain('main:refs/remotes/origin/main');
+    expectAddressBound(fetch, 'github.com');
     // v0.34 fix wave: subcommand flag position assertion.
-    const pullIdx = argv.indexOf('pull');
-    expect(pullIdx).toBeGreaterThan(-1);
+    const fetchIdx = fetch.indexOf('fetch');
+    expect(fetchIdx).toBeGreaterThan(-1);
     for (const subFlag of GIT_SSRF_SUBCOMMAND_FLAGS) {
-      const flagIdx = argv.indexOf(subFlag);
-      expect(flagIdx).toBeGreaterThan(pullIdx);
+      const flagIdx = fetch.indexOf(subFlag);
+      expect(flagIdx).toBeGreaterThan(fetchIdx);
     }
+    const merge = calls.find(call => call.includes('merge'))!;
+    expect(merge).toContain('--ff-only');
+    expect(merge).toContain('refs/remotes/origin/main');
+    expect(merge).not.toContain('https://github.com/example/repo');
     rmSync(repo, { recursive: true, force: true });
   });
 
@@ -350,6 +590,57 @@ describe('pullRepo', () => {
     });
     rmSync(repo, { recursive: true, force: true });
   });
+
+  test('refuses configured origin drift before invoking fetch or merge', async () => {
+    const repo = join(FAKE_GIT_DIR, 'pull-drift');
+    mkdirSync(repo, { recursive: true });
+    setMode('url-drift');
+    await withEnv({ PATH: fakePath() }, async () => {
+      expect(() => pullRepo(repo, {
+        expectedRemoteUrl: 'https://github.com/expected/url',
+      })).toThrow(/differs from the configured source URL/);
+    });
+    expect(readArgvLog().some(call => call.includes('fetch') || call.includes('merge'))).toBe(false);
+    rmSync(repo, { recursive: true, force: true });
+  });
+});
+
+describe('durability network paths', () => {
+  test('divergence-safe pull binds its fetch to the approved address', async () => {
+    const repo = join(FAKE_GIT_DIR, 'durable-pull-target');
+    mkdirSync(repo, { recursive: true });
+    await withEnv({ PATH: fakePath() }, async () => {
+      expect(divergenceSafePull(repo, 'main', {
+        resolveAddresses: approveGitAddress,
+      }).status).toBe('up_to_date');
+    });
+    const fetch = readArgvLog().find(call => call.includes('fetch'))!;
+    expectAddressBound(fetch, 'github.com');
+    expect(fetch).toContain('https://github.com/example/repo');
+    const rebase = readArgvLog().find(call => call.includes('rebase') && !call.includes('--abort'))!;
+    expect(rebase.slice(2, 2 + GIT_EXECUTION_FENCE_FLAGS.length))
+      .toEqual([...GIT_EXECUTION_FENCE_FLAGS]);
+    expect(rebase).toContain('core.hooksPath=/dev/null');
+    expect(rebase).toContain('refs/remotes/origin/main');
+    rmSync(repo, { recursive: true, force: true });
+  });
+
+  test('real push binds its destination to the approved address', async () => {
+    const repo = join(FAKE_GIT_DIR, 'push-branch-target');
+    mkdirSync(repo, { recursive: true });
+    await withEnv({ PATH: fakePath() }, async () => {
+      pushBranch(repo, 'main', { resolveAddresses: approveGitAddress });
+    });
+    const push = readArgvLog().find(call =>
+      call.includes('push') && call.includes('HEAD:refs/heads/main'))!;
+    expectAddressBound(push, 'github.com');
+    expect(push).toContain('https://github.com/example/repo');
+    expect(push).toContain('core.hooksPath=/dev/null');
+    expect(push).toContain('credential.helper=');
+    expect(push).toContain('credential.useHttpPath=true');
+    rmSync(repo, { recursive: true, force: true });
+  });
+
 });
 
 // ---------------------------------------------------------------------------
@@ -414,5 +705,25 @@ describe('validateRepoState', () => {
     await withEnv({ PATH: fakePath() }, async () => {
       expect(validateRepoState(p)).toBe('healthy');
     });
+  });
+});
+
+describe('local Git environment boundary', () => {
+  test('working-tree probe ignores inherited repository/config poisoning', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'gbrain-git-env-'));
+    try {
+      execFileSync('git', ['init', '-q', repo]);
+      await withEnv({
+        GIT_DIR: '/dev/null',
+        GIT_WORK_TREE: '/dev/null',
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'core.repositoryformatversion',
+        GIT_CONFIG_VALUE_0: '999',
+      }, async () => {
+        expect(isWorkingTreeDirty(repo)).toBe(false);
+      });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 });
